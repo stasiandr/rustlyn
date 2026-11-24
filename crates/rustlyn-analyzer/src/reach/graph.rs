@@ -9,7 +9,7 @@
 //! read or written there, what is done to a component through its stash —
 //! is read off the text around the name.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,6 +19,7 @@ use rustlyn_ide::DeclarationKind;
 use rustlyn_ide::semantic::{LinkRole, LinkSymbol, Place, Semantic};
 
 use super::config::Config;
+use super::packages::Packages;
 use super::text;
 use crate::blast::ask::absolute;
 use crate::blast::changes::{Member, Members};
@@ -74,6 +75,16 @@ pub struct Hit {
     pub base: bool,
 }
 
+/// A place where an own member uses what a package declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackageUse {
+    pub from: NodeId,
+    /// The package's index in [`Graph::packages`].
+    pub package: u32,
+    /// The line of the name, from zero, in `from`'s file.
+    pub line: u32,
+}
+
 /// One own file.
 #[derive(Debug, Clone)]
 pub struct OwnFile {
@@ -98,6 +109,14 @@ pub struct Graph {
     types: HashMap<String, NodeId>,
     /// Files the compiler could not answer about.
     pub failed: usize,
+    /// The names of the packages own code uses, sorted.
+    pub packages: Vec<String>,
+    /// Every use of a package by an own member, whatever the role of the
+    /// name there: a call, a type, a base. Once for each member, package
+    /// and line.
+    pub package_uses: Vec<PackageUse>,
+    /// The packages that declare what a sink is, by name, with the sinks.
+    pub provided: BTreeMap<String, BTreeSet<usize>>,
 }
 
 impl Graph {
@@ -215,6 +234,8 @@ struct Target {
     sink: Option<(usize, String)>,
     /// A stash: the qualified name of its component.
     component: Option<String>,
+    /// The Unity package it is declared in.
+    package: Option<String>,
 }
 
 /// An edge before its target is a node: the target's file may not have been
@@ -246,11 +267,18 @@ struct RawHit {
     base: bool,
 }
 
+/// The owner, the package and the line of a use of a package.
+type RawUse = (u32, String, u32);
+
 #[derive(Debug, Default)]
 struct RawFile {
     members: Option<Members>,
     edges: Vec<Raw>,
     hits: Vec<RawHit>,
+    /// Owner, package and line of each use of a package.
+    uses: Vec<RawUse>,
+    /// Package and sink of each hit declared in a package.
+    provided: Vec<(String, usize)>,
 }
 
 /// The type names a stash is written as: `Stash<Health>`.
@@ -275,7 +303,7 @@ const COMPONENT_WRITES: &[&str] = &["AddComponent", "SetComponent", "RemoveCompo
 
 /// Builds the graph of the compiled project in `root`.
 #[must_use]
-pub fn build(root: &str, semantic: &Semantic, config: &Config) -> Graph {
+pub fn build(root: &str, semantic: &Semantic, config: &Config, packages: &Packages) -> Graph {
     let mut paths: Vec<String> = Vec::new();
     sources(Path::new(root), Path::new(root), &mut paths);
     paths.retain(|path| config.is_own(path));
@@ -296,6 +324,7 @@ pub fn build(root: &str, semantic: &Semantic, config: &Config) -> Graph {
         config,
         by_path: &by_path,
         targets: &targets,
+        packages,
     };
     std::thread::scope(|scope| {
         for _ in 0..threads(paths.len()) {
@@ -332,6 +361,7 @@ pub fn build(root: &str, semantic: &Semantic, config: &Config) -> Graph {
     };
     // Nodes: every member of every file, in the order of the files.
     let mut raw: Vec<(Vec<Raw>, Vec<RawHit>)> = Vec::with_capacity(read.len());
+    let mut uses: Vec<(u32, Vec<RawUse>)> = Vec::new();
     for ((_, file), path) in read.into_iter().zip(&paths) {
         let members = file.members.unwrap_or(Members { list: Vec::new() });
         let first = graph.file_of.len() as NodeId;
@@ -351,6 +381,31 @@ pub fn build(root: &str, semantic: &Semantic, config: &Config) -> Graph {
             first,
         });
         raw.push((file.edges, file.hits));
+        for (package, sink) in file.provided {
+            graph.provided.entry(package).or_default().insert(sink);
+        }
+        uses.push((first, file.uses));
+    }
+    let names: BTreeSet<&String> = uses
+        .iter()
+        .flat_map(|(_, uses)| uses.iter().map(|(_, package, _)| package))
+        .chain(graph.provided.keys())
+        .collect();
+    graph.packages = names.into_iter().cloned().collect();
+    let mut seen: BTreeSet<(u32, u32, u32)> = BTreeSet::new();
+    for (first, uses) in uses {
+        for (owner, package, line) in uses {
+            if let Ok(package) = graph.packages.binary_search(&package) {
+                let from = first + owner;
+                if seen.insert((from, package as u32, line)) {
+                    graph.package_uses.push(PackageUse {
+                        from,
+                        package: package as u32,
+                        line,
+                    });
+                }
+            }
+        }
     }
     // Edges: each target found among the nodes.
     let by_offset: Vec<HashMap<usize, u32>> = graph
@@ -425,6 +480,7 @@ struct Context<'a> {
     config: &'a Config,
     by_path: &'a HashMap<String, usize>,
     targets: &'a Mutex<HashMap<LinkSymbol, Arc<Target>>>,
+    packages: &'a Packages,
 }
 
 impl Context<'_> {
@@ -448,6 +504,7 @@ impl Context<'_> {
             own: None,
             sink: None,
             component: None,
+            package: None,
         };
         if found.kind == DeclarationKind::Namespace {
             return target;
@@ -463,6 +520,7 @@ impl Context<'_> {
         match &found.place {
             Some(Place::Source { path, span }) => {
                 let path = relative_to(self.root, &absolute(self.root, path));
+                target.package = self.packages.package_of(&path);
                 if let Some(&file) = self.by_path.get(&path) {
                     target.own = Some((file as u32, span.start() as usize));
                 } else if let Some(sink) = self.config.sink_of_path(&path) {
@@ -474,6 +532,13 @@ impl Context<'_> {
                     .file_stem()
                     .map(|stem| stem.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                // A file outside the project is in no package of it.
+                let full = absolute(self.root, assembly);
+                if let Ok(inside) = Path::new(&full).strip_prefix(self.root) {
+                    target.package = self
+                        .packages
+                        .package_of(&inside.to_string_lossy().replace('\\', "/"));
+                }
                 if let Some(sink) = self.config.sink_of_assembly(&stem) {
                     target.sink = Some((sink, display()));
                 }
@@ -524,6 +589,8 @@ fn read_file(context: &Context<'_>, path: &str) -> RawFile {
     let members = Members::of_outline(path, source, &links.outline);
     let bytes = source.as_bytes();
     let mut file = RawFile::default();
+    // A package's own code uses itself all it likes.
+    let home = context.packages.package_of(path);
     // The innermost member around each line, asked for link after link.
     let mut owners: HashMap<u32, Option<u32>> = HashMap::new();
     let mut owner_at = |line: u32| {
@@ -541,6 +608,14 @@ fn read_file(context: &Context<'_>, path: &str) -> RawFile {
             continue;
         };
         let target = context.target(link.target);
+        if let Some(package) = &target.package
+            && home.as_ref() != Some(package)
+        {
+            file.uses.push((owner, package.clone(), link.line));
+            if let Some((sink, _)) = &target.sink {
+                file.provided.push((package.clone(), *sink));
+            }
+        }
         if let Some((sink, name)) = &target.sink {
             file.hits.push(RawHit {
                 owner,

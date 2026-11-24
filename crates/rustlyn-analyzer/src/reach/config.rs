@@ -12,8 +12,15 @@
 //!     { "name": "android", "symbols": ["UNITY_ANDROID", "-UNITY_EDITOR"] }
 //!   ],
 //!   "sinks": [
-//!     { "name": "Billing", "namespaces": ["Vendor.Billing"], "paths": ["Assets/Vendor/Billing"] }
+//!     {
+//!       "name": "Billing",
+//!       "namespaces": ["Vendor.Billing"],
+//!       "paths": ["Assets/Vendor/Billing"],
+//!       "packages": ["com.vendor.billing", "com.vendor.billing.*"],
+//!       "mentions": ["vendor-billing"]
+//!     }
 //!   ],
+//!   "text_files": ["**/*Dependencies.xml", "**/*.gradle"],
 //!   "watch": [
 //!     { "name": "Billing package", "paths": ["Packages/manifest.json", "Assets/Vendor/Billing/**"] }
 //!   ],
@@ -21,8 +28,26 @@
 //!   "limits": { "depth": 10, "data_hops": 2, "hub_callers": 10, "hub_writers": 10, "shared_readers": 3 }
 //! }
 //! ```
+//!
+//! `packages` names Unity packages (`*` is a glob) that are the sink even
+//! when the code analysis cannot tell, as with a binary plugin.
+//! `mentions` are substrings, matched without regard to case, that make a
+//! changed line of a native build file — one of `text_files`, which has
+//! the defaults of [`DEFAULT_TEXT_FILES`] when left out — concern the sink:
+//! the line that pins `com.appsflyer:af-android-sdk:6.15.0` names it.
 
 use rustlyn_ide::formats::json::Json;
+
+/// The native build files a change is read as text in, when the
+/// configuration does not say.
+pub const DEFAULT_TEXT_FILES: &[&str] = &[
+    "**/*Dependencies.xml",
+    "**/*.gradle",
+    "**/gradle.properties",
+    "**/AndroidManifest.xml",
+    "**/Podfile",
+    "**/*.podspec",
+];
 
 /// A group of APIs under one name: an SDK, a subsystem.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -36,6 +61,12 @@ pub struct Sink {
     pub paths: Vec<String>,
     /// Assemblies by file name, without the extension.
     pub assemblies: Vec<String>,
+    /// Names of Unity packages, with `*` globs, that are the sink whatever
+    /// the code analysis finds in them.
+    pub packages: Vec<String>,
+    /// Substrings that make a changed line of a native build file concern
+    /// the sink, matched without regard to case.
+    pub mentions: Vec<String>,
 }
 
 /// A build to read the project as.
@@ -98,6 +129,10 @@ pub struct Config {
     pub configurations: Vec<Configuration>,
     pub sinks: Vec<Sink>,
     pub watch: Vec<Watch>,
+    /// Globs of the native build files whose changed lines are searched for
+    /// the sinks' mentions. Empty only for a configuration not read from
+    /// JSON: [`Config::parse`] fills in the defaults.
+    pub text_files: Vec<String>,
     /// Qualified name prefixes of types and members the walk does not go
     /// through: a logger that happens to forward to a sink.
     pub ignore: Vec<String>,
@@ -128,6 +163,8 @@ impl Config {
                 types: strings(sink, "types"),
                 paths: folders(sink, "paths"),
                 assemblies: strings(sink, "assemblies"),
+                packages: strings(sink, "packages"),
+                mentions: strings(sink, "mentions"),
             })
             .collect();
         if sinks.is_empty() {
@@ -172,6 +209,12 @@ impl Config {
                     paths: strings(watch, "paths"),
                 })
                 .collect(),
+            text_files: json.strings("text_files").unwrap_or_else(|| {
+                DEFAULT_TEXT_FILES
+                    .iter()
+                    .map(|glob| (*glob).to_owned())
+                    .collect()
+            }),
             ignore: strings(&json, "ignore"),
             limits,
         })
@@ -237,6 +280,20 @@ impl Config {
         self.ignore
             .iter()
             .any(|prefix| qualified == prefix || inside(qualified, prefix))
+    }
+
+    /// The sink a Unity package is, by its name.
+    #[must_use]
+    pub fn sink_of_package(&self, name: &str) -> Option<usize> {
+        self.sinks
+            .iter()
+            .position(|sink| sink.packages.iter().any(|glob| glob_matches(glob, name)))
+    }
+
+    /// Whether a changed file is searched for the sinks' mentions.
+    #[must_use]
+    pub fn is_text_file(&self, path: &str) -> bool {
+        self.text_files.iter().any(|glob| glob_matches(glob, path))
     }
 
     /// The watch entries whose globs match `path`.
@@ -374,6 +431,34 @@ mod tests {
         assert!(!config.is_own("Assets/Vendor/Billing/Api.cs"));
         assert!(!config.is_own("Packages/x/Y.cs"));
         assert_eq!(config.sink_of_path("Assets/Vendor/Billing/Api.cs"), Some(0));
+    }
+
+    #[test]
+    fn packages_mentions_and_text_files() {
+        let config = Config::parse(
+            r#"{"sinks": [
+                {"name": "Tiktok", "packages": ["com.vendor.tiktok"]},
+                {"name": "Firebase", "packages": ["com.google.firebase.*"], "mentions": ["Firebase", "appsflyer"]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.sinks[1].mentions, ["Firebase", "appsflyer"]);
+        assert_eq!(config.sink_of_package("com.vendor.tiktok"), Some(0));
+        assert_eq!(config.sink_of_package("com.google.firebase.app"), Some(1));
+        assert_eq!(config.sink_of_package("com.google.firebase"), None);
+        assert_eq!(config.sink_of_package("com.unity.purchasing"), None);
+        // The default build files.
+        assert!(config.is_text_file("Assets/Editor/AdsDependencies.xml"));
+        assert!(config.is_text_file("Assets/Plugins/Android/mainTemplate.gradle"));
+        assert!(config.is_text_file("Podfile"));
+        assert!(!config.is_text_file("Assets/Game/Notes.txt"));
+        // Given, they replace the defaults.
+        let config = Config::parse(
+            r#"{"text_files": ["Notes/*.txt"], "sinks": [{"name": "A", "types": ["A"]}]}"#,
+        )
+        .unwrap();
+        assert!(config.is_text_file("Notes/a.txt"));
+        assert!(!config.is_text_file("Podfile"));
     }
 
     #[test]

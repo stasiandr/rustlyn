@@ -112,12 +112,12 @@ fn run() -> Result<i32, String> {
     }
     let mut past = Vec::new();
     for range in &commits {
-        past.extend(git::revisions(&root, range, &|done, total| {
+        past.extend(git::revisions(&root, range, &config, &|done, total| {
             eprintln!("rustlyn-reach: reading commit {done}/{total}");
         })?);
     }
     for commit in &single {
-        past.push(git::revision(&root, commit)?);
+        past.push(git::revision(&root, commit, &config)?);
     }
     let patch = if cone || !(commits.is_empty() && single.is_empty()) {
         None

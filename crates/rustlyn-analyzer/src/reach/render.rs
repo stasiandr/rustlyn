@@ -24,6 +24,11 @@ fn hop_text(hop: &Hop) -> String {
         "member_of" => format!("member of {}", hop.target),
         "holds" => format!("holds {}", hop.target),
         "serializes" => format!("holds the serialized data of {}", hop.target),
+        "package_of" => format!("{} is the code of the sink{sink}", hop.target),
+        "dependency_of" => format!("a dependency of {}{sink}", hop.target),
+        "depends_on" => format!("depends on {}{sink}", hop.target),
+        "used_by" => format!("used by {}", hop.target),
+        "mentions" => format!("names the sink{sink}: {}", hop.target),
         "uses" => format!("uses {}{sink}", hop.target),
         "derives" => format!("derives from {}{sink}", hop.target),
         "removed" => format!("removed code named {}{sink}", hop.target),
@@ -96,6 +101,35 @@ fn findings_text(out: &mut String, findings: &[Finding], all: usize, possible: b
         match finding.kind {
             FindingKind::Watch => {
                 let _ = writeln!(block, "▣ {} — watched: {}", finding.path, finding.name);
+            }
+            FindingKind::Package => {
+                let used = if finding.count > 0 {
+                    format!(
+                        ", used by {} members on the way, such as {}",
+                        finding.count,
+                        finding.chain.first().map_or("", |hop| hop.target.as_str())
+                    )
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(
+                    block,
+                    "▣ {}:{} — package {}{used}",
+                    finding.path,
+                    finding.line + 1,
+                    finding.name
+                );
+                chain_text(&mut block, &finding.chain);
+            }
+            FindingKind::Mention => {
+                let _ = writeln!(
+                    block,
+                    "▣ {}:{} — mentions {}",
+                    finding.path,
+                    finding.line + 1,
+                    finding.name
+                );
+                chain_text(&mut block, &finding.chain);
             }
             FindingKind::Sink => {
                 let _ = writeln!(block, "▣ {} — the source of {}", finding.path, finding.name);
@@ -266,6 +300,18 @@ impl Report {
                 );
             }
         }
+        if !self.packages.provided.is_empty() || !self.packages.used.is_empty() {
+            let _ = writeln!(out, "packages:");
+            for (sink, packages) in &self.packages.provided {
+                let _ = writeln!(out, "   {sink} is provided by {}", packages.join(", "));
+            }
+            if !self.packages.used.is_empty() {
+                let _ = writeln!(out, "   used by the cone, on lines that matter:");
+                for used in &self.packages.used {
+                    let _ = writeln!(out, "      {} — {} members", used.name, used.members);
+                }
+            }
+        }
         out.trim_end().to_owned()
     }
 
@@ -322,6 +368,7 @@ impl Report {
                 ("chain", hops(&finding.chain)),
                 ("sinks", strings(&finding.sinks)),
                 ("configurations", strings(&finding.configurations)),
+                ("count", Json::Int(finding.count as i64)),
             ];
             if let Some(role) = finding.role {
                 items.push(("role", Json::String(role.name().to_owned())));
@@ -399,6 +446,41 @@ impl Report {
             ));
         }
         if cone {
+            items.push((
+                "packages",
+                object(vec![
+                    (
+                        "provided",
+                        Json::Array(
+                            self.packages
+                                .provided
+                                .iter()
+                                .map(|(sink, packages)| {
+                                    object(vec![
+                                        ("sink", Json::String(sink.clone())),
+                                        ("packages", strings(packages)),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "used",
+                        Json::Array(
+                            self.packages
+                                .used
+                                .iter()
+                                .map(|used| {
+                                    object(vec![
+                                        ("name", Json::String(used.name.clone())),
+                                        ("members", Json::Int(used.members as i64)),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                ]),
+            ));
             items.push(("cone", Json::Array(self.cone.iter().map(listed).collect())));
             items.push((
                 "hubs",

@@ -82,9 +82,20 @@ that asks for consent does; a change to game logic does not.
     { "name": "ios", "symbols": ["UNITY_IOS", "-UNITY_ANDROID", "-UNITY_EDITOR"] }
   ],
   "sinks": [
-    { "name": "Ads", "namespaces": ["Vendor.Ads"], "paths": ["Assets/Vendor/Ads"] },
-    { "name": "Consent", "types": ["ConsentManager"], "assemblies": ["Vendor.Consent"] }
+    {
+      "name": "Ads",
+      "namespaces": ["Vendor.Ads"],
+      "paths": ["Assets/Vendor/Ads"],
+      "mentions": ["appsflyer"]
+    },
+    {
+      "name": "Consent",
+      "types": ["ConsentManager"],
+      "assemblies": ["Vendor.Consent"],
+      "packages": ["com.vendor.consent", "com.vendor.consent.*"]
+    }
   ],
+  "text_files": ["**/*Dependencies.xml", "**/*.gradle", "**/Podfile"],
   "watch": [
     { "name": "SDK packages", "paths": ["Packages/manifest.json", "Assets/Vendor/**"] }
   ],
@@ -100,8 +111,14 @@ build: `NAME` defines a preprocessor symbol everywhere, `-NAME` undefines it.
 A Unity project's own compile is its editor's, and the code that talks to a
 device SDK usually sits behind `#if UNITY_ANDROID && !UNITY_EDITOR`; the cone
 is worked out for every configuration and a report says which ones a finding
-holds for. `watch` lists files to report as they are: a package manifest, a
-vendor folder. Without `--config` the file is `ROOT/.rustlyn/reach.json`.
+holds for. `watch` lists files to report as they are: a vendor folder, a settings file.
+A sink's `packages` are Unity package names (`*` is a glob) that are the sink
+even when the code analysis cannot tell, as with a binary plugin; its
+`mentions` are substrings, matched without regard to case, that make a changed
+line of a native build file concern it. `text_files` are the globs of those
+build files and default to `**/*Dependencies.xml`, `**/*.gradle`,
+`**/gradle.properties`, `**/AndroidManifest.xml`, `**/Podfile` and
+`**/*.podspec`. Without `--config` the file is `ROOT/.rustlyn/reach.json`.
 
 The cone is walked backward from every place where own code names a sink:
 
@@ -141,6 +158,31 @@ be found, so a removed line that names a sink's type is reported by the name.
 A changed scene, prefab or asset is reported when the change is in the
 serialized data of a script whose fields the cone reads.
 
+A change to `Packages/manifest.json` or `Packages/packages-lock.json` is judged
+per package, not as one file: the packages added, removed or changed (by
+version or hash) are compared between the old and the new text, and each is
+judged by the first rule that holds, for every configuration. A package
+concerns a sink (a `package` finding, certain) when
+
+1. it provides a sink: own code names a sink declared in it, or the
+   configuration names it (`package_of`);
+2. a package that provides a sink depends on it, directly or not, by the lock
+   (`dependency_of`);
+3. it depends on a package that provides a sink (`depends_on`);
+4. a member on a path to a sink, or a helper of one, uses it on the lines that
+   matter (`used_by`, the member closest to a sink, then its way on; the
+   finding says how many members use it).
+
+Any other package is not affected and counts under `unaffected`. A package
+owns the files of its folder: `Library/PackageCache/<name>@…/`, and the folder
+of a lock entry that is `embedded` (`file:<folder>`) or `local` (`file:<path
+relative to Packages>`). A manifest or a lock that is not JSON, before or after,
+is reported whole as a certain `watch` finding named `packages`.
+
+A changed line of one of the `text_files` — added or removed — that contains a
+sink's `mentions` is a certain `mention` finding, once for each file and sink,
+with the line as the way on (`mentions`).
+
 Without `--diff` the change is the git working copy against `--base`
 (`HEAD`); `--merge-base master` takes the commit the branch left `master` at.
 `--commits RANGE` judges every commit of a git range (first parents: a merge
@@ -151,11 +193,16 @@ members are found in today's code, and a member the cone holds a slice of is
 affected for certain when the changed lines mention what the slice leads to.
 `--commit REV` judges that one commit against its first parent, the same way;
 it can be given more than once. The library does the same without the tool:
-`reach::git::revision(root, "HEAD")` and `reach::git::revisions(root, range, progress)`
-give the `Revision`s to put in a `Request`.
+`reach::git::revision(root, "HEAD", &config)` and
+`reach::git::revisions(root, range, &config, progress)` give the `Revision`s to
+put in a `Request`. Sources, assets, the two package files and the
+`text_files` are diffed and their text kept; every other changed path is only
+named in `Revision::others`, which is all a `watch` needs.
 
 `--cone` prints the cone instead: every member with its way to a sink, then
-the hubs. It is the way to check a configuration. `--json` is the report for
+the hubs, then the packages: for each sink the packages that provide it, and
+the packages the cone uses on lines that matter with the number of members,
+most used first. It is the way to check a configuration. `--json` is the report for
 scripts and agents (schema `version: 1`). The exit code is 0 when the change
 leads to no sink, 3 when it does, 2 on an error.
 

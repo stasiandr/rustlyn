@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use super::packages::{LOCK, MANIFEST};
 use super::{Config, FindingKind, Report, Request, Revision, Role, analyze};
 use crate::blast::testing::{Project, patch};
 
@@ -722,6 +723,7 @@ fn a_past_change_is_judged_by_names() {
             title: format!("change {id}"),
             patch: patch("Game/Consent.cs", CONSENT, &then),
             texts: HashMap::from([("Game/Consent.cs".to_owned(), then)]),
+            ..Revision::default()
         }
     };
     let request = Request {
@@ -779,4 +781,398 @@ fn a_past_change_is_judged_by_names() {
     );
     let json = report.json(false);
     assert_eq!(json.objects("revisions").map(|list| list.len()), Some(4));
+}
+
+// MARK: - Unity packages and build files
+
+const STORE: &str = "namespace Vendor.Iap {
+    public static class Store {
+        public static bool Ready() { return true; }
+    }
+}
+";
+
+const LABEL: &str = "namespace Vendor.Ui {
+    public static class Label {
+        public static string Text(string text) { return text; }
+    }
+}
+";
+
+/// Game code over three packages: it sells through the store and reports
+/// to the ads SDK, and shows labels.
+const PAY: &str = "using Vendor.Ads;
+using Vendor.Iap;
+using Vendor.Ui;
+namespace Game {
+    public class Payments {
+        public void Purchase(string id) {
+            if (!Store.Ready()) return;
+            Tracker.Send(id);
+        }
+    }
+    public class Hud {
+        public string Title() {
+            return Label.Text(\"hello\");
+        }
+    }
+}
+";
+
+const PACKAGE_CONFIG: &str = r#"{
+    "name": "ads",
+    "own": ["Game"],
+    "sinks": [{ "name": "Ads", "namespaces": ["Vendor.Ads"], "mentions": ["AppsFlyer"] }]
+}"#;
+
+const DEPENDENCIES: &str = "<dependencies>
+  <androidPackages>
+    <androidPackage spec=\"com.appsflyer:af-android-sdk:6.14.0\"/>
+    <androidPackage spec=\"com.other:lib:1.0\"/>
+  </androidPackages>
+</dependencies>
+";
+
+/// The manifest: what the project asked for. `core` is only in the lock.
+fn manifest() -> String {
+    "{
+  \"dependencies\": {
+    \"com.vendor.ads\": \"1.0.0\",
+    \"com.vendor.iap\": \"1.0.0\",
+    \"com.vendor.ui\": \"1.0.0\",
+    \"com.vendor.wrap\": \"1.0.0\"
+  }
+}
+"
+    .to_owned()
+}
+
+/// The lock: the three packages embedded in the project, `ads` over `core`,
+/// and `wrap` over `ads`.
+fn lock() -> String {
+    let entry = |name: &str, version: &str, source: &str, dependencies: &str| {
+        format!(
+            "    \"com.vendor.{name}\": {{\n      \"version\": \"{version}\",\n      \"depth\": 0,\n      \"source\": \"{source}\",\n      \"dependencies\": {{{dependencies}}},\n      \"hash\": \"{name}-1\"\n    }}"
+        )
+    };
+    let entries = [
+        entry(
+            "ads",
+            "file:com.vendor.ads",
+            "embedded",
+            "\"com.vendor.core\": \"1.0.0\"",
+        ),
+        entry("iap", "file:com.vendor.iap", "embedded", ""),
+        entry("ui", "file:com.vendor.ui", "embedded", ""),
+        entry("core", "1.0.0", "registry", ""),
+        entry("wrap", "1.0.0", "registry", "\"com.vendor.ads\": \"1.0.0\""),
+    ];
+    format!(
+        "{{\n  \"dependencies\": {{\n{}\n  }}\n}}\n",
+        entries.join(",\n")
+    )
+}
+
+/// A project whose SDK is an embedded package, as are the code the game
+/// uses to buy and a label widget.
+fn package_project(name: &str) -> Project {
+    Project::new(
+        name,
+        &[
+            ("Packages/com.vendor.ads/Runtime/Tracker.cs", VENDOR),
+            ("Packages/com.vendor.iap/Runtime/Store.cs", STORE),
+            ("Packages/com.vendor.ui/Runtime/Label.cs", LABEL),
+            (MANIFEST, &manifest()),
+            (LOCK, &lock()),
+            ("Game/Pay.cs", PAY),
+        ],
+    )
+}
+
+/// The manifest and the lock after `package` was bumped, as the texts and
+/// as one patch.
+fn bumped(package: &str) -> (String, String, String) {
+    let name = package.strip_prefix("com.vendor.").unwrap_or(package);
+    let manifest = manifest().replace(
+        &format!("\"{package}\": \"1.0.0\""),
+        &format!("\"{package}\": \"1.1.0\""),
+    );
+    let lock = lock().replace(&format!("\"{name}-1\""), &format!("\"{name}-2\""));
+    let both = patch(MANIFEST, &self::manifest(), &manifest) + &patch(LOCK, &self::lock(), &lock);
+    (manifest, lock, both)
+}
+
+/// What bumping one package of the project comes to.
+fn bump(name: &str, package: &str) -> Report {
+    let project = package_project(name);
+    let (manifest, lock, patch) = bumped(package);
+    project.write(MANIFEST, &manifest);
+    project.write(LOCK, &lock);
+    run(&project, PACKAGE_CONFIG, Some(patch))
+}
+
+fn hop_steps(finding: &super::Finding) -> Vec<String> {
+    finding
+        .chain
+        .iter()
+        .map(|hop| format!("{} {}", hop.step, hop.target))
+        .collect()
+}
+
+#[test]
+fn a_package_that_is_the_sinks_code() {
+    let report = bump("pkg-ads", "com.vendor.ads");
+    assert!(report.affects(), "{}", report.text(true));
+    assert_eq!(report.findings.len(), 1, "{}", report.text(true));
+    let finding = &report.findings[0];
+    assert_eq!(finding.kind, FindingKind::Package);
+    assert_eq!(finding.name, "com.vendor.ads");
+    assert_eq!(finding.path, MANIFEST);
+    assert_eq!(finding.line, 2);
+    assert_eq!(hop_steps(finding), ["package_of com.vendor.ads"]);
+    assert_eq!(finding.chain[0].sink.as_deref(), Some("Ads"));
+    assert_eq!(finding.sinks, ["Ads"]);
+    assert_eq!(finding.count, 0);
+    assert_eq!(report.unaffected, 0);
+}
+
+#[test]
+fn a_package_the_sinks_package_depends_on() {
+    // Only in the lock: its entry is found there.
+    let report = bump("pkg-core", "com.vendor.core");
+    assert!(report.affects(), "{}", report.text(true));
+    let finding = &report.findings[0];
+    assert_eq!(finding.name, "com.vendor.core");
+    assert_eq!(finding.path, LOCK);
+    assert_eq!(hop_steps(finding), ["dependency_of com.vendor.ads"]);
+    assert_eq!(finding.sinks, ["Ads"]);
+}
+
+#[test]
+fn a_package_that_depends_on_the_sinks_package() {
+    let report = bump("pkg-wrap", "com.vendor.wrap");
+    assert!(report.affects(), "{}", report.text(true));
+    let finding = &report.findings[0];
+    assert_eq!(finding.name, "com.vendor.wrap");
+    assert_eq!(hop_steps(finding), ["depends_on com.vendor.ads"]);
+    assert_eq!(finding.sinks, ["Ads"]);
+}
+
+#[test]
+fn a_package_the_way_to_a_sink_uses() {
+    let report = bump("pkg-iap", "com.vendor.iap");
+    assert!(report.affects(), "{}", report.text(true));
+    let finding = &report.findings[0];
+    assert_eq!(finding.kind, FindingKind::Package);
+    assert_eq!(finding.count, 1);
+    assert_eq!(
+        hop_steps(finding),
+        [
+            "used_by Game.Payments.Purchase(string)",
+            "uses Tracker.Send"
+        ]
+    );
+    // The line of the use, in the member's file.
+    assert_eq!(finding.chain[0].path, "Game/Pay.cs");
+    assert_eq!(finding.chain[0].line, 6);
+    assert_eq!(finding.chain[1].sink.as_deref(), Some("Ads"));
+    assert_eq!(finding.sinks, ["Ads"]);
+    let text = report.text(true);
+    assert!(
+        text.contains("used by 1 members on the way, such as Game.Payments.Purchase(string)"),
+        "{text}"
+    );
+    let json = report.json(false);
+    let findings = json.objects("findings").expect("findings");
+    assert_eq!(findings[0].str("kind"), Some("package"));
+    assert_eq!(findings[0].int("count"), Some(1));
+}
+
+#[test]
+fn a_package_only_game_logic_uses_is_not_affected() {
+    let report = bump("pkg-ui", "com.vendor.ui");
+    assert!(!report.affects(), "{}", report.text(true));
+    assert!(report.findings.is_empty(), "{}", report.text(true));
+    assert_eq!(report.unaffected, 1);
+}
+
+#[test]
+fn a_sink_named_only_by_its_packages() {
+    // No code in the project names the sink: its packages are binaries.
+    let config = r#"{
+        "name": "ads",
+        "own": ["Game"],
+        "sinks": [{ "name": "Ads", "types": ["Nothing"], "packages": ["com.vendor.a*"] }]
+    }"#;
+    let project = package_project("pkg-named");
+    let (manifest, lock, both) = bumped("com.vendor.ads");
+    project.write(MANIFEST, &manifest);
+    project.write(LOCK, &lock);
+    let report = run(&project, config, Some(both));
+    let finding = &report.findings[0];
+    assert_eq!(
+        hop_steps(finding),
+        ["package_of com.vendor.ads"],
+        "{}",
+        report.text(true)
+    );
+    // What depends on it follows from the lock.
+    let (manifest, lock, both) = bumped("com.vendor.core");
+    project.write(MANIFEST, &manifest);
+    project.write(LOCK, &lock);
+    let report = run(&project, config, Some(both));
+    assert_eq!(
+        hop_steps(&report.findings[0]),
+        ["dependency_of com.vendor.ads"],
+        "{}",
+        report.text(true)
+    );
+}
+
+#[test]
+fn a_manifest_that_is_not_json_is_reported() {
+    let project = package_project("pkg-broken");
+    let broken = "{ \"dependencies\": { \"com.vendor.ads\": \n";
+    project.write(MANIFEST, broken);
+    let report = run(
+        &project,
+        PACKAGE_CONFIG,
+        Some(patch(MANIFEST, &manifest(), broken)),
+    );
+    assert!(report.affects(), "{}", report.text(true));
+    let finding = &report.findings[0];
+    assert_eq!(finding.kind, FindingKind::Watch);
+    assert_eq!(finding.name, "packages");
+    assert_eq!(finding.path, MANIFEST);
+}
+
+#[test]
+fn a_package_bump_in_a_past_revision() {
+    let project = package_project("pkg-past");
+    let revision = |id: &str, package: &str| {
+        let (manifest, lock, patch) = bumped(package);
+        Revision {
+            id: id.to_owned(),
+            title: format!("bump {package}"),
+            patch,
+            texts: HashMap::from([(MANIFEST.to_owned(), manifest), (LOCK.to_owned(), lock)]),
+            ..Revision::default()
+        }
+    };
+    let request = Request {
+        root: project.root(),
+        revisions: vec![
+            revision("iap", "com.vendor.iap"),
+            revision("ui", "com.vendor.ui"),
+            revision("ads", "com.vendor.ads"),
+        ],
+        ..Request::default()
+    };
+    let report =
+        analyze(&request, &Config::parse(PACKAGE_CONFIG).expect("config")).expect("analyzed");
+    let text = report.text(true);
+    let judged: Vec<bool> = report.revisions.iter().map(|r| r.affects()).collect();
+    assert_eq!(judged, [true, false, true], "{text}");
+    let finding = &report.revisions[0].findings[0];
+    assert_eq!(finding.kind, FindingKind::Package);
+    assert_eq!(finding.count, 1);
+    assert_eq!(report.revisions[1].unaffected, 1, "{text}");
+    assert_eq!(report.revisions[2].findings[0].chain[0].step, "package_of");
+}
+
+#[test]
+fn a_line_of_a_build_file_that_names_a_sink() {
+    let path = "Game/Editor/AdsDependencies.xml";
+    let judged = |name: &str, old: &str, new: &str| {
+        let project = package_project(name);
+        project.write(path, new);
+        run(&project, PACKAGE_CONFIG, Some(patch(path, old, new)))
+    };
+    let bumped = DEPENDENCIES.replace("6.14.0", "6.15.0");
+    // The line is replaced: added and removed both name it, once.
+    let report = judged("mention-bump", DEPENDENCIES, &bumped);
+    assert!(report.affects(), "{}", report.text(true));
+    assert_eq!(report.findings.len(), 1, "{}", report.text(true));
+    let finding = &report.findings[0];
+    assert_eq!(finding.kind, FindingKind::Mention);
+    // As the configuration spells it, matched without regard to case.
+    assert_eq!(finding.name, "AppsFlyer");
+    assert_eq!(finding.path, path);
+    assert_eq!(finding.line, 2);
+    assert_eq!(finding.sinks, ["Ads"]);
+    assert_eq!(finding.chain[0].step, "mentions");
+    assert_eq!(
+        finding.chain[0].target,
+        "<androidPackage spec=\"com.appsflyer:af-android-sdk:6.15.0\"/>"
+    );
+    // Added.
+    let without = DEPENDENCIES.replace(
+        "    <androidPackage spec=\"com.appsflyer:af-android-sdk:6.14.0\"/>\n",
+        "",
+    );
+    let report = judged("mention-added", &without, DEPENDENCIES);
+    assert!(report.affects(), "{}", report.text(true));
+    // Removed: the line is not in the new text.
+    let report = judged("mention-removed", DEPENDENCIES, &without);
+    assert!(report.affects(), "{}", report.text(true));
+    assert_eq!(report.findings[0].kind, FindingKind::Mention);
+    // A line that names nothing.
+    let other = DEPENDENCIES.replace("com.other:lib:1.0", "com.other:lib:2.0");
+    let report = judged("mention-none", DEPENDENCIES, &other);
+    assert!(!report.affects(), "{}", report.text(true));
+    assert!(report.findings.is_empty(), "{}", report.text(true));
+}
+
+#[test]
+fn a_watched_file_changed_by_name_only_in_a_past_revision() {
+    let project = project("others");
+    let revision = |others: &[&str]| Revision {
+        id: "abc".to_owned(),
+        title: "binary".to_owned(),
+        others: others.iter().map(|path| (*path).to_owned()).collect(),
+        ..Revision::default()
+    };
+    let request = Request {
+        root: project.root(),
+        revisions: vec![
+            revision(&["Packages/manifest.json"]),
+            revision(&["Assets/a.png"]),
+        ],
+        ..Request::default()
+    };
+    let report = analyze(&request, &Config::parse(CONFIG).expect("config")).expect("analyzed");
+    let text = report.text(true);
+    assert!(report.revisions[0].affects(), "{text}");
+    assert_eq!(report.revisions[0].findings[0].kind, FindingKind::Watch);
+    assert_eq!(report.revisions[0].findings[0].name, "packages");
+    assert!(!report.revisions[1].affects(), "{text}");
+}
+
+#[test]
+fn the_cone_lists_its_packages() {
+    let project = package_project("pkg-cone");
+    let report = run(&project, PACKAGE_CONFIG, None);
+    assert_eq!(
+        report.packages.provided,
+        [("Ads".to_owned(), vec!["com.vendor.ads".to_owned()])]
+    );
+    // The store is used on the way; the label is game logic's; the SDK's
+    // own package is not listed as used.
+    assert_eq!(report.packages.used.len(), 1, "{:?}", report.packages);
+    assert_eq!(report.packages.used[0].name, "com.vendor.iap");
+    assert_eq!(report.packages.used[0].members, 1);
+    let text = report.cone_text(true);
+    assert!(text.contains("Ads is provided by com.vendor.ads"), "{text}");
+    assert!(text.contains("com.vendor.iap — 1 members"), "{text}");
+    let json = report.json(true);
+    let section = json.object("packages").expect("packages");
+    let used = section.objects("used").expect("used");
+    assert_eq!(used[0].str("name"), Some("com.vendor.iap"));
+    assert_eq!(used[0].int("members"), Some(1));
+    let provided = section.objects("provided").expect("provided");
+    assert_eq!(provided[0].str("sink"), Some("Ads"));
+    assert_eq!(
+        provided[0].strings("packages"),
+        Some(vec!["com.vendor.ads".to_owned()])
+    );
 }

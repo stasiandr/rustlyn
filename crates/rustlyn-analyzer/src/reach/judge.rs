@@ -16,8 +16,9 @@ use rustlyn_ide::semantic::Semantic;
 
 use super::Listed;
 use super::cone::{Cone, Role, Step, Via};
-use super::config::Config;
+use super::config::{Config, glob_matches};
 use super::graph::{Graph, NodeId};
+use super::packages::{Changes, Packages};
 use super::text::words;
 use crate::blast::changes::{How, Members, changes_by};
 use crate::blast::diff::{FileDiff, Status};
@@ -39,6 +40,11 @@ pub enum FindingKind {
     /// A scene, prefab or asset with the serialized data of a script whose
     /// fields the cone reads.
     Asset,
+    /// A Unity package that was updated, added or removed, and concerns a
+    /// sink.
+    Package,
+    /// A line of a native build file that names a sink.
+    Mention,
 }
 
 impl FindingKind {
@@ -52,6 +58,8 @@ impl FindingKind {
             Self::Sink => "sink",
             Self::Watch => "watch",
             Self::Asset => "asset",
+            Self::Package => "package",
+            Self::Mention => "mention",
         }
     }
 }
@@ -91,6 +99,9 @@ pub struct Finding {
     pub chain: Vec<Hop>,
     pub sinks: Vec<String>,
     pub configurations: Vec<String>,
+    /// For a package: how many members of the cone use it on lines that
+    /// matter. Zero for anything else.
+    pub count: usize,
 }
 
 /// What a configuration says of a change.
@@ -202,6 +213,7 @@ pub fn judge(
                     chain: Vec::new(),
                     sinks: vec![config.sinks[sink].name.clone()],
                     configurations: Vec::new(),
+                    count: 0,
                 });
             } else if file.status == Status::Deleted && config.is_own(&file.path) {
                 // A file that is gone: by what its lines named.
@@ -457,6 +469,7 @@ fn settle(
         chain: hops,
         sinks,
         configurations: Vec::new(),
+        count: 0,
     });
 }
 
@@ -514,6 +527,7 @@ fn verdict(
         chain: chain.0,
         sinks: chain.1,
         configurations: Vec::new(),
+        count: 0,
     };
     if let Some(entry) = cone.entries.get(&node) {
         // The way on from the statement that changed, when one did.
@@ -694,10 +708,35 @@ pub fn judge_revision(
     judged
 }
 
-/// The changed files the configuration watches.
+/// The changed files the configuration watches. `others` are the paths a
+/// past change touched that have no diff — a scene of hundreds of
+/// megabytes, a binary — which a watch needs only by name.
 #[must_use]
-pub fn watched(config: &Config, files: &[FileDiff]) -> Vec<Finding> {
+pub fn watched(config: &Config, files: &[FileDiff], others: &[String]) -> Vec<Finding> {
     let mut findings = Vec::new();
+    for path in others {
+        for watch in config.watched(path) {
+            if findings
+                .iter()
+                .any(|f: &Finding| &f.path == path && f.name == watch.name)
+            {
+                continue;
+            }
+            findings.push(Finding {
+                kind: FindingKind::Watch,
+                path: path.clone(),
+                line: 0,
+                name: watch.name.clone(),
+                role: None,
+                certain: true,
+                lines: Vec::new(),
+                chain: Vec::new(),
+                sinks: Vec::new(),
+                configurations: Vec::new(),
+                count: 0,
+            });
+        }
+    }
     for file in files {
         let paths = std::iter::once(&file.path).chain(&file.old_path);
         let mut names: Vec<&str> = Vec::new();
@@ -720,6 +759,7 @@ pub fn watched(config: &Config, files: &[FileDiff]) -> Vec<Finding> {
                 chain: Vec::new(),
                 sinks: Vec::new(),
                 configurations: Vec::new(),
+                count: 0,
             });
         }
     }
@@ -870,6 +910,7 @@ pub fn assets_of(
                     chain,
                     sinks: listed.sinks.clone(),
                     configurations: Vec::new(),
+                    count: 0,
                 });
             }
         }
@@ -952,6 +993,7 @@ pub fn merge(findings: Vec<Finding>) -> Vec<Finding> {
         });
         match same {
             Some(other) => {
+                other.count = other.count.max(finding.count);
                 if finding.certain && !other.certain {
                     other.certain = true;
                     other.chain.clone_from(&finding.chain);
@@ -984,4 +1026,255 @@ pub fn merge(findings: Vec<Finding>) -> Vec<Finding> {
             .then_with(|| a.kind.cmp(&b.kind))
     });
     merged
+}
+
+/// The packages that are a sink, by name, and the sinks of each: the ones
+/// whose code the graph found a sink in, and the ones the configuration
+/// names. `known` are the project's packages, which the configuration's
+/// globs are matched against; `more` are other names to match, such as the
+/// changed ones.
+#[must_use]
+pub fn providers(
+    graph: &Graph,
+    config: &Config,
+    known: &Packages,
+    more: &[&str],
+) -> BTreeMap<String, Vec<usize>> {
+    let mut found: BTreeMap<String, Vec<usize>> = graph
+        .provided
+        .iter()
+        .map(|(name, sinks)| (name.clone(), sinks.iter().copied().collect()))
+        .collect();
+    let mut names: Vec<String> = known.names().into_iter().collect();
+    names.extend(graph.packages.iter().cloned());
+    names.extend(more.iter().map(|name| (*name).to_owned()));
+    // A name given whole is a package whether or not the project lists it.
+    for sink in &config.sinks {
+        names.extend(
+            sink.packages
+                .iter()
+                .filter(|glob| !glob.contains(['*', '?']))
+                .cloned(),
+        );
+    }
+    for name in names {
+        for (index, sink) in config.sinks.iter().enumerate() {
+            if sink.packages.iter().any(|glob| glob_matches(glob, &name)) {
+                let sinks = found.entry(name.clone()).or_default();
+                if !sinks.contains(&index) {
+                    sinks.push(index);
+                }
+            }
+        }
+    }
+    for sinks in found.values_mut() {
+        sinks.sort_unstable();
+    }
+    found
+}
+
+/// Judges the packages a change touched against one configuration's cone.
+/// `known` are the project's packages as they are now.
+///
+/// A package concerns a sink when it provides it, when a package that
+/// provides it depends on it, when it depends on one that does, or when the
+/// own code on the way to a sink uses it on the lines that matter. What
+/// else a package update changes is the project's business, not the
+/// sinks'.
+#[must_use]
+pub fn packages(
+    graph: &Graph,
+    cone: &Cone,
+    config: &Config,
+    known: &Packages,
+    changes: &Changes,
+) -> Judged {
+    let mut judged = Judged::default();
+    let names: Vec<&str> = changes.packages.iter().map(|c| c.name.as_str()).collect();
+    let providers = providers(graph, config, known, &names);
+    let sink_name = |sink: usize| config.sinks[sink].name.clone();
+    for changed in &changes.packages {
+        let finding = |chain: Vec<Hop>, sinks: Vec<String>, count: usize| Finding {
+            kind: FindingKind::Package,
+            path: changed.path.clone(),
+            line: changed.line,
+            name: changed.name.clone(),
+            role: None,
+            certain: true,
+            lines: vec![changed.line],
+            chain,
+            sinks,
+            configurations: Vec::new(),
+            count,
+        };
+        let hop = |step: &'static str, target: &str, sink: usize| Hop {
+            step,
+            target: target.to_owned(),
+            sink: Some(sink_name(sink)),
+            path: changed.path.clone(),
+            line: changed.line,
+        };
+        // 1. It is the sink's code.
+        if let Some(sinks) = providers.get(&changed.name)
+            && let Some(&first) = sinks.first()
+        {
+            judged.findings.push(finding(
+                vec![hop("package_of", &changed.name, first)],
+                sinks.iter().map(|&sink| sink_name(sink)).collect(),
+                0,
+            ));
+            continue;
+        }
+        // 2. A package that is the sink's depends on it; 3. it depends on
+        // one that is.
+        let dependents = known.dependents_of(&changed.name);
+        let depends_on = known.depends_on(&changed.name);
+        if let Some((package, sinks)) = providers
+            .iter()
+            .find(|(package, _)| dependents.contains(*package))
+        {
+            judged.findings.push(finding(
+                vec![hop("dependency_of", package, sinks[0])],
+                sinks.iter().map(|&sink| sink_name(sink)).collect(),
+                0,
+            ));
+            continue;
+        }
+        if let Some((package, sinks)) = providers
+            .iter()
+            .find(|(package, _)| depends_on.contains(*package))
+        {
+            judged.findings.push(finding(
+                vec![hop("depends_on", package, sinks[0])],
+                sinks.iter().map(|&sink| sink_name(sink)).collect(),
+                0,
+            ));
+            continue;
+        }
+        // 4. The code on the way to a sink uses it.
+        let used = used_on_the_way(graph, cone, &changed.name);
+        if let Some(&(first, line)) = used
+            .iter()
+            .min_by_key(|(node, _)| (cone.entries[node].depth, *node))
+        {
+            let (mut chain, mut sinks) = chain(graph, cone, config, first, None);
+            for &(other, _) in &used {
+                for sink in self::chain(graph, cone, config, other, None).1 {
+                    if !sinks.contains(&sink) {
+                        sinks.push(sink);
+                    }
+                }
+            }
+            let member = graph.member(first);
+            chain.insert(
+                0,
+                Hop {
+                    step: "used_by",
+                    target: member.key.clone(),
+                    sink: None,
+                    path: member.path.clone(),
+                    line: line as usize,
+                },
+            );
+            judged.findings.push(finding(chain, sinks, used.len()));
+            continue;
+        }
+        // 5. Not the sinks' business.
+        judged
+            .unaffected
+            .push((changed.path.clone(), changed.name.clone()));
+    }
+    judged
+}
+
+/// The members of the cone, on a path or helping it, that use the package
+/// on a line that matters, each with the first such line.
+#[must_use]
+pub fn used_on_the_way(graph: &Graph, cone: &Cone, package: &str) -> Vec<(NodeId, u32)> {
+    let Ok(index) = graph
+        .packages
+        .binary_search_by(|name| name.as_str().cmp(package))
+    else {
+        return Vec::new();
+    };
+    let mut users: BTreeMap<NodeId, u32> = BTreeMap::new();
+    for used in graph
+        .package_uses
+        .iter()
+        .filter(|used| used.package as usize == index)
+    {
+        let Some(entry) = cone.entries.get(&used.from) else {
+            continue;
+        };
+        if matches!(entry.role, Role::Path | Role::Helper) && entry.matters(used.line) {
+            users.entry(used.from).or_insert(used.line);
+        }
+    }
+    users.into_iter().collect()
+}
+
+/// A changed line of a native build file that names a sink: one finding
+/// for each file and sink. The added lines are read from the new text
+/// (`text_of(path)`), the removed ones from the patch.
+#[must_use]
+pub fn mentions(
+    config: &Config,
+    files: &[FileDiff],
+    text_of: &dyn Fn(&str) -> Option<String>,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    if config.sinks.iter().all(|sink| sink.mentions.is_empty()) {
+        return findings;
+    }
+    for file in files {
+        if !config.is_text_file(&file.path) {
+            continue;
+        }
+        let text = text_of(&file.path).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        let mut changed: Vec<(usize, &str)> = Vec::new();
+        for block in &file.blocks {
+            for line in block.new_lines.clone() {
+                if let Some(text) = lines.get(line) {
+                    changed.push((line, text));
+                }
+            }
+            for removed in &block.removed {
+                changed.push((block.new_lines.start, removed));
+            }
+        }
+        for sink in &config.sinks {
+            let found = changed.iter().find_map(|&(line, text)| {
+                let lower = text.to_lowercase();
+                sink.mentions
+                    .iter()
+                    .find(|mention| !mention.is_empty() && lower.contains(&mention.to_lowercase()))
+                    .map(|mention| (line, text, mention))
+            });
+            let Some((line, text, mention)) = found else {
+                continue;
+            };
+            let shown: String = text.trim().chars().take(120).collect();
+            findings.push(Finding {
+                kind: FindingKind::Mention,
+                path: file.path.clone(),
+                line,
+                name: mention.clone(),
+                role: None,
+                certain: true,
+                lines: vec![line],
+                chain: vec![Hop {
+                    step: "mentions",
+                    target: shown,
+                    sink: Some(sink.name.clone()),
+                    path: file.path.clone(),
+                    line,
+                }],
+                sinks: vec![sink.name.clone()],
+                configurations: Vec::new(),
+                count: 0,
+            });
+        }
+    }
+    findings
 }
