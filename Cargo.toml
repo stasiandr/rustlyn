@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+repository = "https://github.com/stasiandr/rustlyn"
+
+[workspace.dependencies]
+rustlyn-text = { path = "crates/rustlyn-text", version = "0.0.1" }
+rustlyn-diagnostics = { path = "crates/rustlyn-diagnostics", version = "0.0.1" }
+rustlyn-syntax = { path = "crates/rustlyn-syntax", version = "0.0.1" }
+rustlyn-semantics = { path = "crates/rustlyn-semantics", version = "0.0.1" }
+rustlyn-interpret = { path = "crates/rustlyn-interpret", version = "0.0.1" }
+rustlyn-emit = { path = "crates/rustlyn-emit", version = "0.0.1" }
+rustlyn-metadata = { path = "crates/rustlyn-metadata", version = "0.0.1" }
+rustlyn-ide = { path = "crates/rustlyn-ide", version = "0.0.1" }
+rustlyn-ffi = { path = "crates/rustlyn-ffi", version = "0.0.1" }
+rustlyn-decompile = { path = "crates/rustlyn-decompile", version = "0.0.1" }
+rustlyn-analyzer = { path = "crates/rustlyn-analyzer", version = "0.0.1" }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+
+# For iterating on the compiler: optimized enough to run the benchmark,
+# built several times faster than `release`.
+[profile.fast]
+inherits = "release"
+opt-level = 1
+incremental = true
+codegen-units = 256
+# Local ThinLTO and an incremental cache can link a stale symbol; off, the
+# build stays both incremental and correct.
+lto = "off"

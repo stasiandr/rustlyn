@@ -1,0 +1,22 @@
+[package]
+name = "rustlyn-ffi"
+description = "The C ABI over rustlyn-ide, for an editor that is not written in Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "rustlyn_ffi"
+# A static library is what an app bundle wants: one binary to sign and ship,
+# and no dynamic library to find at launch. The dynamic one is here for
+# anything that would rather load it at runtime.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+rustlyn-ide.workspace = true
+rustlyn-syntax.workspace = true
+
+[lints]
+workspace = true

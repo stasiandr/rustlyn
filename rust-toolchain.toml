@@ -1,0 +1,7 @@
+# The toolchain CI and everyone else build with. Pinned: every stable release
+# brings new clippy lints, and with `-D warnings` an unpinned CI goes red on a
+# release day with no change of ours. Bump it on purpose, fixing what the new
+# clippy finds in the same commit.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]

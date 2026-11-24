@@ -1,0 +1,16 @@
+[package]
+name = "rustlyn-interpret"
+description = "A tree-walking interpreter for the subset of C# Rustlyn understands"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustlyn-semantics.workspace = true
+rustlyn-syntax.workspace = true
+rustlyn-text.workspace = true
+
+[lints]
+workspace = true

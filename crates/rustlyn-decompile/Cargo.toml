@@ -1,0 +1,24 @@
+[package]
+name = "rustlyn-decompile"
+description = "Turning a .NET assembly back into readable C#"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustlyn-metadata.workspace = true
+
+[dev-dependencies]
+rustlyn-emit.workspace = true
+rustlyn-semantics.workspace = true
+rustlyn-syntax.workspace = true
+rustlyn-text.workspace = true
+
+[[bin]]
+name = "decompile"
+path = "src/main.rs"
+
+[lints]
+workspace = true

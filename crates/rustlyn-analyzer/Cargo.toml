@@ -1,0 +1,26 @@
+[package]
+name = "rustlyn-analyzer"
+description = "Whole-project analyses on top of rustlyn-ide: where a value comes from, how a method can fail, blast radius of a change, diffs, Unity assets and their references, NuGet packages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rustlyn-blast"
+path = "src/bin/rustlyn-blast.rs"
+
+[[bin]]
+name = "rustlyn-fail"
+path = "src/bin/rustlyn-fail.rs"
+
+[[bin]]
+name = "rustlyn-graph"
+path = "src/bin/rustlyn-graph.rs"
+
+[dependencies]
+rustlyn-ide.workspace = true
+
+[lints]
+workspace = true

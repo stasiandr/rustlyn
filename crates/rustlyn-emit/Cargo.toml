@@ -1,0 +1,21 @@
+[package]
+name = "rustlyn-emit"
+description = "IL and ECMA-335 metadata emission for the Rustlyn C# compiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustlyn-diagnostics.workspace = true
+rustlyn-semantics.workspace = true
+rustlyn-syntax.workspace = true
+rustlyn-text.workspace = true
+
+[dev-dependencies]
+rustlyn-decompile.workspace = true
+rustlyn-interpret.workspace = true
+
+[lints]
+workspace = true

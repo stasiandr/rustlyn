@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The version and components are in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # The emit tests run the assemblies they produce, which is the only
+      # check on a code generator worth trusting. Without a runtime they
+      # still compile the programs and say that they could not run them —
+      # which here would be a broken setup passing as green, so CI requires
+      # the host. Both runtimes: the programs the emit tests write themselves
+      # ask for 8.0, which does not roll forward to 10; the rest compile
+      # against what the host has, and 10 is what the compiler targets.
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features
+      # Every crate's tests, even after one fails: a red test early in the
+      # list would otherwise hide whether the emitter's still pass.
+      - run: cargo test --all-features --no-fail-fast
+        env:
+          RUSTLYN_REQUIRE_DOTNET: "1"
+      # The C header is written by hand, so only a C compiler can say whether
+      # it still describes the library. This compiles it against the real
+      # static library and calls through it.
+      - run: crates/rustlyn-ffi/tests/run.sh
+
+  # Every program the emit tests run, read back by the decompiler, compiled
+  # again and run: it has to print the same. The ones that do not yet are
+  # listed in crates/rustlyn-emit/tests/roundtrip_known.txt; a program off
+  # that list that stops passing is a regression in either half.
+  roundtrip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - run: cargo test --test against_references -p rustlyn-emit
+        env:
+          RUSTLYN_REQUIRE_DOTNET: "1"
+          RUSTLYN_ROUNDTRIP: "1"

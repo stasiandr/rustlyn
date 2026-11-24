@@ -1,0 +1,17 @@
+[package]
+name = "rustlyn-metadata"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reading ECMA-335 metadata out of a .NET assembly"
+
+[dev-dependencies]
+rustlyn-emit.workspace = true
+rustlyn-semantics.workspace = true
+rustlyn-syntax.workspace = true
+rustlyn-text.workspace = true
+
+[lints]
+workspace = true

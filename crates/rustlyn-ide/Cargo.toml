@@ -1,0 +1,25 @@
+[package]
+name = "rustlyn-ide"
+description = "The editor-facing side of Rustlyn: open, colour, outline, index and decompile, each layer cached"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustlyn-decompile.workspace = true
+rustlyn-emit.workspace = true
+rustlyn-diagnostics.workspace = true
+rustlyn-metadata.workspace = true
+rustlyn-semantics.workspace = true
+rustlyn-syntax.workspace = true
+rustlyn-text.workspace = true
+
+[dev-dependencies]
+# Only for the tests: the surest check that an assembly is read correctly is
+# to compile one and read it back, and the emitter is the other end of the
+# same standard.
+
+[lints]
+workspace = true
