@@ -23,6 +23,7 @@
 
 pub mod cone;
 pub mod config;
+pub mod git;
 pub mod graph;
 pub mod judge;
 pub mod render;

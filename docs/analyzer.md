@@ -64,7 +64,7 @@ Change: 4 changed members in 1 files; 2 more reached, assets 1. Risk: high.
 
 ```
 rustlyn-reach [ROOT] --config FILE [--diff FILE|-] [--base REV] [--merge-base REV] [--staged] [--possible] [--json] [--no-cache] [--timings]
-rustlyn-reach [ROOT] --config FILE --commits RANGE [--possible] [--json]
+rustlyn-reach [ROOT] --config FILE --commits RANGE [--commit REV] [--possible] [--json]
 rustlyn-reach [ROOT] --config FILE --cone [--users] [--json]
 ```
 
@@ -149,6 +149,10 @@ release's merges touched the SDKs. A file that has not changed since a commit
 is judged by lines, as above; one that has is judged by names: the changed
 members are found in today's code, and a member the cone holds a slice of is
 affected for certain when the changed lines mention what the slice leads to.
+`--commit REV` judges that one commit against its first parent, the same way;
+it can be given more than once. The library does the same without the tool:
+`reach::git::revision(root, "HEAD")` and `reach::git::revisions(root, range, progress)`
+give the `Revision`s to put in a `Request`.
 
 `--cone` prints the cone instead: every member with its way to a sink, then
 the hubs. It is the way to check a configuration. `--json` is the report for

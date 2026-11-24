@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use rustlyn_ide::formats::json::{Json, object};
+use rustlyn_ide::formats::json::{Format, Json, object};
 
 use super::judge::{Finding, FindingKind, Hop};
 use super::{Judgement, Listed, Report, Role};
@@ -267,6 +267,13 @@ impl Report {
             }
         }
         out.trim_end().to_owned()
+    }
+
+    /// The report as the text a tool prints: [`Report::json`] pretty-printed
+    /// with sorted keys, so that two runs can be compared as text.
+    #[must_use]
+    pub fn json_text(&self, cone: bool) -> String {
+        self.json(cone).to_text_with(Format::PRETTY_SORTED)
     }
 
     /// The report for machines (schema `version: 1`). `cone` adds the whole
