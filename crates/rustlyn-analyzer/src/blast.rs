@@ -27,10 +27,10 @@ pub mod risk;
 pub mod setup;
 pub mod walk;
 
-mod ask;
+pub(crate) mod ask;
 
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 
 use std::collections::HashMap;
 

@@ -30,12 +30,30 @@ pub fn compiled_timed(
     cache: Option<PathBuf>,
     phases: &mut Vec<(&'static str, u128)>,
 ) -> Result<Session, String> {
+    compiled_with(root, cache, Vec::new(), phases)
+}
+
+/// The same, read with preprocessor symbols of the caller's: `NAME` is
+/// defined everywhere, `-NAME` undefined everywhere, over what the project
+/// says. A Unity project's own compile is its editor's; this is how to read
+/// it as a build for a device (`UNITY_ANDROID`, `-UNITY_EDITOR`). Give each
+/// set of symbols a `cache` folder of its own.
+///
+/// # Errors
+///
+/// When the compiler panics while indexing or compiling.
+pub fn compiled_with(
+    root: &str,
+    cache: Option<PathBuf>,
+    symbols: Vec<String>,
+    phases: &mut Vec<(&'static str, u128)>,
+) -> Result<Session, String> {
     let mut lap = Instant::now();
     let mut phase = |name: &'static str, phases: &mut Vec<(&'static str, u128)>| {
         phases.push((name, lap.elapsed().as_millis()));
         lap = Instant::now();
     };
-    let session = Session::new(trimmed(root), cache.clone(), Vec::new());
+    let session = Session::new(trimmed(root), cache.clone(), symbols);
     if cache.is_some() {
         let _ = ask(|| {
             session

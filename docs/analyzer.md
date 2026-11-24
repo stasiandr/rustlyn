@@ -19,6 +19,7 @@ an item says otherwise.
 | Module | What it does |
 |---|---|
 | `blast` | The blast radius of a change. It maps the changed lines of a patch onto members, then walks forward through the compiler to find who calls the changed code, who reads what it writes and who uses a changed type. It adds the Unity scenes and prefabs that use the touched scripts, then attaches risks to every node. |
+| `reach` | Does a change lead to a given set of APIs. A caller names the *sinks* (an SDK's namespaces, a vendor folder, an assembly); the analysis works out the cone of own code that leads to them through calls, fields and ECS components, and judges a change against it, with the chain from the change to the sink. |
 | `value` | The value graph: where a value comes from, through every place that writes it, down to its sources (literals, constants, configs, the Unity inspector, time, input). |
 | `fail` | How a member can fail (throw, division by zero, null, index, a library call), where, through which calls and under which conditions, and whether those conditions can hold given the values its inputs get across the project. |
 | `unity` | A Unity project read without Unity: asset GUIDs from `.meta` files, the serialized scene and prefab format, and where a script or asset is used. |
@@ -58,6 +59,101 @@ Change: 4 changed members in 1 files; 2 more reached, assets 1. Risk: high.
       ⚠ medium: Unity calls it every frame: an error or slow code shows at once
 ▣ Assets/Hero.prefab — has Assets/Player.cs (Hero › MonoBehaviour); sets field health
 ```
+
+### rustlyn-reach
+
+```
+rustlyn-reach [ROOT] --config FILE [--diff FILE|-] [--base REV] [--merge-base REV] [--staged] [--possible] [--json] [--no-cache] [--timings]
+rustlyn-reach [ROOT] --config FILE --commits RANGE [--possible] [--json]
+rustlyn-reach [ROOT] --config FILE --cone [--users] [--json]
+```
+
+A blast radius starts at a change and asks what it reaches. `rustlyn-reach`
+starts at the other end: the configuration names *sinks* — the APIs of an SDK,
+say — and the question is whether a change leads to them. A change to the code
+that asks for consent does; a change to game logic does not.
+
+```json
+{
+  "name": "ads",
+  "own": ["Assets/Game"],
+  "configurations": [
+    { "name": "android", "symbols": ["UNITY_ANDROID", "-UNITY_EDITOR"] },
+    { "name": "ios", "symbols": ["UNITY_IOS", "-UNITY_ANDROID", "-UNITY_EDITOR"] }
+  ],
+  "sinks": [
+    { "name": "Ads", "namespaces": ["Vendor.Ads"], "paths": ["Assets/Vendor/Ads"] },
+    { "name": "Consent", "types": ["ConsentManager"], "assemblies": ["Vendor.Consent"] }
+  ],
+  "watch": [
+    { "name": "SDK packages", "paths": ["Packages/manifest.json", "Assets/Vendor/**"] }
+  ],
+  "ignore": ["Game.Logging"],
+  "limits": { "depth": 10, "data_hops": 2, "hub_callers": 10, "hub_writers": 10, "shared_readers": 3 }
+}
+```
+
+`own` is the code the cone is looked for in (everything outside the sinks'
+folders when it is left out). A sink is named by namespaces, type names,
+source folders or assemblies. Each configuration reads the project as one
+build: `NAME` defines a preprocessor symbol everywhere, `-NAME` undefines it.
+A Unity project's own compile is its editor's, and the code that talks to a
+device SDK usually sits behind `#if UNITY_ANDROID && !UNITY_EDITOR`; the cone
+is worked out for every configuration and a report says which ones a finding
+holds for. `watch` lists files to report as they are: a package manifest, a
+vendor folder. Without `--config` the file is `ROOT/.rustlyn/reach.json`.
+
+The cone is walked backward from every place where own code names a sink:
+
+* a member that names a sink is in it, all of it, and so are the members of a
+  type that derives from a sink's type: the sink calls them;
+* who calls a member of the cone is in it, by the *slice* of the calling
+  statement — the statement, the conditions it runs under, the conditions
+  under which an earlier `return` leaves before it, and the statements that
+  give the locals those mention their values;
+* a field, a property or an ECS component read on those lines is in it as
+  data, and so is who writes it. Two systems that never call each other are
+  linked by the component one sets and the other reads;
+* a method called on those lines, and from the cone only, is in it whole.
+
+Three things stop the walk before it reaches the whole project. A member with
+more than `hub_callers` callers is the project's own API over the sink
+(`Analytics.Track`): its callers are *users*, judged by the statement that
+calls it and followed no further; so are the callers of a base or interface
+member with several implementations. A field or component that more than
+`shared_readers` members outside the cone read is shared state: it is in the
+cone as data, but who writes it is not. And at most `data_hops` steps of a
+path go through data.
+
+A changed member of the cone is a finding for certain when the change is on
+the lines that matter, and a possible one (`--possible`) otherwise:
+
+```
+Reach «ads»: AFFECTS Ads — 1 findings; 0 possibly, 3 changed members do not lead there.
+✎ Game.ConsentSystem.SetStatus(bool) [path]  Assets/Game/Consent.cs:17
+   → writes Game.TrackingStatus  Assets/Game/Consent.cs:18
+   → read by Game.TrackingSystem.OnUpdate()  Assets/Game/Consent.cs:28
+   → uses Tracker.Start [Ads]  Assets/Game/Consent.cs:30
+```
+
+Removed lines are read as text: a call that is gone is not in the new code to
+be found, so a removed line that names a sink's type is reported by the name.
+A changed scene, prefab or asset is reported when the change is in the
+serialized data of a script whose fields the cone reads.
+
+Without `--diff` the change is the git working copy against `--base`
+(`HEAD`); `--merge-base master` takes the commit the branch left `master` at.
+`--commits RANGE` judges every commit of a git range (first parents: a merge
+is its whole branch) against the cone of the code as it is now — which of a
+release's merges touched the SDKs. A file that has not changed since a commit
+is judged by lines, as above; one that has is judged by names: the changed
+members are found in today's code, and a member the cone holds a slice of is
+affected for certain when the changed lines mention what the slice leads to.
+
+`--cone` prints the cone instead: every member with its way to a sink, then
+the hubs. It is the way to check a configuration. `--json` is the report for
+scripts and agents (schema `version: 1`). The exit code is 0 when the change
+leads to no sink, 3 when it does, 2 on an error.
 
 ### rustlyn-graph
 
@@ -134,7 +230,11 @@ println!("{}", report.text());
 - Parts of `value` still work on UTF-16 text internally, which is why
   `Decl` and `Target` positions are UTF-16 columns, the same as
   `rustlyn-ide`'s `Location`.
-- Morpeh-style ECS stashes are recognised by `value::ecs`. Other ECS frameworks
+- `reach` reads a body by its text, not its flow: a slice takes every
+  assignment to a local, before the statement or after it. It does not follow
+  a value through a call's arguments into the callee, and a delegate stored
+  in a field and invoked elsewhere is a read of the field, not a call.
+- Morpeh-style ECS stashes are recognised by `value::ecs` and `reach`. Other ECS frameworks
   need their own provider.
 - Unity source generators are not run, so members they add are invisible
   unless the host's `Symbols` knows about them.

@@ -70,7 +70,9 @@ pub use quick_info::QuickInfo;
 
 // MARK: - navigation: types, bases, implementations, calls
 mod hierarchy;
+mod links;
 pub use hierarchy::{HierarchyItem, IncomingCall, OutgoingCall};
+pub use links::{FileLinks, Link, LinkRole, LinkSymbol, LinkTarget};
 
 // MARK: - Unity: the methods the engine calls by name
 pub mod unity;

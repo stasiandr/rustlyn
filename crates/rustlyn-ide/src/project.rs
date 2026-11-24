@@ -377,7 +377,43 @@ impl Project {
             }
         }
         drop(generating);
+        project.override_symbols(symbols);
         project
+    }
+
+    /// Applies the caller's symbols over what the project files and Unity's
+    /// last compile say. `NAME` is defined in every assembly, `-NAME` is
+    /// undefined in every one: Unity's own compile is the editor's, with
+    /// `UNITY_EDITOR`, and the code a player runs sits behind
+    /// `#if UNITY_ANDROID && !UNITY_EDITOR` — asking about a build for a
+    /// device means reading the project with that build's symbols.
+    fn override_symbols(&mut self, symbols: &[String]) {
+        let removed: Vec<&str> = symbols
+            .iter()
+            .filter_map(|symbol| symbol.strip_prefix('-'))
+            .collect();
+        let added: Vec<&String> = symbols
+            .iter()
+            .filter(|symbol| !symbol.starts_with('-'))
+            .collect();
+        self.symbols
+            .retain(|symbol| !symbol.starts_with('-') && !removed.contains(&symbol.as_str()));
+        for symbol in &added {
+            if !self.symbols.contains(symbol) {
+                self.symbols.push((*symbol).clone());
+            }
+        }
+        for list in &mut self.assembly_symbols {
+            if list.is_empty() {
+                continue;
+            }
+            list.retain(|symbol| !removed.contains(&symbol.as_str()));
+            for symbol in &added {
+                if !list.contains(symbol) {
+                    list.push((*symbol).clone());
+                }
+            }
+        }
     }
 
     /// Which of `assemblies` each of `paths` goes into, `u16::MAX` where
@@ -2846,6 +2882,33 @@ mod tests {
         assert!(project.symbols.contains(&"UNITY_2021_3".to_string()));
         assert!(!project.symbols.contains(&"SHARED".to_string()));
         assert!(project.generated.is_empty(), "{}", project.generated);
+    }
+
+    #[test]
+    fn the_callers_symbols_go_over_the_projects() {
+        let mut project = folder_project(Path::new("/nowhere"));
+        project.symbols = vec!["TRACE".to_string(), "UNITY_EDITOR".to_string()];
+        // An assembly with symbols of its own, and one that takes the
+        // project's.
+        project.assembly_symbols = vec![
+            vec!["UNITY_EDITOR".to_string(), "UNITY_ANDROID".to_string()],
+            Vec::new(),
+        ];
+        project.override_symbols(&["UNITY_IOS".to_string(), "-UNITY_EDITOR".to_string()]);
+        assert_eq!(project.symbols, ["TRACE", "UNITY_IOS"]);
+        assert_eq!(project.assembly_symbols[0], ["UNITY_ANDROID", "UNITY_IOS"]);
+        assert!(project.assembly_symbols[1].is_empty());
+        let options = project.parse_options(0);
+        assert!(
+            options
+                .preprocessor_symbols
+                .contains(&"UNITY_IOS".to_string())
+        );
+        assert!(
+            !options
+                .preprocessor_symbols
+                .contains(&"UNITY_EDITOR".to_string())
+        );
     }
 
     #[test]

@@ -19,6 +19,10 @@
 //!   the compiler and the assets, and which of it is risky; hosts plug in
 //!   their own steps and risk models. The `rustlyn-blast` binary serves it
 //!   from a terminal and over the Model Context Protocol.
+//! * [`reach`] — does a change lead to a given set of APIs: the cone of
+//!   own code that leads to them through calls, fields and ECS components,
+//!   and a change judged against it. The `rustlyn-reach` binary serves it
+//!   from a terminal.
 //! * [`value`] — the value graph: where a value comes from, through the
 //!   places that write it, to its sources; hosts add their own edges.
 //! * [`fail`] — how a member can fail, when and whether it can happen, in
@@ -37,5 +41,6 @@ pub mod deep;
 pub mod diff;
 pub mod fail;
 pub mod nuget;
+pub mod reach;
 pub mod unity;
 pub mod value;

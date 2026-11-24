@@ -39,10 +39,11 @@ Roslyn does not have.
   diagnostics with IDE analyzers, rename, code actions, formatting and more. It loads
   `.sln`/`.csproj` and Unity projects, and `rustlyn-ffi` exposes it through a C ABI.
 * **Whole-project analyses.** `rustlyn-analyzer` computes the blast radius of a change,
+  says whether a change leads to a given SDK through calls, fields and ECS components,
   traces where a value comes from, and explains how a method can fail and under which
   conditions. It also reads Unity assets and their references, and NuGet packages. Its
   command-line tools are `rustlyn-blast` (also an MCP server for coding agents),
-  `rustlyn-graph` and `rustlyn-fail`. See [docs/analyzer.md](docs/analyzer.md).
+  `rustlyn-reach`, `rustlyn-graph` and `rustlyn-fail`. See [docs/analyzer.md](docs/analyzer.md).
 
 The APIs are pre-1.0 and may still change. Behaviour that knowingly differs from Roslyn
 is listed in [docs/differences-from-roslyn.md](docs/differences-from-roslyn.md), and

@@ -113,6 +113,23 @@ impl Members {
         Self { list }
     }
 
+    /// The same from an outline made elsewhere: the compiler's, which read
+    /// the file with its project's preprocessor symbols, so that code behind
+    /// an `#if` the project turns on is there.
+    #[must_use]
+    pub fn of_outline(path: &str, text: &str, parsed: &rustlyn_ide::FileOutline) -> Self {
+        let starts = line_starts(text);
+        let list = parsed
+            .declarations
+            .iter()
+            .filter(|d| {
+                d.kind != DeclarationKind::Namespace && d.kind != DeclarationKind::Extension
+            })
+            .map(|d| member(path, text, &starts, d))
+            .collect();
+        Self { list }
+    }
+
     /// The innermost member whose lines hold `line`. A type's line outside
     /// its members counts as the type's only in its header.
     #[must_use]
@@ -153,13 +170,26 @@ impl Members {
 /// The changed members of a file, by its new text (empty for a deleted one).
 #[must_use]
 pub fn changes(file: &FileDiff, new_text: &str) -> Vec<Change> {
+    changes_by(file, new_text, &Members::of)
+}
+
+/// The same, with the caller reading the structure of each text
+/// (`members_of(path, text)`): a compiled project reads a file with its
+/// preprocessor symbols, and a member behind an `#if` it turns on is there
+/// only then.
+#[must_use]
+pub fn changes_by(
+    file: &FileDiff,
+    new_text: &str,
+    members_of: &dyn Fn(&str, &str) -> Members,
+) -> Vec<Change> {
     let old_text = file.old_text(new_text);
     let new = if file.status == Status::Deleted {
         Members { list: Vec::new() }
     } else {
-        Members::of(&file.path, new_text)
+        members_of(&file.path, new_text)
     };
-    let old = Members::of(file.old_path.as_deref().unwrap_or(&file.path), &old_text);
+    let old = members_of(file.old_path.as_deref().unwrap_or(&file.path), &old_text);
     let new_lines = split_lines(new_text);
     let mut found: BTreeMap<String, Change> = BTreeMap::new();
     let mut note = |member: &Member, how: How, line: usize| {

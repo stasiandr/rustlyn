@@ -16,6 +16,10 @@ name = "rustlyn-fail"
 path = "src/bin/rustlyn-fail.rs"
 
 [[bin]]
+name = "rustlyn-reach"
+path = "src/bin/rustlyn-reach.rs"
+
+[[bin]]
 name = "rustlyn-graph"
 path = "src/bin/rustlyn-graph.rs"
 
