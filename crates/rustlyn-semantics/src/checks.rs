@@ -62,6 +62,7 @@ impl Compilation {
         checker.signatures();
         checker.attributes();
         checker.types();
+        checker.constants();
         let trees = match tree {
             Some(tree) => tree..tree + 1,
             None => self.corlib_trees..self.trees().len(),
@@ -686,6 +687,56 @@ impl Checker<'_> {
                     && self.could_be_attribute_value(alternative)
             }
             _ => true,
+        }
+    }
+
+    // MARK: - constants
+
+    /// CS0110: a constant whose value is written in terms of itself, through
+    /// however many others. Each circle is reported once, at the member of
+    /// it written first, as Roslyn reports it at the one it reaches first.
+    fn constants(&mut self) {
+        let compilation = self.compilation;
+        let symbols = compilation.symbols();
+        // A circle is found by working a member of it out, so every
+        // constant of the files checked is, which caches what the bodies
+        // and the emitter ask for next.
+        for symbol in symbols.iter() {
+            if compilation.is_from_metadata(symbol.id) {
+                break;
+            }
+            if symbol.kind != SymbolKind::Field
+                || compilation.is_from_corlib(symbol.id)
+                || !symbol
+                    .locations
+                    .iter()
+                    .any(|location| self.covers(location.tree))
+            {
+                continue;
+            }
+            let in_enum = symbol.container.is_some_and(|container| {
+                symbols.get(container).type_kind() == Some(TypeKind::Enum)
+            });
+            if in_enum || symbol.modifiers.contains(Modifiers::CONST) {
+                let _ = self.binder.constant_value(symbol.id);
+            }
+        }
+        for circle in compilation.circular_constants() {
+            let first = circle
+                .iter()
+                .filter_map(|member| {
+                    let location = symbols.get(*member).locations.first()?;
+                    Some(((location.tree, location.span.start()), *member, *location))
+                })
+                .min_by_key(|(place, _, _)| *place);
+            let Some((_, member, location)) = first else {
+                continue;
+            };
+            if !self.covers(location.tree) {
+                continue;
+            }
+            let display = member_display(compilation, member, &Frame::new(), None);
+            self.report(location, ErrorCode::ErrCircConstValue, &[&display]);
         }
     }
 

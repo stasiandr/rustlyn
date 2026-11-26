@@ -119,6 +119,9 @@ error_codes! {
     ErrBadCtorArgCount = 1729, Error, "'{0}' does not contain a constructor that takes {1} arguments";
     ErrNoCorrespondingArgument = 7036, Error, "There is no argument given that corresponds to the required parameter '{0}' of '{1}'";
     ErrNoImplicitConvCast = 266, Error, "Cannot implicitly convert type '{0}' to '{1}'. An explicit conversion exists (are you missing a cast?)";
+    ErrCheckedOverflow = 220, Error, "The operation overflows at compile time in checked mode";
+    ErrIntDivByZero = 20, Error, "Division by constant zero";
+    ErrCircConstValue = 110, Error, "The evaluation of the constant value for '{0}' involves a circular definition";
     ErrConstOutOfRangeChecked = 221, Error, "Constant value '{0}' cannot be converted to a '{1}' (use 'unchecked' syntax to override)";
     ErrObjectRequired = 120, Error, "An object reference is required for the non-static field, method, or property '{0}'";
     ErrObjectProhibited = 176, Error, "Member '{0}' cannot be accessed with an instance reference; qualify it with a type name instead";

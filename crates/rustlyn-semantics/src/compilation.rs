@@ -128,6 +128,9 @@ pub struct Compilation {
     /// hundred members written in terms of each other, and without this it
     /// takes longer to emit that one file than to emit eight hundred others.
     pub(crate) constants: RwLock<HashMap<SymbolId, Option<ConstantValue>>>,
+    /// The circles of constants defined in terms of themselves; see
+    /// [`Self::note_circular_constants`].
+    pub(crate) circular_constants: RwLock<std::collections::BTreeSet<Vec<SymbolId>>>,
     /// Every extension method, by name.
     ///
     /// An extension method is found by the name at the call site rather than
@@ -480,6 +483,7 @@ impl Compilation {
             extension_members: HashMap::new(),
             conversions: RwLock::new(HashMap::new()),
             constants: RwLock::new(HashMap::new()),
+            circular_constants: RwLock::new(std::collections::BTreeSet::new()),
             imports: RwLock::new(HashMap::new()),
             global_imports: RwLock::new(None),
             obsolete: std::sync::OnceLock::new(),
@@ -856,6 +860,20 @@ impl Compilation {
 
     pub(crate) fn cache_constant(&self, symbol: SymbolId, value: Option<ConstantValue>) {
         write(&self.constants).insert(symbol, value);
+    }
+
+    /// Notes constants whose values are written in terms of each other all
+    /// the way round (CS0110): the members of one circle.
+    pub(crate) fn note_circular_constants(&self, mut circle: Vec<SymbolId>) {
+        circle.sort_unstable();
+        circle.dedup();
+        write(&self.circular_constants).insert(circle);
+    }
+
+    /// Every circle of constants found so far, each with its members in
+    /// order; a circle is found when one of its members is evaluated.
+    pub(crate) fn circular_constants(&self) -> Vec<Vec<SymbolId>> {
+        read(&self.circular_constants).iter().cloned().collect()
     }
 
     pub(crate) fn cached_imports(&self, key: ImportsKey) -> Option<Vec<Import>> {

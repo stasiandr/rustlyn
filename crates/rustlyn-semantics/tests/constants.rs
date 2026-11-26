@@ -55,3 +55,152 @@ fn members_defined_in_terms_of_each_other_have_no_value_rather_than_no_end() {
     let compilation = compile("enum Self { A = A + 1 }");
     assert_eq!(value(&compilation, "Self.A"), None);
 }
+
+/// The constants of `source`, each asked in a compilation of its own.
+fn values(source: &str, paths: &[&str]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| {
+            let compilation = compile(source);
+            value(&compilation, path).unwrap_or_else(|| format!("{path} has no value"))
+        })
+        .collect()
+}
+
+#[test]
+fn a_floating_constant_cast_to_an_integer_is_cut_off_toward_zero() {
+    // The cast was dropped and the `3.7` kept: `(int)3.7 + 0.5` came to 4.2,
+    // and `const int n = (int)3.7;` was a `double` where an `int` is loaded.
+    let source = "class C {
+        const int Up = (int)3.7;
+        const int Down = (int)-3.7;
+        const long Wide = (long)1e10;
+        const byte Narrow = (byte)3.99f;
+        const char Letter = (char)65.7;
+        const double Sum = (int)3.7 + 0.5;
+        const double Twice = (double)(int)2.9 * 2;
+        const int Half = (int)3.7 / 2;
+        const ulong Huge = (ulong)1.8e19;
+    }";
+    assert_eq!(
+        values(
+            source,
+            &[
+                "C.Up", "C.Down", "C.Wide", "C.Narrow", "C.Letter", "C.Sum", "C.Twice", "C.Half",
+                "C.Huge"
+            ]
+        ),
+        [
+            "Int32(3)",
+            "Int32(-3)",
+            "Int64(10000000000)",
+            "Int32(3)",
+            "Char('A')",
+            "Double(3.5)",
+            "Double(4.0)",
+            "Int32(1)",
+            "UInt64(18000000000000000000)",
+        ]
+    );
+}
+
+#[test]
+fn a_double_cast_to_a_float_is_the_float() {
+    // `(float)0.1` is `0.1f`, which is not the `double` 0.1.
+    let source = "class C {
+        const float Tenth = (float)0.1;
+        const bool Same = (float)0.1 == 0.1f;
+        const bool Wider = (double)0.1f == 0.1;
+    }";
+    assert_eq!(
+        values(source, &["C.Tenth", "C.Same", "C.Wider"]),
+        ["Single(0.1)", "Boolean(true)", "Boolean(false)"]
+    );
+}
+
+#[test]
+fn an_enum_over_ulong_goes_past_long_max() {
+    // A member past `long.MaxValue` had no value at all, and the enum did
+    // not compile: the value was kept as a `long`.
+    let source = "enum Bits : ulong {
+        Top = 1UL << 63,
+        After,
+        Max = 0xFFFFFFFFFFFFFFFF,
+        Mix = Top | 1,
+        Inverse = ~1UL,
+        Less = Max - 1,
+    }";
+    assert_eq!(
+        values(
+            source,
+            &[
+                "Bits.Top",
+                "Bits.After",
+                "Bits.Max",
+                "Bits.Mix",
+                "Bits.Inverse",
+                "Bits.Less"
+            ]
+        ),
+        [
+            "UInt64(9223372036854775808)",
+            "UInt64(9223372036854775809)",
+            "UInt64(18446744073709551615)",
+            "UInt64(9223372036854775809)",
+            "UInt64(18446744073709551614)",
+            "UInt64(18446744073709551614)",
+        ]
+    );
+}
+
+#[test]
+fn integer_constants_fold_as_the_numbers_they_are() {
+    // In the type the operator works in: a `ulong` past `long.MaxValue` is
+    // arithmetic like any other, `unchecked` wraps at the type's own width,
+    // and `>>>` shifts the bits the type has.
+    let source = "class C {
+        const ulong Big = 0xFFFFFFFFFFFFFFFF;
+        const ulong Half = Big / 2 + 1;
+        const bool More = Big > 5;
+        const int Wrapped = unchecked(2147483647 + 1);
+        const uint Under = unchecked(0u - 1);
+        const long Product = unchecked(9223372036854775807 * 2);
+        const int Logical = -1 >>> 28;
+        const long LogicalWide = -1L >>> 60;
+        const int Shifted = 1 << 33;
+        const long ShiftedWide = 1L << 65;
+        const int Remainder = unchecked(-2147483647 - 1) % -1;
+        const int Hash = unchecked((int)2166136261 * 16777619);
+    }";
+    assert_eq!(
+        values(
+            source,
+            &[
+                "C.Half",
+                "C.More",
+                "C.Wrapped",
+                "C.Under",
+                "C.Product",
+                "C.Logical",
+                "C.LogicalWide",
+                "C.Shifted",
+                "C.ShiftedWide",
+                "C.Remainder",
+                "C.Hash"
+            ]
+        ),
+        [
+            "UInt64(9223372036854775808)",
+            "Boolean(true)",
+            "Int32(-2147483648)",
+            "UInt32(4294967295)",
+            "Int64(-2)",
+            "Int32(15)",
+            "Int64(15)",
+            "Int32(2)",
+            "Int64(2)",
+            "Int32(0)",
+            "Int32(84696351)",
+        ]
+    );
+}

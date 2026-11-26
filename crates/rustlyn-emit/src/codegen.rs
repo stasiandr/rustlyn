@@ -4716,6 +4716,34 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             self.emit_constant(&value, &expression.ty)?;
             return Ok(true);
         }
+        // So is a floating constant cast to an integer: `(int)3.7` is 3,
+        // and one its type has no room for — `unchecked((int)1e10)` — is the
+        // zero it folds to, where the conversion left to run gives whatever
+        // the processor or the runtime's version gives.
+        if let BoundExpressionKind::Conversion { operand, .. } = &expression.kind
+            && matches!(
+                self.emitter.special_type_of(&expression.ty),
+                Some(
+                    SpecialType::Char
+                        | SpecialType::SByte
+                        | SpecialType::Byte
+                        | SpecialType::Int16
+                        | SpecialType::UInt16
+                        | SpecialType::Int32
+                        | SpecialType::UInt32
+                        | SpecialType::Int64
+                        | SpecialType::UInt64
+                )
+            )
+            && matches!(
+                self.emitter.binder.folded(operand),
+                Some(ConstantValue::Single(_) | ConstantValue::Double(_))
+            )
+            && let Some(value) = self.emitter.binder.folded(expression)
+        {
+            self.emit_constant(&value, &expression.ty)?;
+            return Ok(true);
+        }
         match &expression.kind {
             // `__arglist` in a varargs method: the handle on what it was
             // given past its parameters.
@@ -8088,7 +8116,11 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             return self.emit_pointer_arithmetic(operator, left, right);
         }
         self.emit_expression(left, true)?;
-        self.emit_expression(right, true)?;
+        if Self::is_shift(operator) {
+            self.emit_shift_count(right, &left.ty)?;
+        } else {
+            self.emit_expression(right, true)?;
+        }
         // A `decimal` is not a primitive: the runtime has no instruction for
         // it, and every operator is a call on `System.Decimal`.
         if self.is_decimal(&left.ty) || self.is_decimal(&right.ty) {
@@ -8271,6 +8303,18 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                         Instruction::ConvertI
                     });
                 }
+                // Inside `checked`, out of a native integer into a narrower
+                // or differently signed one traps, by the source's sign: an
+                // `nuint` past `long.MaxValue` is no `long`, where the
+                // signed form read it as -1 and let it through.
+                (Some(_), None)
+                    if self.checked
+                        && self.checked_conversion(target, source_unsigned).is_some() =>
+                {
+                    if let Some(instruction) = self.checked_conversion(target, source_unsigned) {
+                        self.stream.emit(instruction);
+                    }
+                }
                 (Some(_), None) => match self.integer_special(target) {
                     Some(SpecialType::Int64 | SpecialType::UInt64) if source_unsigned => {
                         self.stream.emit(Instruction::ConvertU8);
@@ -8338,7 +8382,23 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             _ => None,
         };
         if to_decimal {
-            let Some(element) = primitive(self.integer_special(from)) else {
+            // A native integer goes by way of the 64-bit one of its sign,
+            // which `Decimal` has an operator from: an `nuint` zero-extended
+            // and an `nint` sign-extended. Nothing at all was written for
+            // one, and the call after it took a native integer for a
+            // `decimal`.
+            let element = match native_from {
+                Some(ElementType::U) => {
+                    self.stream.emit(Instruction::ConvertU8);
+                    Some(ElementType::U8)
+                }
+                Some(_) => {
+                    self.stream.emit(Instruction::ConvertI8);
+                    Some(ElementType::I8)
+                }
+                None => primitive(self.integer_special(from)),
+            };
+            let Some(element) = element else {
                 return Ok(());
             };
             // A float into a `decimal` is explicit, and so is its operator.
@@ -8357,7 +8417,15 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             self.stream.call_effect(Instruction::Call(token), 1, 1);
             return Ok(());
         }
-        let Some(element) = primitive(self.integer_special(target)) else {
+        // Out of a `decimal` into a native integer the same way back: the
+        // 64-bit one `Decimal` converts to, then narrowed — with a check
+        // inside `checked`, where a 32-bit process has no room for it.
+        let element = match native_to {
+            Some(ElementType::U) => Some(ElementType::U8),
+            Some(_) => Some(ElementType::I8),
+            None => primitive(self.integer_special(target)),
+        };
+        let Some(element) = element else {
             return Ok(());
         };
         let token = self.emitter.framework_member(
@@ -8368,6 +8436,13 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             &[decimal],
         );
         self.stream.call_effect(Instruction::Call(token), 1, 1);
+        match (native_to, self.checked) {
+            (Some(ElementType::U), true) => self.stream.emit(Instruction::ConvertOvfUUn),
+            (Some(ElementType::U), false) => self.stream.emit(Instruction::ConvertU),
+            (Some(_), true) => self.stream.emit(Instruction::ConvertOvfI),
+            (Some(_), false) => self.stream.emit(Instruction::ConvertI),
+            (None, _) => {}
+        }
         Ok(())
     }
 
@@ -9020,6 +9095,9 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         self.stream.emit(Instruction::BranchIfFalse(missing));
         present(self, left_slot, left_value);
         present(self, right_slot, right_value);
+        if Self::is_shift(operator) {
+            self.emit_shift_mask(&inner)?;
+        }
         self.emit_operator(operator, unsigned, floating);
         if let Some(inner_result) = self.emitter.nullable_underlying(result) {
             self.narrow_enum_result(operator, &inner_result, false);
@@ -9197,18 +9275,114 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         self.stream.emit(instruction);
     }
 
+    /// Whether a number of this type compares, divides and shifts right as
+    /// an unsigned one: `clt.un`, `div.un`, `shr.un`.
+    ///
+    /// An `nuint` is one — `nuint.MaxValue > 1` read as signed is `-1 > 1` —
+    /// and so is an enum over an unsigned type, whose members past the sign
+    /// bit (`Flags.Top = 0x80000000`) are otherwise below every other.
     fn is_unsigned(&self, ty: &Type) -> bool {
-        matches!(ty, Type::Pointer(_) | Type::FunctionPointer(_))
-            || matches!(
-                self.emitter.special_type_of(ty),
-                Some(
-                    SpecialType::Byte
-                        | SpecialType::UInt16
-                        | SpecialType::UInt32
-                        | SpecialType::UInt64
-                        | SpecialType::Char
-                )
+        if matches!(ty, Type::Pointer(_) | Type::FunctionPointer(_)) {
+            return true;
+        }
+        let symbols = self.emitter.compilation.symbols();
+        let underlying = match ty.symbol() {
+            Some(symbol) if symbols.get(symbol).type_kind() == Some(TypeKind::Enum) => {
+                self.emitter.enum_underlying(symbol)
+            }
+            _ => ty.clone(),
+        };
+        if underlying
+            .symbol()
+            .is_some_and(|symbol| symbols.qualified_name(symbol).as_str() == "System.UIntPtr")
+        {
+            return true;
+        }
+        matches!(
+            self.emitter.special_type_of(&underlying),
+            Some(
+                SpecialType::Byte
+                    | SpecialType::UInt16
+                    | SpecialType::UInt32
+                    | SpecialType::UInt64
+                    | SpecialType::Char
             )
+        )
+    }
+
+    /// Whether an operator shifts.
+    const fn is_shift(operator: BinaryOperator) -> bool {
+        matches!(
+            operator,
+            BinaryOperator::LeftShift
+                | BinaryOperator::RightShift
+                | BinaryOperator::UnsignedRightShift
+        )
+    }
+
+    /// Masks the shift count on the stack to the width of what is shifted
+    /// (§12.11): the low five bits for an `int` or a `uint`, six for a
+    /// `long` or a `ulong`, so `x << 33` on an `int` is `x << 1`. The
+    /// instruction itself leaves a count as wide as the value or wider
+    /// unspecified (§III.3.58): x64 happens to mask, and an interpreter or
+    /// code translated ahead of time gives whatever its own shift gives.
+    fn emit_shift_mask(&mut self, shifted: &Type) -> Result<(), EmitError> {
+        let symbols = self.emitter.compilation.symbols();
+        let native = shifted.symbol().is_some_and(|symbol| {
+            matches!(
+                symbols.qualified_name(symbol).as_str(),
+                "System.IntPtr" | "System.UIntPtr"
+            )
+        });
+        if native {
+            // As wide as the process: `sizeof(nint) * 8 - 1`, found there.
+            let token = self.emitter.type_token(shifted)?;
+            self.stream.emit(Instruction::SizeOf(token));
+            self.stream.emit(Instruction::LoadInt32(8));
+            self.stream.emit(Instruction::Multiply);
+            self.stream.emit(Instruction::LoadInt32(1));
+            self.stream.emit(Instruction::Subtract);
+        } else {
+            self.stream
+                .emit(Instruction::LoadInt32(self.shift_mask(shifted)));
+        }
+        self.stream.emit(Instruction::And);
+        Ok(())
+    }
+
+    /// The mask of a shift count where it is known here: 63 for a `long` or
+    /// a `ulong`, 31 for everything narrower, each shifted as an `int`.
+    fn shift_mask(&self, shifted: &Type) -> i32 {
+        match self.emitter.special_type_of(shifted) {
+            Some(SpecialType::Int64 | SpecialType::UInt64) => 63,
+            _ => 31,
+        }
+    }
+
+    /// The count of a shift of a `shifted`, masked: a constant count as the
+    /// constant it comes to, as `csc` writes it, anything else with the mask
+    /// after it.
+    fn emit_shift_count(
+        &mut self,
+        count: &BoundExpression,
+        shifted: &Type,
+    ) -> Result<(), EmitError> {
+        let symbols = self.emitter.compilation.symbols();
+        let native = shifted.symbol().is_some_and(|symbol| {
+            matches!(
+                symbols.qualified_name(symbol).as_str(),
+                "System.IntPtr" | "System.UIntPtr"
+            )
+        });
+        if let BoundExpressionKind::Literal(ConstantValue::Int32(value)) = count.kind
+            && !native
+        {
+            self.stream
+                .emit(Instruction::LoadInt32(value & self.shift_mask(shifted)));
+            return Ok(());
+        }
+        self.emit_expression(count, true)?;
+        self.emit_shift_mask(shifted)
     }
 
     // -- places ------------------------------------------------------------
@@ -10762,6 +10936,9 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             }
         };
         let _ = right;
+        if Self::is_shift(operator) {
+            self.emit_shift_mask(ty)?;
+        }
         self.stream.emit(instruction);
         Ok(())
     }

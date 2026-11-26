@@ -32,6 +32,106 @@ impl BodyBinder<'_> {
             )
     }
 
+    /// Whether the innermost `checked` or `unchecked` around `span` is an
+    /// `unchecked`: the one thing that lets a constant overflow (§12.23).
+    /// What `/checked` says does not come into it.
+    fn explicitly_unchecked(&self, span: TextSpan) -> bool {
+        self.body
+            .checked_regions
+            .iter()
+            .filter(|(region, _)| region.start() <= span.start() && span.end() <= region.end())
+            .min_by_key(|(region, _)| region.length())
+            .is_some_and(|(_, checked)| !*checked)
+    }
+
+    /// CS0220 and CS0020: integer arithmetic on constants that overflows the
+    /// type it is worked out in, outside `unchecked`, and `/` or `%` of a
+    /// constant by a constant zero. Both are found when the compiler works
+    /// the value out, so both are errors however the code is reached, and
+    /// neither is one where an operand is not a constant: `x / 0` throws
+    /// when it runs.
+    ///
+    /// `bound` is what a binary operator or a unary minus was bound to;
+    /// anything but a predefined integer operator on two constants is left
+    /// alone.
+    pub(super) fn check_constant_arithmetic(&mut self, bound: &BoundExpression) {
+        use crate::bound::UnaryOperator;
+        use crate::constant::{Integers, as_exact, integer_range, integers};
+        let ty = self
+            .binder
+            .enum_underlying(&bound.ty)
+            .unwrap_or_else(|| bound.ty.clone());
+        let special = self.binder.special_of(&ty);
+        let Some((low, high)) = integer_range(special) else {
+            return;
+        };
+        let exact = match &bound.kind {
+            BoundExpressionKind::Binary {
+                operator,
+                left,
+                right,
+            } if matches!(
+                operator,
+                BinaryOperator::Add
+                    | BinaryOperator::Subtract
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo
+            ) =>
+            {
+                // The right first: in a long `a + b + c` it is the leaf, and
+                // a chain that is not constant is turned down at once.
+                let Some(right) = self.binder.folded(right).as_ref().and_then(as_exact) else {
+                    return;
+                };
+                let Some(left) = self.binder.folded(left).as_ref().and_then(as_exact) else {
+                    return;
+                };
+                match integers(*operator, left, right, special) {
+                    Some(Integers::Value(exact)) => exact,
+                    Some(Integers::DivisionByZero) => {
+                        if !self.reported_within(bound.span) {
+                            self.report(ErrorCode::ErrIntDivByZero, bound.span, &[]);
+                        }
+                        return;
+                    }
+                    None => return,
+                }
+            }
+            BoundExpressionKind::Unary {
+                operator: UnaryOperator::Minus,
+                operand,
+            } => {
+                let Some(operand) = self.binder.folded(operand).as_ref().and_then(as_exact) else {
+                    return;
+                };
+                -operand
+            }
+            _ => return,
+        };
+        if (exact < low || exact > high)
+            && !self.explicitly_unchecked(bound.span)
+            && !self.reported_within(bound.span)
+        {
+            self.report(ErrorCode::ErrCheckedOverflow, bound.span, &[]);
+        }
+    }
+
+    /// Whether a part of the expression at `span` has overflowed or divided
+    /// by zero already: it has no value then, and what is worked out from it
+    /// is not a second mistake.
+    fn reported_within(&self, span: TextSpan) -> bool {
+        self.body.diagnostics.iter().any(|(tree, diagnostic)| {
+            *tree == self.tree
+                && matches!(
+                    diagnostic.code(),
+                    ErrorCode::ErrCheckedOverflow | ErrorCode::ErrIntDivByZero
+                )
+                && span.start() <= diagnostic.span().start()
+                && diagnostic.span().end() <= span.end()
+        })
+    }
+
     /// CS0221: a constant cast to an integral type it does not fit, outside
     /// `unchecked`. Constants are checked whatever `/checked` says: only an
     /// `unchecked` around the cast lets `(int)2147483648L` wrap.
@@ -42,14 +142,7 @@ impl BodyBinder<'_> {
         span: TextSpan,
     ) {
         use crate::bound::ConstantValue;
-        let unchecked = self
-            .body
-            .checked_regions
-            .iter()
-            .filter(|(region, _)| region.start() <= span.start() && span.end() <= region.end())
-            .min_by_key(|(region, _)| region.length())
-            .is_some_and(|(_, checked)| !*checked);
-        if unchecked {
+        if self.explicitly_unchecked(span) {
             return;
         }
         let target = self
@@ -318,6 +411,34 @@ impl BodyBinder<'_> {
                 .binder
                 .extension_members_in_scope(&self.context, name)
                 .is_empty()
+        {
+            return None;
+        }
+        // An `nint` or an `nuint` is a number, with the language's own
+        // operators (C# 11): where one of those takes the operands, the
+        // `op_Addition(IntPtr, int)` the type declares for older compilers
+        // is not asked. They give the same value until `checked` says the
+        // sum must fit, which only the language's own `+` checks.
+        let native = |ty: &Type| {
+            let ty = self
+                .binder
+                .nullable_underlying(ty)
+                .unwrap_or_else(|| ty.clone());
+            self.binder.native_int(&ty)
+        };
+        if let (left_native, right_native) = (native(&left.ty), native(&right.ty))
+            && (left_native.is_some() || right_native.is_some())
+            && (self
+                .binder
+                .binary_result(operator, &left.ty, &right.ty)
+                .is_some()
+                // A non-negative `int` constant is an `nuint` (§10.2.11).
+                || (left_native == Some(true)
+                    && right_native.is_none()
+                    && self.constant_fits(right, &left.ty))
+                || (right_native == Some(true)
+                    && left_native.is_none()
+                    && self.constant_fits(left, &right.ty)))
         {
             return None;
         }

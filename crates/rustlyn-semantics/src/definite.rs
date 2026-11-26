@@ -11,9 +11,17 @@
 //! state that comes back around a loop is never less assigned than the one
 //! that entered it.
 //!
+//! A `goto` is the one jump that does not fit that: it may go back to a
+//! label already walked, carrying a state the walk had not seen when it was
+//! there. So a label keeps the state every `goto` to it arrives with, and a
+//! body with a `goto` is walked again until those states stop changing —
+//! they only ever lose locals, so they do — and only the last walk's
+//! findings count.
+//!
 //! Like the rest of the flow analysis it would rather say nothing than
-//! something wrong. A body with a `goto`, a construct the binder does not
-//! model or an expression that did not bind gets no CS0165 at all, and a
+//! something wrong. A body with a construct the binder does not model, a
+//! `goto` out of a `try` with a `finally`, or an expression that did not
+//! bind gets no CS0165 at all, and a
 //! local is only watched where its type leaves no doubt about what assigning
 //! it means: a struct is assigned field by field as well as whole, so one
 //! whose fields the body touches is left alone, as is one from another
@@ -60,6 +68,22 @@ pub(crate) fn check(
     shape.in_local_function = false;
     for lambda in &body.lambdas {
         shape.statement(&lambda.body);
+    }
+    // A `goto` is followed by the name of its label, so the name has to
+    // say which label: one declared once in everything walked here — a
+    // lambda may repeat a name of the method around it — and declared at
+    // all, which a `goto` to nowhere (an error of its own) is not.
+    let mut labels = shape.labels.clone();
+    labels.sort_unstable();
+    let repeated = labels.windows(2).any(|pair| pair[0] == pair[1]);
+    if !shape.gotos.is_empty()
+        && (repeated
+            || shape
+                .gotos
+                .iter()
+                .any(|label| labels.binary_search(label).is_err()))
+    {
+        shape.unsure = true;
     }
     if shape.unsure {
         return Diagnostics::new();
@@ -117,6 +141,28 @@ pub(crate) fn check(
         found: Vec::new(),
         unsure: false,
         needs: HashMap::new(),
+        arriving: HashMap::new(),
+        arriving_changed: false,
+    };
+    // A `goto` may jump over a declaration: `goto L; int x = 1; L: Use(x);`
+    // reads an `x` nothing assigned. A local counts as assigned until its
+    // declaration is walked — which is where it stops being — so in a body
+    // with a `goto` the locals it declares start out unassigned instead,
+    // and the jump carries that to the label. Without a `goto` every read
+    // comes after the declaration, and nothing is different.
+    let has_gotos = !shape.gotos.is_empty();
+    let declared_in = |statements: &[BoundStatement]| -> Vec<LocalId> {
+        let mut declared = Vec::new();
+        if has_gotos {
+            for statement in statements {
+                each_nested_statement(statement, &mut |inner| {
+                    if let BoundStatementKind::LocalDeclaration { local, .. } = &inner.kind {
+                        declared.push(*local);
+                    }
+                });
+            }
+        }
+        declared
     };
     // What each local function reads of the method around it before it
     // assigns it, walked with those locals unassigned. A local function
@@ -126,13 +172,16 @@ pub(crate) fn check(
         let mut changed = false;
         for function in &body.local_functions {
             let saved = std::mem::take(&mut walk.found);
-            walk.state = State::assigned(slots);
-            walk.targets.clear();
-            walk.checking = Vec::new();
-            for local in &function.captured {
-                walk.state.unassign(*local);
-            }
-            walk.statement(&function.body);
+            let declared = declared_in(std::slice::from_ref(&function.body));
+            walk.settled(|walk| {
+                walk.state = State::assigned(slots);
+                walk.targets.clear();
+                walk.checking = Vec::new();
+                for local in function.captured.iter().chain(&declared) {
+                    walk.state.unassign(*local);
+                }
+                walk.statement(&function.body);
+            });
             let found = std::mem::replace(&mut walk.found, saved);
             let mut reads: Vec<LocalId> = found
                 .into_iter()
@@ -154,23 +203,29 @@ pub(crate) fn check(
     }
     let walk_body =
         |walk: &mut Walk<'_, '_>, owner: Option<SymbolId>, statements: &[BoundStatement]| {
-            walk.state = State::assigned(slots);
-            walk.targets.clear();
-            walk.checking = owner.map(outs_of).unwrap_or_default();
-            for parameter in walk.checking.clone() {
-                if let Some(slot) = walk.out_slot(parameter) {
-                    walk.state.unassign(slot);
+            let declared = declared_in(statements);
+            walk.settled(|walk| {
+                walk.state = State::assigned(slots);
+                for local in &declared {
+                    walk.state.unassign(*local);
                 }
-            }
-            for statement in statements {
-                walk.statement(statement);
-            }
-            // Running off the end leaves as much as a `return` does.
-            if !walk.state.unreachable
-                && let Some(at) = owner.and_then(|owner| symbols.get(owner).locations.first())
-            {
-                walk.leaving(at.span);
-            }
+                walk.targets.clear();
+                walk.checking = owner.map(outs_of).unwrap_or_default();
+                for parameter in walk.checking.clone() {
+                    if let Some(slot) = walk.out_slot(parameter) {
+                        walk.state.unassign(slot);
+                    }
+                }
+                for statement in statements {
+                    walk.statement(statement);
+                }
+                // Running off the end leaves as much as a `return` does.
+                if !walk.state.unreachable
+                    && let Some(at) = owner.and_then(|owner| symbols.get(owner).locations.first())
+                {
+                    walk.leaving(at.span);
+                }
+            });
         };
     walk_body(&mut walk, member, &body.statements);
     // A local function is a method of its own: whatever it reads of the
@@ -305,15 +360,18 @@ struct Shape {
     in_local_function: bool,
     /// Which locals are `ref` locals, by index.
     by_ref: Vec<bool>,
+    /// The labels the body declares, lambdas and local functions included,
+    /// and the labels its `goto`s name.
+    labels: Vec<String>,
+    gotos: Vec<String>,
 }
 
 impl Shape {
     fn statement(&mut self, statement: &BoundStatement) {
         match &statement.kind {
-            // A label is only a place to jump to; it is the `goto` that
-            // makes the flow one the walk cannot follow.
-            BoundStatementKind::Unsupported(_) | BoundStatementKind::Goto(_) => self.unsure = true,
-            BoundStatementKind::Label(_) => {}
+            BoundStatementKind::Unsupported(_) => self.unsure = true,
+            BoundStatementKind::Goto(label) => self.gotos.push(label.clone()),
+            BoundStatementKind::Label(label) => self.labels.push(label.clone()),
             BoundStatementKind::Block(statements) => {
                 for inner in statements {
                     self.statement(inner);
@@ -589,9 +647,9 @@ fn struct_parameter(receiver: &BoundExpression) -> Option<SymbolId> {
     }
 }
 
-/// Whether a statement holds a `break`, a `continue` or a `return`: each
-/// leaves through the `finally` around it, which may assign what the jump
-/// needs assigned.
+/// Whether a statement holds a `break`, a `continue`, a `return` or a
+/// `goto`: each leaves through the `finally` around it, which may assign
+/// what the jump needs assigned.
 fn jumps(statement: &BoundStatement) -> bool {
     let mut found = false;
     each_nested_statement(statement, &mut |inner| {
@@ -600,6 +658,7 @@ fn jumps(statement: &BoundStatement) -> bool {
             BoundStatementKind::Break(_)
                 | BoundStatementKind::Continue(_)
                 | BoundStatementKind::Return(_)
+                | BoundStatementKind::Goto(_)
         );
     });
     found
@@ -904,7 +963,7 @@ fn each_child(expression: &BoundExpression, mut visit: impl FnMut(&BoundExpressi
 
 /// Which locals are definitely assigned at one point, or that the point
 /// cannot be reached, where everything counts as assigned.
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 struct State {
     bits: Vec<u64>,
     unreachable: bool,
@@ -994,6 +1053,14 @@ struct Walk<'a, 'b> {
     /// For each local function, the locals of the method around it that it
     /// reads before it assigns them: a call to it reads them there.
     needs: HashMap<SymbolId, Vec<LocalId>>,
+    /// For each label, what is assigned on every `goto` to it met so far:
+    /// the state a label is reached with besides the one that falls into
+    /// it. Kept from one walk of a body to the next; see [`Walk::settled`].
+    arriving: HashMap<String, State>,
+    /// Whether the walk under way took a local out of a label's state: the
+    /// label may have been walked already with more assigned than that, so
+    /// the body is walked again.
+    arriving_changed: bool,
 }
 
 impl Walk<'_, '_> {
@@ -1239,11 +1306,52 @@ impl Walk<'_, '_> {
                 }
                 self.state = State::unreachable(self.count());
             }
-            BoundStatementKind::Empty
-            | BoundStatementKind::Unsupported(_)
-            | BoundStatementKind::Label(_)
-            | BoundStatementKind::Goto(_) => {}
+            // A label is reached by falling into it and by every `goto`
+            // to it: assigned only where all of them assigned it.
+            BoundStatementKind::Label(label) => {
+                if let Some(arriving) = self.arriving.get(label) {
+                    self.state.join(arriving);
+                }
+            }
+            BoundStatementKind::Goto(label) => {
+                let count = self.count();
+                let arriving = self
+                    .arriving
+                    .entry(label.clone())
+                    .or_insert_with(|| State::unreachable(count));
+                let before = arriving.clone();
+                arriving.join(&self.state);
+                if *arriving != before {
+                    self.arriving_changed = true;
+                }
+                self.state = State::unreachable(count);
+            }
+            BoundStatementKind::Empty | BoundStatementKind::Unsupported(_) => {}
         }
+    }
+
+    /// Walks a body with `once` until the states its `goto`s carry to their
+    /// labels stop changing, keeping the findings of the last walk only.
+    ///
+    /// A `goto` back to a label arrives after the label was walked, so the
+    /// first walk reads what follows the label with too much assigned; the
+    /// next knows better. Each walk can only take locals out of a label's
+    /// state, so there are no more walks than labels times locals, and for
+    /// a body without a `goto` there is the one.
+    fn settled(&mut self, mut once: impl FnMut(&mut Self)) {
+        self.arriving.clear();
+        let mark = self.found.len();
+        // Far more than any body needs; past it the walk says nothing
+        // rather than something unsettled.
+        for _ in 0..1024 {
+            self.found.truncate(mark);
+            self.arriving_changed = false;
+            once(self);
+            if !self.arriving_changed {
+                return;
+            }
+        }
+        self.unsure = true;
     }
 
     /// Whether the cases of a switch match every value of what it switches

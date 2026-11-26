@@ -361,6 +361,7 @@ impl Compilation {
             extension_members: self.extension_members.clone(),
             conversions: RwLock::new(HashMap::new()),
             constants: RwLock::new(HashMap::new()),
+            circular_constants: RwLock::new(std::collections::BTreeSet::new()),
             imports: RwLock::new(HashMap::new()),
             global_imports: RwLock::new(None),
             obsolete: std::sync::OnceLock::new(),

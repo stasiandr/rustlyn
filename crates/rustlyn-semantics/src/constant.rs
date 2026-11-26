@@ -66,6 +66,21 @@ impl Binder<'_> {
         // conversions fold again from scratch.
         let key = (std::ptr::from_ref(compilation) as usize, symbol);
         if !visiting.insert(symbol) || EVALUATING.with_borrow(|stack| stack.contains(&key)) {
+            // Everything being worked out since this one was first asked
+            // for is the circle it is on (CS0110).
+            let circle: Vec<SymbolId> = EVALUATING.with_borrow(|stack| {
+                stack.iter().position(|entry| *entry == key).map_or_else(
+                    || vec![symbol],
+                    |start| {
+                        stack[start..]
+                            .iter()
+                            .filter(|(owner, _)| *owner == key.0)
+                            .map(|(_, member)| *member)
+                            .collect()
+                    },
+                )
+            });
+            compilation.note_circular_constants(circle);
             return None;
         }
         EVALUATING.with_borrow_mut(|stack| stack.push(key));
@@ -145,6 +160,10 @@ impl Binder<'_> {
         // walking back to it, rather than forward from the first member,
         // never evaluates a member after it. `A = B, B = 1` is legal, and a
         // forward walk asked for `B` would evaluate `A`, which asks for `B`.
+        // The value so far, as the bits of a 64-bit integer: an `enum :
+        // ulong` goes past `long.MaxValue`, where `0xFFFFFFFFFFFFFFF0` is a
+        // value like any other and no `long` at all.
+        let unsigned_wide = self.special_of(&underlying) == Some(SpecialType::UInt64);
         let mut start = index;
         let mut previous: i64 = -1;
         loop {
@@ -152,7 +171,7 @@ impl Binder<'_> {
             if candidate != member
                 && let Some(cached) = self.compilation().cached_constant(candidate)
             {
-                previous = as_integer(&cached?)?;
+                previous = as_bits(&cached?)?;
                 start += 1;
                 break;
             }
@@ -162,7 +181,7 @@ impl Binder<'_> {
                 } else {
                     self.constant_value_with(candidate, visiting)?
                 };
-                previous = as_integer(&value)?;
+                previous = as_bits(&value)?;
                 if candidate == member {
                     return Some(integer_like(&underlying, previous, self));
                 }
@@ -175,7 +194,11 @@ impl Binder<'_> {
             start -= 1;
         }
         for &candidate in &fields[start..=index] {
-            previous = previous.checked_add(1)?;
+            previous = if unsigned_wide {
+                (previous as u64).checked_add(1)? as i64
+            } else {
+                previous.checked_add(1)?
+            };
             let constant = integer_like(&underlying, previous, self);
             if candidate == member {
                 return Some(constant);
@@ -556,6 +579,42 @@ impl Binder<'_> {
         }
     }
 
+    /// A floating constant as a value of the integral type `ty` (or of an
+    /// enum over one): the fraction dropped. A value the type has no room
+    /// for — which only `unchecked` lets through, CS0221 otherwise — and a
+    /// NaN are zero, which is what Roslyn folds them to: the language
+    /// leaves the result unspecified (§10.3.2), and the runtime's own
+    /// answer has changed between versions. `None` where `ty` is not
+    /// integral.
+    fn truncated(&self, folded: &ConstantValue, ty: &Type) -> Option<ConstantValue> {
+        let value = as_float(folded)?.trunc();
+        let ty = self.enum_underlying(ty).unwrap_or_else(|| ty.clone());
+        // The bounds as the powers of two they are: `long.MaxValue` itself
+        // is no `double`, and the one next to it is one past the range.
+        let two = |power: i32| 2f64.powi(power);
+        let (low, past) = match self.special_of(&ty)? {
+            SpecialType::SByte => (-two(7), two(7)),
+            SpecialType::Byte => (0.0, two(8)),
+            SpecialType::Int16 => (-two(15), two(15)),
+            SpecialType::UInt16 | SpecialType::Char => (0.0, two(16)),
+            SpecialType::Int32 => (-two(31), two(31)),
+            SpecialType::UInt32 => (0.0, two(32)),
+            SpecialType::Int64 => (-two(63), two(63)),
+            SpecialType::UInt64 => (0.0, two(64)),
+            _ => return None,
+        };
+        let bits = if value >= low && value < past {
+            if low < 0.0 {
+                value as i64
+            } else {
+                (value as u64) as i64
+            }
+        } else {
+            0
+        };
+        Some(integer_like(&ty, bits, self))
+    }
+
     /// Whether an integer constant lies outside the integral type `ty`: an
     /// unchecked conversion to it wraps, `unchecked((uint)-1)` is the `uint`
     /// 4294967295 and not the `int` it was written as.
@@ -695,6 +754,28 @@ impl Binder<'_> {
             // it was written as.
             BoundExpressionKind::Conversion { operand, .. } => {
                 let folded = self.fold(operand, visiting)?;
+                // A floating constant into an integral type is cut off
+                // toward zero (§10.3.2): `(int)3.7` is the `int` 3. Kept as
+                // the `3.7` it was written as, `(int)3.7 + 0.5` came to 4.2
+                // and `const int n = (int)3.7;` loaded a `double` where the
+                // `int` goes.
+                if let ConstantValue::Single(_) | ConstantValue::Double(_) = folded
+                    && let Some(cut) = self.truncated(&folded, &expression.ty)
+                {
+                    return Some(cut);
+                }
+                // And between the two floating types it is the nearest the
+                // target has: `(float)0.1` is `0.1f`, not the `double` it
+                // was written as, which no `float` equals.
+                match (&folded, self.special_of(&expression.ty)) {
+                    (ConstantValue::Double(value), Some(SpecialType::Single)) => {
+                        return Some(ConstantValue::Single(*value as f32));
+                    }
+                    (ConstantValue::Single(value), Some(SpecialType::Double)) => {
+                        return Some(ConstantValue::Double(f64::from(*value)));
+                    }
+                    _ => {}
+                }
                 let target = self.special_of(&expression.ty);
                 let narrowed = match folded {
                     ConstantValue::Int64(_)
@@ -752,6 +833,14 @@ impl Binder<'_> {
                         _ => return None,
                     };
                     return Some(floating(width, value));
+                }
+                // `~0xFFFFFFFFFFFFFFFF` turns bits over, whatever number
+                // they spell.
+                if *operator == UnaryOperator::BitwiseNot {
+                    let ty = self
+                        .enum_underlying(&expression.ty)
+                        .unwrap_or_else(|| expression.ty.clone());
+                    return Some(integer_like(&ty, !as_bits(&folded)?, self));
                 }
                 let value = as_integer(&folded)?;
                 let value = match operator {
@@ -869,30 +958,24 @@ impl Binder<'_> {
                     };
                     return Some(floating(width, value));
                 }
-                let left = as_integer(&left)?;
-                let right = as_integer(&right)?;
-                // A shift counts modulo the width of what is shifted
-                // (§12.11): `1 << 33` on an `int` is `2`.
-                let wide = matches!(
-                    self.special_of(&expression.ty),
-                    Some(crate::corlib::SpecialType::Int64 | crate::corlib::SpecialType::UInt64)
-                );
-                let count = u32::try_from(right & if wide { 63 } else { 31 }).ok()?;
-                let value = match operator {
-                    BinaryOperator::Add => left.checked_add(right)?,
-                    BinaryOperator::Subtract => left.checked_sub(right)?,
-                    BinaryOperator::Multiply => left.checked_mul(right)?,
-                    BinaryOperator::Divide => left.checked_div(right)?,
-                    BinaryOperator::Modulo => left.checked_rem(right)?,
-                    BinaryOperator::BitwiseAnd => left & right,
-                    BinaryOperator::BitwiseOr => left | right,
-                    BinaryOperator::ExclusiveOr => left ^ right,
-                    BinaryOperator::LeftShift if wide => left.wrapping_shl(count),
-                    BinaryOperator::LeftShift => i64::from((left as i32).wrapping_shl(count)),
-                    BinaryOperator::RightShift => left >> count,
-                    _ => return None,
+                // What the operator comes to as a number, and then as the
+                // type holds it: past the type's range it wraps, which is
+                // what `unchecked` asks for — anywhere else the binder has
+                // reported CS0220, and the value is nobody's.
+                let ty = self
+                    .enum_underlying(&expression.ty)
+                    .unwrap_or_else(|| expression.ty.clone());
+                let exact = match integers(
+                    *operator,
+                    as_exact(&left)?,
+                    as_exact(&right)?,
+                    self.special_of(&ty),
+                )? {
+                    Integers::Value(exact) => exact,
+                    // Not a constant, and CS0020 where it was written.
+                    Integers::DivisionByZero => return None,
                 };
-                Some(integer_like(&expression.ty, value, self))
+                Some(integer_like(&ty, exact as i64, self))
             }
             _ => None,
         }
@@ -932,8 +1015,7 @@ fn compare(operator: BinaryOperator, left: &ConstantValue, right: &ConstantValue
         | (_, ConstantValue::Single(_) | ConstantValue::Double(_)) => {
             as_float(left)?.partial_cmp(&as_float(right)?)
         }
-        (ConstantValue::UInt64(left), ConstantValue::UInt64(right)) => Some(left.cmp(right)),
-        _ => Some(as_integer(left)?.cmp(&as_integer(right)?)),
+        _ => Some(as_exact(left)?.cmp(&as_exact(right)?)),
     };
     let strings = matches!(left, ConstantValue::String(_) | ConstantValue::Null)
         || matches!(right, ConstantValue::String(_) | ConstantValue::Null);
@@ -994,6 +1076,78 @@ fn as_integer(value: &ConstantValue) -> Option<i64> {
         ConstantValue::Boolean(value) => i64::from(*value),
         _ => return None,
     })
+}
+
+/// The number an integer constant is, exactly: a `ulong` past
+/// `long.MaxValue` is itself, where [`as_integer`] refuses it and
+/// [`as_bits`] reads it as negative.
+pub(crate) fn as_exact(value: &ConstantValue) -> Option<i128> {
+    match value {
+        ConstantValue::UInt64(value) => Some(i128::from(*value)),
+        other => as_integer(other).map(i128::from),
+    }
+}
+
+/// What an integer operator on two constants comes to.
+pub(crate) enum Integers {
+    /// The number, exactly: it may lie outside the type it is worked out
+    /// in, which is an overflow (CS0220) unless `unchecked` wraps it.
+    Value(i128),
+    /// `/` or `%` by a constant zero (CS0020).
+    DivisionByZero,
+}
+
+/// The range of an integral type an operator works in, or `None` for a
+/// type no predefined integer operator gives.
+pub(crate) fn integer_range(special: Option<SpecialType>) -> Option<(i128, i128)> {
+    Some(match special? {
+        SpecialType::Int32 => (i32::MIN.into(), i32::MAX.into()),
+        SpecialType::UInt32 => (u32::MIN.into(), u32::MAX.into()),
+        SpecialType::Int64 => (i64::MIN.into(), i64::MAX.into()),
+        SpecialType::UInt64 => (u64::MIN.into(), u64::MAX.into()),
+        _ => return None,
+    })
+}
+
+/// An integer operator applied to two constants as the numbers they are,
+/// in the type `special` (the operator's own: `int`, `uint`, `long` or
+/// `ulong`; anything else counts as `int`). `None` for an operator that is
+/// not integer arithmetic, or a product no 128 bits hold.
+pub(crate) fn integers(
+    operator: BinaryOperator,
+    left: i128,
+    right: i128,
+    special: Option<SpecialType>,
+) -> Option<Integers> {
+    let wide = matches!(special, Some(SpecialType::Int64 | SpecialType::UInt64));
+    let unsigned = matches!(special, Some(SpecialType::UInt32 | SpecialType::UInt64));
+    // A shift counts modulo the width of what is shifted (§12.11): `1 <<
+    // 33` on an `int` is `2`.
+    let count = (right & if wide { 63 } else { 31 }) as u32;
+    Some(Integers::Value(match operator {
+        BinaryOperator::Add => left + right,
+        BinaryOperator::Subtract => left - right,
+        BinaryOperator::Multiply => left.checked_mul(right)?,
+        BinaryOperator::Divide | BinaryOperator::Modulo if right == 0 => {
+            return Some(Integers::DivisionByZero);
+        }
+        BinaryOperator::Divide => left / right,
+        BinaryOperator::Modulo => left % right,
+        BinaryOperator::BitwiseAnd => left & right,
+        BinaryOperator::BitwiseOr => left | right,
+        BinaryOperator::ExclusiveOr => left ^ right,
+        BinaryOperator::LeftShift => left << count,
+        // The sign comes along for a signed type; an unsigned one has
+        // none, its number being its bits.
+        BinaryOperator::RightShift => left >> count,
+        // `>>>` shifts the bits of the type, sign bit and all.
+        BinaryOperator::UnsignedRightShift => match (wide, unsigned) {
+            (_, true) => left >> count,
+            (true, false) => i128::from((left as i64 as u64) >> count),
+            (false, false) => i128::from((left as i32 as u32) >> count),
+        },
+        _ => return None,
+    }))
 }
 
 /// An integer constant's two's-complement bits, for a conversion that keeps

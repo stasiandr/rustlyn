@@ -17164,7 +17164,9 @@ class Program
 #[test]
 fn an_unchecked_narrowing_of_a_constant_wraps_to_the_narrower_type() {
     // Folded at compile time: `unchecked((byte)-1)` is the byte 255, not the
-    // int -1 it was written as, and a `char` keeps 16 bits.
+    // int -1 it was written as, and a `char` keeps 16 bits. A floating
+    // constant its target has no room for — `unchecked((byte)300.7)` — is
+    // zero, as Roslyn folds it.
     check(
         "ConstantNarrowing",
         r#"using System;
@@ -17201,7 +17203,7 @@ A
 65535
 55296
 1 -1 2
-44
+0
 1 -1
 255
 -1
@@ -17612,5 +17614,261 @@ static class Program
             format!("Program.cs(12,9): {message}"),
             format!("Program.cs(16,26): {message}")
         ]
+    );
+}
+
+/// `nuint.MaxValue > 1` was `-1 > 1`: an `nuint` compared, divided and
+/// shifted right with the signed instructions. A shift count goes in masked
+/// to the width of what is shifted (§12.11), which `shl` itself does not
+/// promise; and a floating constant cast to an integer is the integer.
+/// What is expected is what the program prints built by Roslyn.
+#[test]
+fn an_nuint_compares_divides_and_shifts_unsigned_and_a_shift_count_is_masked() {
+    check(
+        "NativeAndShifts",
+        r#"
+using System;
+class NativeAndShifts {
+    static nuint Big() => unchecked((nuint)(-1));
+    static nuint One() => 1;
+    static int Sh(int x, int n) => x << n;
+    static long ShL(long x, int n) => x << n;
+    static int Sr(int x, int n) => x >> n;
+    static uint Sru(uint x, int n) => x >> n;
+    static int Srr(int x, int n) => x >>> n;
+    static void A() {
+        nuint big = Big(), one = One();
+        Console.WriteLine(big > one);      // True
+        Console.WriteLine(big < one);      // False
+        Console.WriteLine(big >= one);     // True
+        Console.WriteLine(big <= one);     // False
+    }
+    static void B() {
+        nuint big = Big();
+        Console.WriteLine(big / 2 == (nuint)IntPtr.MaxValue);  // True
+        Console.WriteLine(big % 10);       // 5 (64-bit)
+        Console.WriteLine(big >> 60);      // 15
+    }
+    static void C() {
+        nuint big = Big();
+        big /= 2; Console.WriteLine(big == (nuint)IntPtr.MaxValue); // True
+        big = Big(); big >>= 60; Console.WriteLine(big); // 15
+        big = Big(); big %= 10; Console.WriteLine(big); // 5
+    }
+    static void D() {
+        nint neg = -8;
+        Console.WriteLine(neg >> 1);       // -4
+        Console.WriteLine(neg / 2);        // -4
+        Console.WriteLine(neg < 0);        // True
+    }
+    static void E() {
+        Console.WriteLine(Sh(1, 33));      // 2
+        Console.WriteLine(ShL(1, 65));     // 2
+        Console.WriteLine(Sr(-16, 34));    // -4
+        Console.WriteLine(Sru(0x80000000, 35)); // 268435456
+        Console.WriteLine(Srr(-16, 33));   // 2147483640
+        int x = 1; x <<= 33; Console.WriteLine(x); // 2
+        long y = 1; y <<= 65; Console.WriteLine(y); // 2
+    }
+    static void F() {
+        Console.WriteLine(1 << 33);        // 2 (constant)
+        Console.WriteLine(1L << 65);       // 2
+        Console.WriteLine(-16 >> 34);      // -4
+        byte b = 1; int sh = 9; Console.WriteLine(b << sh); // 512
+        short s = -1; Console.WriteLine(s >> 40);  // -1
+    }
+    static void G() {
+        const int c = (int)3.7; Console.WriteLine(c); // 3
+        Console.WriteLine((int)3.7);       // 3
+        Console.WriteLine((int)-3.7);      // -3
+        Console.WriteLine((long)1e10);     // 10000000000
+        Console.WriteLine((byte)3.99f);    // 3
+    }
+    static void H() {
+        const double d = (int)3.7 + 0.5; Console.WriteLine(d); // 3.5
+        Console.WriteLine((int)3.7 / 2);   // 1
+        Console.WriteLine((double)(int)2.9 * 2); // 4
+        Console.WriteLine((char)65.7);     // A
+        Console.WriteLine((uint)3.7m);     // 3
+        Console.WriteLine((float)(int)7.9); // 7
+    }
+    static void Try(string name, Action a) {
+        Console.Write(name + ": ");
+        try { a(); } catch (Exception e) { Console.WriteLine(e.GetType().Name); }
+    }
+    static void Main() {
+        Try("A", A); Try("B", B); Try("C", C); Try("D", D); Try("E", E); Try("F", F); Try("G", G); Try("H", H);
+    }
+}
+"#,
+        "A: True\nFalse\nTrue\nFalse\nB: True\n5\n15\nC: True\n15\n5\nD: -4\n-4\nTrue\nE: 2\n2\n-4\n268435456\n2147483640\n2\n2\nF: 2\n2\n-4\n512\n-1\nG: 3\n3\n-3\n10000000000\n3\nH: 3.5\n1\n4\nA\n3\n7\n",
+    );
+}
+
+/// An enum over an unsigned type orders its members as unsigned numbers,
+/// a lifted or compound shift masks its count like any other, and a cast of
+/// a constant folds to the value the cast gives. Expected: Roslyn's build.
+#[test]
+fn unsigned_enums_lifted_shifts_and_constant_casts_agree_with_roslyn() {
+    check(
+        "UnsignedEnumsAndCasts",
+        r#"
+using System;
+[Flags] enum U : uint { None = 0, Low = 1, Top = 0x80000000 }
+enum UL : ulong { A = 1, Big = 0xFFFFFFFFFFFFFFF0 }
+enum B : byte { X = 200, Y = 100 }
+class UnsignedEnumsAndCasts {
+    static nuint Big() => unchecked((nuint)(-1));
+    static T Id<T>(T x) => x;
+    static void Main() {
+        nuint big = Big(); nuint two = Id<nuint>(2);
+        Console.WriteLine((ulong)big);
+        Console.WriteLine((double)big > 1e18);
+        Console.WriteLine((long)(big / two));
+        Console.WriteLine(big > two ? "gt" : "le");
+        Console.WriteLine(Math.Max(big, two) == big);
+        nuint? nb = big, nt = two;
+        Console.WriteLine(nb > nt);
+        Console.WriteLine(nb / nt == (nuint)IntPtr.MaxValue);
+        Console.WriteLine(nb >> 60);
+        if (big < two) Console.WriteLine("wrong"); else Console.WriteLine("right");
+        while (big > 100) big /= 1000;
+        Console.WriteLine(big);
+        U top = Id(U.Top), low = Id(U.Low);
+        Console.WriteLine(top > low);
+        Console.WriteLine(top < low);
+        Console.WriteLine(top >= low);
+        Console.WriteLine(low <= top);
+        Console.WriteLine(top.CompareTo(low) > 0);
+        UL ub = Id(UL.Big), ua = Id(UL.A);
+        Console.WriteLine(ub > ua);
+        Console.WriteLine((ulong)ub);
+        Console.WriteLine(ub - ua);
+        B bx = Id(B.X), by = Id(B.Y);
+        Console.WriteLine(bx > by);
+        U? nt2 = top; U? nl = low;
+        Console.WriteLine(nt2 > nl);
+        int one = Id(1), n33 = Id(33), n65 = Id(65);
+        long lone = Id(1L);
+        int? none = one; int? ncount = n33;
+        Console.WriteLine(none << ncount);
+        Console.WriteLine(lone << n65);
+        long? nlone = lone; Console.WriteLine(nlone << n65);
+        uint ux = Id(0x80000000u); Console.WriteLine(ux >> n33);
+        ulong ulx = Id(0x8000000000000000ul); Console.WriteLine(ulx >> n65);
+        nint ni = Id<nint>(1); Console.WriteLine(ni << n65);
+        nuint nu = Id<nuint>(1); Console.WriteLine(nu << n65);
+        nu <<= n65; Console.WriteLine(nu);
+        short sh = Id<short>(1); sh <<= n33; Console.WriteLine(sh);
+        byte bb = Id<byte>(1); Console.WriteLine(bb << n33);
+        sbyte sb = Id<sbyte>(-128); Console.WriteLine(sb >> n33);
+        Console.WriteLine(sb >>> n33);
+        char c = Id('A'); Console.WriteLine(c << n33);
+        long big2 = Id(long.MinValue); big2 >>= n65; Console.WriteLine(big2);
+        big2 >>>= n65; Console.WriteLine(big2);
+        Console.WriteLine(one << -1);
+        Console.WriteLine(lone << -1);
+        Console.WriteLine(one << Id(-1));
+        Console.WriteLine(lone << Id(-1));
+        Console.WriteLine((int)Id(3.7));
+        Console.WriteLine((int)3.7 + (int)-2.9);
+        const long L = (long)1e15; Console.WriteLine(L);
+        const byte By = (byte)255.9; Console.WriteLine(By);
+        const char Ch = (char)66.2; Console.WriteLine(Ch);
+        const float F = (float)0.1; Console.WriteLine(F == 0.1f);
+        Console.WriteLine((float)0.1 == 0.1f);
+        Console.WriteLine((double)0.1f == 0.1);
+        Console.WriteLine((ulong)1.8e19);
+        Console.WriteLine((uint)3e9);
+        Console.WriteLine(unchecked((int)1e10) == unchecked((int)1e10));
+        const int K = (int)2.5f * 2; Console.WriteLine(K);
+        Console.WriteLine((B)1.9);
+        Console.WriteLine((int)(B)200.5 + 1);
+        switch (one) { case (int)1.9: Console.WriteLine("case 1"); break; default: Console.WriteLine("default"); break; }
+        int[] arr = new int[(int)3.9]; Console.WriteLine(arr.Length);
+    }
+}
+"#,
+        "18446744073709551615\nTrue\n9223372036854775807\ngt\nTrue\nTrue\nTrue\n15\nright\n18\nTrue\nFalse\nTrue\nTrue\nTrue\nTrue\n18446744073709551600\n18446744073709551599\nTrue\nTrue\n2\n2\n2\n1073741824\n4611686018427387904\n2\n2\n2\n2\n2\n-64\n2147483584\n130\n-4611686018427387904\n6917529027641081856\n-2147483648\n-9223372036854775808\n-2147483648\n-9223372036854775808\n3\n1\n1000000000000000\n255\nB\nTrue\nTrue\nFalse\n18000000000000000000\n3000000000\nTrue\n4\n1\n201\ncase 1\n3\n",
+    );
+}
+
+/// `(long)n` on an `nuint` is the language's conversion, not `UIntPtr`'s
+/// operator to `uint`, which throws past four thousand million; and a
+/// native integer reaches a `decimal` through the 64-bit integer of its
+/// sign, where nothing at all was emitted. Expected: Roslyn's build.
+#[test]
+fn native_integers_convert_to_and_from_every_number() {
+    check(
+        "NativeConversions",
+        r#"
+using System;
+class NativeConversions {
+    static T Id<T>(T x) => x;
+    static void Main() {
+        nuint big = unchecked((nuint)(-1)); nint neg = Id<nint>(-5);
+        Console.WriteLine((long)big); Console.WriteLine((ulong)big); Console.WriteLine((int)big); Console.WriteLine((uint)big);
+        Console.WriteLine((short)big); Console.WriteLine((byte)big); Console.WriteLine((double)big); Console.WriteLine((float)big);
+        Console.WriteLine((char)Id<nuint>(65)); Console.WriteLine((decimal)big); Console.WriteLine((nint)big);
+        Console.WriteLine((long)neg); Console.WriteLine((ulong)neg); Console.WriteLine((int)neg); Console.WriteLine((uint)neg);
+        Console.WriteLine((double)neg); Console.WriteLine((nuint)neg); Console.WriteLine((decimal)neg); Console.WriteLine((sbyte)neg);
+        Console.WriteLine((nuint)Id(5)); Console.WriteLine((nuint)Id(5L)); Console.WriteLine((nuint)Id(5u)); Console.WriteLine((nuint)Id(5.9));
+        Console.WriteLine((nint)Id(-5.9)); Console.WriteLine((nint)Id(-5L)); Console.WriteLine((nint)Id(3000000000u)); Console.WriteLine((nint)Id('A'));
+        Console.WriteLine((nuint)Id<byte>(200)); Console.WriteLine((nint)Id<sbyte>(-3)); Console.WriteLine((nuint)Id(7m)); Console.WriteLine((nint)Id(DayOfWeek.Friday));
+        Console.WriteLine((DayOfWeek)Id<nint>(2)); Console.WriteLine((DayOfWeek)Id<nuint>(3));
+        try { Console.WriteLine(checked((int)big)); } catch (OverflowException) { Console.WriteLine("ovf1"); }
+        try { Console.WriteLine(checked((nuint)neg)); } catch (OverflowException) { Console.WriteLine("ovf2"); }
+        try { Console.WriteLine(checked((long)big)); } catch (OverflowException) { Console.WriteLine("ovf3"); }
+        try { Console.WriteLine(checked(big + 1)); } catch (OverflowException) { Console.WriteLine("ovf4"); }
+        long l = neg; double d = big; ulong ul = big; nint fromInt = Id(7); nuint fromUint = Id(7u);
+        Console.WriteLine(l + " " + d + " " + ul + " " + fromInt + " " + fromUint);
+        IntPtr ip = new IntPtr(42); UIntPtr up = new UIntPtr(43);
+        Console.WriteLine((int)ip + (int)up + (long)ip + (long)(ulong)up);
+        Console.WriteLine(ip == (IntPtr)42); Console.WriteLine(up != UIntPtr.Zero); Console.WriteLine(ip + 1); Console.WriteLine(up > 1);
+    }
+}
+"#,
+        "-1\n18446744073709551615\n-1\n4294967295\n-1\n255\n1.8446744073709552E+19\n1.8446744E+19\nA\n18446744073709551615\n-1\n-5\n18446744073709551611\n-5\n4294967291\n-5\n18446744073709551611\n-5\n-5\n5\n5\n5\n5\n-5\n-5\n3000000000\n65\n200\n-3\n7\n5\nTuesday\nWednesday\novf1\novf2\novf3\novf4\n-5 1.8446744073709552E+19 18446744073709551615 7 7\n170\nTrue\nTrue\n43\nTrue\n",
+    );
+}
+
+/// Inside `checked`, `nuint.MaxValue + 1` overflows — by the language's
+/// `+`, not `UIntPtr.op_Addition`, which wraps — and an `nuint` past
+/// `long.MaxValue` is no `long`. Expected: Roslyn's build.
+#[test]
+fn checked_native_arithmetic_and_conversions_trap_by_sign() {
+    check(
+        "CheckedNative",
+        r#"
+using System;
+class CheckedNative {
+    static T Id<T>(T x) => x;
+    static void Main() {
+        nuint big = unchecked((nuint)(-1)); nuint one = Id<nuint>(1); nint max = IntPtr.MaxValue; nint mone = Id<nint>(-1);
+        try { Console.WriteLine(checked(big + 1)); } catch (OverflowException) { Console.WriteLine("ovf4"); }
+        try { Console.WriteLine(checked(big + one)); } catch (OverflowException) { Console.WriteLine("ovf5"); }
+        try { Console.WriteLine(checked(one - big)); } catch (OverflowException) { Console.WriteLine("ovf6"); }
+        try { Console.WriteLine(checked(big * big)); } catch (OverflowException) { Console.WriteLine("ovf7"); }
+        try { Console.WriteLine(checked(max + 1)); } catch (OverflowException) { Console.WriteLine("ovf8"); }
+        try { Console.WriteLine(checked(mone + mone)); } catch (OverflowException) { Console.WriteLine("ovf9"); }
+        try { checked { big++; } Console.WriteLine(big); } catch (OverflowException) { Console.WriteLine("ovf10"); }
+        try { checked { big += one; } Console.WriteLine(big); } catch (OverflowException) { Console.WriteLine("ovf11"); }
+        try { Console.WriteLine(checked((int)big)); } catch (OverflowException) { Console.WriteLine("ovf1"); }
+        try { Console.WriteLine(checked((long)big)); } catch (OverflowException) { Console.WriteLine("ovf3"); }
+        try { Console.WriteLine(checked((uint)big)); } catch (OverflowException) { Console.WriteLine("ovf12"); }
+        try { Console.WriteLine(checked((ulong)mone)); } catch (OverflowException) { Console.WriteLine("ovf13"); }
+        try { Console.WriteLine(checked((byte)mone)); } catch (OverflowException) { Console.WriteLine("ovf14"); }
+        try { Console.WriteLine(checked((sbyte)one)); } catch (OverflowException) { Console.WriteLine("ovf15"); }
+        try { Console.WriteLine(checked((ulong)big)); } catch (OverflowException) { Console.WriteLine("ovf16"); }
+        try { Console.WriteLine(checked((long)mone)); } catch (OverflowException) { Console.WriteLine("ovf17"); }
+        try { Console.WriteLine(checked((char)big)); } catch (OverflowException) { Console.WriteLine("ovf18"); }
+        try { Console.WriteLine(checked((double)big)); } catch (OverflowException) { Console.WriteLine("ovf19"); }
+        try { Console.WriteLine(checked((decimal)big)); } catch (OverflowException) { Console.WriteLine("ovf20"); }
+        try { Console.WriteLine(checked((nuint)Id(-1m))); } catch (OverflowException) { Console.WriteLine("ovf21"); }
+        try { Console.WriteLine(checked((nint)Id(7e28m))); } catch (OverflowException) { Console.WriteLine("ovf22"); }
+    }
+}
+"#,
+        "ovf4\novf5\novf6\novf7\novf8\n-2\novf10\novf11\novf1\novf3\novf12\novf13\novf14\n1\n18446744073709551615\n-1\novf18\n1.8446744073709552E+19\n18446744073709551615\novf21\novf22\n",
     );
 }

@@ -1470,7 +1470,21 @@ impl BodyBinder<'_> {
             })
         };
         let pointer = |ty: &Type| matches!(ty, Type::Pointer(_) | Type::FunctionPointer(_));
-        let built_in = (pointer(&value.ty) && native(ty)) || (native(&value.ty) && pointer(ty));
+        // So do a native integer and a number (§10.3.2, C# 11): `(long)n` on
+        // an `nuint` is the bits it has, where `UIntPtr`'s operator to
+        // `uint` — the one found first — throws past four thousand million.
+        // A `decimal` is reached by `System.Decimal`'s own operators, as
+        // from any integer.
+        let number = |ty: &Type| {
+            self.binder
+                .special_of(ty)
+                .is_some_and(|special| special.is_numeric() && special != SpecialType::Decimal)
+                || self.binder.enum_underlying(ty).is_some()
+        };
+        let built_in = (pointer(&value.ty) && native(ty))
+            || (native(&value.ty) && pointer(ty))
+            || (native(&value.ty) && (number(ty) || native(ty)))
+            || (number(&value.ty) && native(ty));
         let checked = self.in_checked_context(self.cast_span.unwrap_or(value.span));
         if !built_in
             && let Some(operator) = self.binder.explicit_operator_in(&value.ty, ty, checked)

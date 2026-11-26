@@ -1072,6 +1072,7 @@ impl BodyBinder<'_> {
             }
             kind if binary_operator(kind).is_some() => {
                 let bound = self.bind_binary(node);
+                self.check_constant_arithmetic(&bound);
                 self.fold_decimal(bound)
             }
             kind if compound_operator(kind).is_some() => self.bind_compound_assignment(node),
@@ -1179,13 +1180,16 @@ impl BodyBinder<'_> {
                             None => self.predefined_unary_operand(operator, operand),
                         };
                         let ty = operand.ty.clone();
-                        at(
+                        let bound = at(
                             BoundExpressionKind::Unary {
                                 operator,
                                 operand: Box::new(operand),
                             },
                             ty,
-                        )
+                        );
+                        // `-int.MinValue` has no `int` to be (CS0220).
+                        self.check_constant_arithmetic(&bound);
+                        bound
                     }
                     None => BoundExpression::error(span),
                 }

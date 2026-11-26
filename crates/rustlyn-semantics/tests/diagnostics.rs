@@ -2197,3 +2197,209 @@ class Derived : Base
         "{found:#?}"
     );
 }
+
+// MARK: - constants that have no value
+
+/// The errors among `wanted` that a file gets, whatever else it is told —
+/// that a local is never read, mostly.
+fn only(source: &str, wanted: &[&str]) -> Vec<String> {
+    codes(source)
+        .into_iter()
+        .filter(|code| wanted.contains(&code.as_str()))
+        .collect()
+}
+
+#[test]
+fn a_constant_that_overflows_its_type_is_cs0220() {
+    // Worked out by the compiler, so an error wherever it is written — it
+    // was folded to the wrapped value without a word.
+    assert_eq!(
+        diagnose("class C { const int Over = 2147483647 + 1; }"),
+        ["CS0220 '2147483647 + 1': The operation overflows at compile time in checked mode"]
+    );
+    for body in [
+        "int i = 2147483647 + 1;",
+        "long l = 9223372036854775807 * 2;",
+        "uint u = 0u - 1;",
+        "ulong u = 0xFFFFFFFFFFFFFFFF + 1;",
+        "int i = -(-2147483648);",
+        "long l = -(-9223372036854775808);",
+        "int i = (-2147483647 - 1) / -1;",
+        "const int K = 2147483647 + 1;",
+        "int i = 'a' * 100000000;",
+        "int i = checked(2147483647 + 1);",
+        // Only the part that overflowed: what is worked out from it has no
+        // value to overflow again.
+        "int i = 2147483647 + 1 - 1;",
+        "int i = (2147483647 + 1) + n;",
+        "int i = 2147483647 * 2 + n;",
+    ] {
+        assert_eq!(codes(&with_flag(body)), ["CS0220"], "{body}");
+    }
+    assert_eq!(
+        codes("enum E { A = 1 } class C { const E Over = E.A + 2147483647; }"),
+        ["CS0220"]
+    );
+}
+
+#[test]
+fn arithmetic_that_stays_in_range_or_is_unchecked_is_not_cs0220() {
+    for body in [
+        "int i = unchecked(2147483647 + 1);",
+        "unchecked { int i = 2147483647 + 1; int j = -(-2147483648); const int K = 2147483647 * 2; }",
+        "int hash = unchecked((int)2166136261 * 16777619);",
+        // Not constants: what they come to is found when they run.
+        "int i = n + 2147483647;",
+        "int i = n + 2147483647 + 1;",
+        "checked { int i = n + 2147483647; }",
+        // A shift never overflows: the bits fall off.
+        "int i = 1 << 40; int j = 1 << 31; uint k = 1u << 31;",
+        // In range, at the edges.
+        "int i = 2147483647 - 1 + 1; int j = -2147483648 + 0; long l = 2147483647 + 1L;",
+        "ulong u = 0xFFFFFFFFFFFFFFFF - 1; uint v = 0xFFFFFFFF + 0u; long m = -9223372036854775808;",
+        "int r = (-2147483647 - 1) % -1;",
+        // Floating point has infinities, not overflows.
+        "double d = 1e308 * 10; float f = 3e38f * 10;",
+        "string s = \"a\" + \"b\" + 1;",
+    ] {
+        let found = only(&with_flag(body), &["CS0220", "CS0020", "CS0221"]);
+        assert!(found.is_empty(), "{body}: {found:?}");
+    }
+    assert_clean(
+        "[System.Flags] enum Bits : ulong { None, Top = 1UL << 63, All = 0xFFFFFFFFFFFFFFFF, Rest = All - Top }
+         class C { const int Size = sizeof(int) * Count; const int Count = 4; }",
+    );
+}
+
+#[test]
+fn a_constant_divided_by_a_constant_zero_is_cs0020() {
+    assert_eq!(
+        diagnose("class C { const int Zero = 5 / 0; }"),
+        ["CS0020 '5 / 0': Division by constant zero"]
+    );
+    assert_eq!(codes(&with_flag("int i = 5 % 0;")), ["CS0020"]);
+    assert_eq!(codes(&with_flag("long l = 5L / (1 - 1);")), ["CS0020"]);
+    // A variable divided by zero throws when it runs, and floating point
+    // has an answer.
+    let found = only(
+        &with_flag("int i = n / 0; int j = n % 0; double d = 1.0 / 0; double e = n / 0.0;"),
+        &["CS0020", "CS0220"],
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_constant_defined_in_terms_of_itself_is_cs0110() {
+    assert_eq!(
+        diagnose("class C { const int A = B + 1; const int B = A + 1; const int Fine = 1; }"),
+        [
+            "CS0110 'A': The evaluation of the constant value for 'C.A' involves a circular definition"
+        ]
+    );
+    assert_eq!(
+        diagnose("class C { const int Self = Self; }"),
+        [
+            "CS0110 'Self': The evaluation of the constant value for 'C.Self' involves a circular definition"
+        ]
+    );
+    assert_eq!(
+        diagnose("enum Loop { P = Q, Q = P, R = 1 }"),
+        [
+            "CS0110 'P': The evaluation of the constant value for 'Loop.P' involves a circular definition"
+        ]
+    );
+    // Through a third, and across two types: once, where it is first written.
+    assert_eq!(
+        codes(
+            "class A { public const int X = B.Y; } class B { public const int Y = C.Z; } class C { public const int Z = A.X; }"
+        ),
+        ["CS0110"]
+    );
+}
+
+#[test]
+fn a_constant_that_names_itself_without_needing_its_value_is_not_cs0110() {
+    assert_clean(
+        "class C {
+            public const string Name = nameof(Name);
+            public const string Both = nameof(Both) + nameof(Name);
+            public const int Size = sizeof(int) * Count;
+            public const int Count = 4;
+            public const int Next = Count + 1;
+            static int Default(int x = Count, string s = Name) => x;
+        }
+        enum Flags { All = A | B, A = 1, B = 2, C, D = C * 2 }
+        enum Order { A, B = A + C, C = 1 }",
+    );
+}
+
+// MARK: - definite assignment across a goto
+
+/// A method body of a class with `Use(int)` and `Cond()` to call.
+fn jumping(body: &str) -> String {
+    format!(
+        "class C {{ static void Use(int x) {{ }} static bool Cond() => true; void M() {{ {body} }} }}"
+    )
+}
+
+#[test]
+fn a_local_a_goto_reaches_unassigned_is_cs0165() {
+    // A body with a `goto` used to get no CS0165 at all: the jump is one
+    // the walk could not follow, so it said nothing — about any local in
+    // the method.
+    assert_eq!(
+        diagnose(&jumping("int x; goto L; L: Use(x);")),
+        ["CS0165 'x': Use of unassigned local variable 'x'"]
+    );
+    for body in [
+        // Over the assignment, and over the declaration that makes it.
+        "int x; if (Cond()) goto L; x = 2; L: Use(x);",
+        "int x; for (int i = 0; i < 3; i++) { if (i == 1) goto Done; } x = 1; Done: Use(x);",
+        "int x; { goto L; } L: { Use(x); }",
+        // Back to a label walked before the jump was seen.
+        "int x; goto B; A: Use(x); return; B: if (Cond()) x = 1; goto A;",
+        "int x; int n = 0; L: if (n > 0) Use(x); x = 1; n++; if (n < 3) goto L;",
+        // The one of two that a path leaves out.
+        "int x; int y; A: if (Cond()) { x = 1; goto B; } y = 2; goto A; B: Use(x); Use(y);",
+        // In a lambda and in a local function, which jump within themselves.
+        "System.Func<int> f = () => { int y; if (Cond()) goto L; y = 1; L: return y; }; Use(f());",
+        "void Local() { int z; goto Q; Q: Use(z); } Local();",
+        // `goto case` too.
+        "int x; switch (Cond() ? 1 : 2) { case 1: goto case 2; case 2: Use(x); break; }",
+    ] {
+        assert_eq!(only(&jumping(body), &["CS0165"]), ["CS0165"], "{body}");
+    }
+    // A jump over the declaration itself reads what nothing assigned.
+    assert_eq!(
+        only(&jumping("goto L; int x = 1; L: Use(x);"), &["CS0165"]),
+        ["CS0165"]
+    );
+    // And an `out` parameter a jump leaves unassigned on the way out.
+    assert_eq!(
+        codes("class C { void M(out int r) { goto L; L: return; } }"),
+        ["CS0177"]
+    );
+}
+
+#[test]
+fn a_local_assigned_on_every_way_to_a_label_is_not_cs0165() {
+    for body in [
+        "int x; if (Cond()) { x = 1; goto L; } x = 2; L: Use(x);",
+        "int x; goto B; A: Use(x); return; B: x = 1; goto A;",
+        "int x = 0; int n = 0; L: Use(x); n++; if (n < 3) goto L;",
+        "int x; int n = 0; L: x = n; n++; if (n < 3) goto L; Use(x);",
+        "int x; while (true) { if (Cond()) { x = 1; goto Out; } } Out: Use(x);",
+        "int x; try { if (Cond()) goto L; x = 1; } catch { x = 2; } Use(x); return; L: x = 3; Use(x);",
+        "int x; switch (Cond() ? 1 : 2) { case 1: x = 1; goto case 2; case 2: x = 2; break; default: x = 3; break; } Use(x);",
+        "int x; goto L2; L1: Use(x); goto L3; L2: x = 1; goto L1; L3: return;",
+        "int a; L: if (Cond()) { a = 1; } else goto L; Use(a);",
+        "int x; if (Cond()) { x = 1; } else { goto Skip; } Use(x); Skip: ;",
+        "int x; do { if (Cond()) goto End; x = 1; Use(x); } while (Cond()); End: ;",
+    ] {
+        let found = only(&jumping(body), &["CS0165", "CS0177", "CS0269"]);
+        assert!(found.is_empty(), "{body}: {found:?}");
+    }
+    assert_clean(
+        "class C { static bool Cond() => true; void M(out int r) { if (Cond()) goto L; r = 1; return; L: r = 2; } }",
+    );
+}
