@@ -18201,3 +18201,99 @@ public class Base { protected internal class ProtInt { } protected class Prot { 
     let stranger = found("Stranger");
     assert_eq!(stranger.len(), 2, "{stranger:#?}");
 }
+
+#[test]
+fn a_const_decimal_from_a_non_decimal_constant_loads_as_a_decimal() {
+    check(
+        "decimal_from_integer_constants",
+        r#"
+using System;
+using System.Reflection;
+class P
+{
+    const decimal F1 = (byte)3;
+    const decimal F2 = 'b';
+    const decimal F3 = 5L;
+    const decimal F4 = ulong.MaxValue;
+    const decimal F5 = (short)-3;
+    const decimal F6 = 'a' + 1;
+    const decimal F7 = 1.5m + 2;
+    const decimal F8 = long.MinValue;
+    const decimal F9 = uint.MaxValue;
+    const decimal F12 = -F4;
+    const decimal F13 = F4 * 2;
+    public const decimal PubB = (ulong)long.MaxValue + 1;
+    static void M(decimal d = 5, decimal e = 'c', decimal? n = 3L, decimal? z = null, decimal q = ulong.MaxValue)
+        => Console.WriteLine($"{d} {e} {n} {z} {q}");
+    static void Main()
+    {
+        const decimal c1 = (byte)3; const decimal c2 = 'b'; const decimal c3 = 5L; const decimal c4 = ulong.MaxValue;
+        const decimal c5 = (short)-3; const decimal c6 = 'a' + 1; const decimal c7 = 1.5m + 2; const decimal c8 = long.MinValue;
+        Console.WriteLine($"{c1} {c2} {c3} {c4} {c5} {c6} {c7} {c8}");
+        Console.WriteLine($"{F1} {F2} {F3} {F4} {F5} {F6} {F7} {F8} {F9} {F12} {F13}");
+        Console.WriteLine(c4 + c3 * 2 + F1);
+        decimal? o = 5L;
+        Console.WriteLine(o);
+        M(); M(1, 'd'); M(q: 2);
+        foreach (var name in new[] { "F4", "F6", "F8", "F9", "F12", "F13", "PubB" })
+        {
+            var data = typeof(P).GetField(name, BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static).GetCustomAttributesData();
+            Console.Write(name);
+            foreach (var d in data)
+                foreach (var a in d.ConstructorArguments) Console.Write(" " + a.Value);
+            Console.WriteLine();
+        }
+        foreach (var p in typeof(P).GetMethod("M", BindingFlags.NonPublic | BindingFlags.Static).GetParameters())
+        {
+            Console.Write(p.Name + " " + p.RawDefaultValue);
+            foreach (var d in p.GetCustomAttributesData())
+                if (d.AttributeType.Name == "DecimalConstantAttribute")
+                    foreach (var a in d.ConstructorArguments) Console.Write(" " + a.Value);
+            Console.WriteLine();
+        }
+    }
+}
+"#,
+        "3 98 5 18446744073709551615 -3 98 3.5 -9223372036854775808\n3 98 5 18446744073709551615 -3 98 3.5 -9223372036854775808 4294967295 -18446744073709551615 36893488147419103230\n18446744073709551628\n5\n5 99 3  18446744073709551615\n1 100 3  18446744073709551615\n5 99 3  2\nF4 0 0 0 4294967295 4294967295\nF6 0 0 0 0 98\nF8 0 128 0 2147483648 0\nF9 0 0 0 0 4294967295\nF12 0 128 0 4294967295 4294967295\nF13 0 0 1 4294967295 4294967294\nPubB 0 0 0 2147483648 0\nd 5 0 0 0 0 5\ne 99 0 0 0 0 99\nn 3 0 0 0 0 3\nz \nq 18446744073709551615 0 0 0 4294967295 4294967295\n",
+    );
+}
+
+#[test]
+fn nint_and_nuint_reach_static_members_unless_a_name_answers_first() {
+    check(
+        "native_integer_static_members",
+        r#"
+using System;
+class P
+{
+    static unsafe void Main()
+    {
+        nint x = nint.MaxValue;
+        nint y = nint.MinValue;
+        nuint z = nuint.MaxValue;
+        nuint w = nuint.MinValue;
+        Console.WriteLine($"{x} {y} {z} {w} {nint.Size} {nuint.Size} {nint.Zero == 0} {nint.Parse("1")} {nuint.Parse("2")}");
+        Console.WriteLine(typeof(nint));
+        Console.WriteLine(default(nint));
+        Console.WriteLine(sizeof(nint) + sizeof(nuint));
+        Console.WriteLine(nameof(nint.MaxValue));
+        Console.WriteLine(nint.MaxValue.ToString());
+        Console.WriteLine((nint)1 + nint.Size);
+        Console.WriteLine(nint.TryParse("77", out var q) + " " + q);
+        Other.Run();
+    }
+}
+class Other
+{
+    class nuint { public static int Zero = 9; }
+    public static void Run()
+    {
+        Console.WriteLine(nuint.Zero);
+        var nint = new { MaxValue = 5 };
+        Console.WriteLine(nint.MaxValue);
+    }
+}
+"#,
+        "9223372036854775807 -9223372036854775808 18446744073709551615 0 8 8 True 1 2\nSystem.IntPtr\n0\n16\nMaxValue\n9223372036854775807\n9\nTrue 77\n9\n5\n",
+    );
+}

@@ -987,6 +987,18 @@ impl BodyBinder<'_> {
             };
         }
 
+        // `nint` and `nuint` are contextual: only where nothing else answers
+        // to the name are they the two framework types, and `nint.MaxValue`
+        // reaches a static member of one.
+        if node.kind() == SyntaxKind::IdentifierName
+            && matches!(node.text().trim(), "nint" | "nuint")
+        {
+            let ty = self.resolve(node);
+            if let Some(symbol) = ty.symbol() {
+                return BoundExpression::new(BoundExpressionKind::TypeExpression(symbol), ty, span);
+            }
+        }
+
         // A name the parser made up where one was missing has been
         // complained about as a syntax error already.
         if !span.is_empty() {

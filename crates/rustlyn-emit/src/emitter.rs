@@ -11230,6 +11230,36 @@ impl Emitter<'_> {
     }
 
     fn decimal_value(&mut self, value: &BoundExpression, depth: usize) -> Option<DecimalParts> {
+        // An integer constant of any type, however it is written —
+        // `ulong.MaxValue`, `'a' + 1`, `(short)-3` — is a whole number.
+        if self.special_type_of(&value.ty) != Some(rustlyn_semantics::SpecialType::Decimal)
+            && let Some(constant) = self.binder.folded(value)
+        {
+            let whole = match constant {
+                ConstantValue::Int32(value) => i128::from(value),
+                ConstantValue::UInt32(value) => i128::from(value),
+                ConstantValue::Int64(value) => i128::from(value),
+                ConstantValue::UInt64(value) => i128::from(value),
+                ConstantValue::Char(value) => i128::from(u32::from(value)),
+                _ => return self.decimal_value_of_kind(value, depth),
+            };
+            let magnitude = whole.unsigned_abs();
+            return Some(DecimalParts {
+                lo: magnitude as u32,
+                mid: (magnitude >> 32) as u32,
+                hi: 0,
+                negative: whole < 0,
+                scale: 0,
+            });
+        }
+        self.decimal_value_of_kind(value, depth)
+    }
+
+    fn decimal_value_of_kind(
+        &mut self,
+        value: &BoundExpression,
+        depth: usize,
+    ) -> Option<DecimalParts> {
         match &value.kind {
             BoundExpressionKind::Conversion { operand, .. } => self.decimal_value(operand, depth),
             BoundExpressionKind::Literal(constant) => {

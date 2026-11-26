@@ -278,7 +278,11 @@ impl Binder<'_> {
         let node = compilation.trees().get(tree)?.root().find_node(span)?;
         let mut sink = crate::Diagnostics::new();
         let ty = self.type_of(symbol, &mut sink);
-        let decimal = self.special_of(&ty) == Some(SpecialType::Decimal);
+        // A `decimal?` parameter's default is a `[DecimalConstant]` as well.
+        let decimal = self.special_of(&ty) == Some(SpecialType::Decimal)
+            || self
+                .nullable_underlying(&ty)
+                .is_some_and(|inner| self.special_of(&inner) == Some(SpecialType::Decimal));
         match detail.kind {
             SymbolKind::Parameter => {
                 if let Some(attribute) =
@@ -344,7 +348,18 @@ impl Binder<'_> {
                 })
             }
             BoundExpressionKind::Field { field, .. } => {
-                self.special_constant_with(*field, visiting)
+                self.special_constant_with(*field, visiting).or_else(|| {
+                    // `ulong.MaxValue` is a whole number, not a `decimal`.
+                    let whole = as_exact(&self.folded(value)?)?;
+                    let magnitude = whole.unsigned_abs();
+                    Some(SpecialConstant::Decimal {
+                        scale: 0,
+                        negative: whole < 0,
+                        hi: 0,
+                        mid: (magnitude >> 32) as u32,
+                        lo: magnitude as u32,
+                    })
+                })
             }
             BoundExpressionKind::Unary {
                 operator: UnaryOperator::Minus,
@@ -392,7 +407,7 @@ impl Binder<'_> {
                 if let Some(inner) = self.decimal_of(operand, visiting) {
                     return Some(inner);
                 }
-                let whole = as_integer(&self.folded(operand)?)?;
+                let whole = as_exact(&self.folded(operand)?)?;
                 let magnitude = whole.unsigned_abs();
                 Some(SpecialConstant::Decimal {
                     scale: 0,
@@ -404,7 +419,7 @@ impl Binder<'_> {
             }
             _ => {
                 // `const decimal x = 5;` folds to the integer it was written as.
-                let whole = as_integer(&self.folded(value)?)?;
+                let whole = as_exact(&self.folded(value)?)?;
                 let magnitude = whole.unsigned_abs();
                 Some(SpecialConstant::Decimal {
                     scale: 0,

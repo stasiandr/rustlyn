@@ -5753,6 +5753,43 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                         .special_type_of(&self.emitter.enum_underlying(symbol))
                 })
         });
+        // A `decimal` that an integer constant stands for (`const decimal c =
+        // 'b'`) is loaded as the integer it holds, as its own type, and
+        // converted: nothing else puts a `decimal` on the stack.
+        if special == Some(SpecialType::Decimal) {
+            let element = match value {
+                ConstantValue::Int32(_) => Some(ElementType::I4),
+                ConstantValue::UInt32(_) => Some(ElementType::U4),
+                ConstantValue::Int64(_) => Some(ElementType::I8),
+                ConstantValue::UInt64(_) => Some(ElementType::U8),
+                ConstantValue::Char(_) => Some(ElementType::Char),
+                _ => None,
+            };
+            if let Some(element) = element {
+                match value {
+                    ConstantValue::Int32(value) => self.stream.emit(Instruction::LoadInt32(*value)),
+                    ConstantValue::UInt32(value) => {
+                        self.stream.emit(Instruction::LoadInt32(*value as i32));
+                    }
+                    ConstantValue::Char(value) => {
+                        self.stream.emit(Instruction::LoadInt32(*value as i32));
+                    }
+                    _ => self
+                        .stream
+                        .emit(Instruction::LoadInt64(integer.unwrap_or_default())),
+                }
+                let decimal = self.decimal_sig();
+                let token = self.emitter.framework_member(
+                    "System.Decimal",
+                    "op_Implicit",
+                    false,
+                    &decimal,
+                    &[SigType::Primitive(element)],
+                );
+                self.stream.call_effect(Instruction::Call(token), 1, 1);
+                return Ok(());
+            }
+        }
         // A native integer is loaded as the narrowest constant that holds
         // it and widened the way its signedness says: `uint.MaxValue` as an
         // `nuint` is zero-extended, not the `-1` an `i4` would sign-extend to.
