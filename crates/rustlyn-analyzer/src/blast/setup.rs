@@ -25,6 +25,9 @@ pub fn git_patch(root: &str, base: Option<&str>, staged: bool) -> Result<String,
     if has_head || base != "HEAD" {
         args.push(base);
     }
+    // What stands before `--` is a revision and nothing else: a `base` that
+    // is also the name of a file is not taken for a path to compare.
+    args.push("--");
     let mut patch = git(root, &args)?;
     if !staged {
         let untracked = git(

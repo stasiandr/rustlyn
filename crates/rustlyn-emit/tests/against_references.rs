@@ -17933,7 +17933,9 @@ public class Mid : Base { protected override void OnThing() { } }
 /// class: `stream.Dispose(true)` compiled in one that is no `Stream`, and
 /// the runtime refused it. It is for the types derived from its own, as one
 /// in the same compilation is; `protected internal` from another assembly
-/// is protected and no more. The errors are the ones Roslyn reports.
+/// is protected and no more. The errors are the ones Roslyn reports:
+/// `Dispose(true)` is a public `Dispose()` given one too many (CS1501), as
+/// a name is looked up among what may be called before arguments count.
 #[test]
 fn a_protected_member_of_a_reference_is_for_derived_types_only() {
     let stranger = r#"
@@ -17974,7 +17976,7 @@ class Stranger
             "CS0122 'Prop'",
             "CS0122 'Helper'",
             "CS0122 'SProt'",
-            "CS0122 'Dispose'",
+            "CS1501 'Dispose'",
             "CS0122 'CoreNewLine'",
             "CS0122 'ClearItems'",
             "CS0122 'Items'",
@@ -18136,6 +18138,30 @@ class Anyone { void N() { var a = new Base.Pub(); var b = new Base.Open.InnerPub
         return;
     };
     assert_eq!(found, Vec::<String>::new());
+}
+
+/// A `private protected` type is for the derived types of its own assembly:
+/// read out of a reference it is for none, a type derived from its owner
+/// included, while `protected internal` and `protected` beside it are.
+/// Roslyn calls it inaccessible (CS0122); the reference loader does not read
+/// what no other assembly can use, so here the name is not there (CS0426).
+#[test]
+fn a_private_protected_nested_type_of_a_reference_is_for_none() {
+    let library = r#"
+public class Base { private protected class PrivProt { } protected internal class ProtInt { } protected class Prot { } }
+"#;
+    let user = r#"
+class Derived : Base
+{
+    void N() { var a = new Base.PrivProt(); var b = new Base.ProtInt(); var c = new Base.Prot(); }
+}
+class Stranger { void N() { var a = new Base.PrivProt(); } }
+"#;
+    let Some(found) = errors_with_library("PrivateProtectedAbroad", library, user) else {
+        println!("note: skipped; no .NET shared framework was found");
+        return;
+    };
+    assert_eq!(found, ["CS0426 'PrivProt'", "CS0426 'PrivProt'"]);
 }
 
 /// The assembly an `[InternalsVisibleTo]` names reaches the library's

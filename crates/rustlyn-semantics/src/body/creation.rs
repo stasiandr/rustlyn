@@ -1668,8 +1668,53 @@ impl BodyBinder<'_> {
                 .map_or(node.span(), |name| name.span());
             self.report_if_ambiguous(constructor, &candidates, written, &ty, &[], false, at);
         }
+        // Resolution keeps to the constructors this code may call wherever
+        // one of them takes the arguments; one it may not call is chosen
+        // only where none does, and that is CS0122: `new Single()` outside a
+        // class whose constructor is private. Blamed like an ambiguity.
+        // A type that cannot be made at all is CS0144 and nothing more: the
+        // constructor an abstract class is given is protected.
+        let hidden = match constructor {
+            _ if self.cannot_be_made(&ty) => None,
+            Some(constructor) => (!self.accessible(constructor)).then_some(constructor),
+            // None that may be called takes these; one that may not might.
+            None => {
+                let hidden: Vec<SymbolId> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|candidate| !self.accessible(*candidate))
+                    .collect();
+                if hidden.is_empty() || hidden.len() == candidates.len() {
+                    None
+                } else {
+                    let mut given = arguments.clone();
+                    self.resolve_with_lambdas(&hidden, &mut given, &ty, &[], false)
+                        .map(|resolved| resolved.method)
+                }
+            }
+        };
+        let constructor_missing = constructor.is_none() && hidden.is_some();
+        if let Some(constructor) = hidden {
+            let at = node
+                .children()
+                .find(|child| child.kind().is_type_node())
+                .map_or_else(
+                    || {
+                        node.child_tokens()
+                            .find(|token| token.kind() == SyntaxKind::NewKeyword)
+                            .map_or(node.span(), |token| token.span())
+                    },
+                    |name| name.span(),
+                );
+            let frame = self.substitution_for(constructor, &ty);
+            let display =
+                crate::checks::member_display(self.binder.compilation(), constructor, &frame, None);
+            self.report(ErrorCode::ErrBadAccess, at, &[&display]);
+        }
         let written = node.children().find(|child| child.kind().is_type_node());
-        if let Some(written) = &written {
+        if let Some(written) = &written
+            && !constructor_missing
+        {
             self.check_creation(node, written, &ty, &candidates, constructor, &arguments);
         }
         let arguments = match constructor {
@@ -1702,6 +1747,26 @@ impl BodyBinder<'_> {
         )
     }
 
+    /// Whether `new` of this type is CS0144: an interface, or an abstract
+    /// class.
+    fn cannot_be_made(&self, ty: &Type) -> bool {
+        let Some(symbol) = ty.symbol() else {
+            return false;
+        };
+        if !matches!(ty, Type::Named { .. }) {
+            return false;
+        }
+        let found = self.binder.compilation().symbols().get(symbol);
+        match found.type_kind() {
+            Some(TypeKind::Interface) => true,
+            Some(TypeKind::Class | TypeKind::Record) => {
+                found.modifiers.contains(Modifiers::ABSTRACT)
+                    && !found.modifiers.contains(Modifiers::STATIC)
+            }
+            _ => false,
+        }
+    }
+
     /// What is wrong with a `new T(...)` that made nothing: `T` cannot be
     /// made at all (CS0144), or no constructor of it takes these arguments.
     fn check_creation(
@@ -1719,15 +1784,7 @@ impl BodyBinder<'_> {
         }
         let symbols = self.binder.compilation().symbols();
         let found = symbols.get(symbol);
-        let is_abstract = match found.type_kind() {
-            Some(TypeKind::Interface) => true,
-            Some(TypeKind::Class | TypeKind::Record) => {
-                found.modifiers.contains(Modifiers::ABSTRACT)
-                    && !found.modifiers.contains(Modifiers::STATIC)
-            }
-            _ => false,
-        };
-        if is_abstract {
+        if self.cannot_be_made(ty) {
             let name = self.display(ty);
             self.report(ErrorCode::ErrNoNewAbstract, node.span(), &[&name]);
             return;

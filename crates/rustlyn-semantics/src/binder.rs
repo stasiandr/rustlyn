@@ -2434,11 +2434,16 @@ impl<'a> Binder<'a> {
         let protected = match symbol.accessibility {
             Accessibility::Private => false,
             Accessibility::Protected => true,
-            // `private protected` is for the assembly's own derived types;
-            // from another one it is for none, which is not judged.
-            Accessibility::ProtectedAndInternal => true,
+            // `private protected` is for the assembly's own derived types,
+            // and a friend's; from any other assembly it is for none.
+            Accessibility::ProtectedAndInternal => {
+                if from_metadata && !self.compilation.befriended_by(ty, context.tree) {
+                    return false;
+                }
+                true
+            }
             // Inside the assembly (or a friend's) `protected internal` is
-            // internal.
+            // internal; from any other it is protected and no more.
             Accessibility::ProtectedOrInternal => {
                 if !from_metadata || self.compilation.befriended_by(ty, context.tree) {
                     return true;
