@@ -194,7 +194,7 @@ impl<'a> SemanticModel<'a> {
     /// Binds the body of `owner`, one of what [`Self::body_owner`] returns.
     #[must_use]
     pub fn bind_body(&self, owner: &SyntaxNode) -> BoundBody {
-        BodyBinder::bind_member(&self.binder, self.tree, owner)
+        crate::parallel::deep(|| BodyBinder::bind_member(&self.binder, self.tree, owner))
     }
 
     /// [`Self::bind_body`] for an editor: the lambdas of calls that do not
@@ -202,7 +202,7 @@ impl<'a> SemanticModel<'a> {
     /// about. Not for compiling.
     #[must_use]
     pub fn bind_body_for_editor(&self, owner: &SyntaxNode) -> BoundBody {
-        BodyBinder::bind_member_for_editor(&self.binder, self.tree, owner)
+        crate::parallel::deep(|| BodyBinder::bind_member_for_editor(&self.binder, self.tree, owner))
     }
 
     /// The arguments of the attribute `attribute` bound for an editor: what
@@ -214,7 +214,9 @@ impl<'a> SemanticModel<'a> {
             .parent()
             .and_then(|list| list.parent().cloned())
             .unwrap_or_else(|| attribute.clone());
-        BodyBinder::bind_attribute_for_editor(&self.binder, self.tree, &declaration, attribute)
+        crate::parallel::deep(|| {
+            BodyBinder::bind_attribute_for_editor(&self.binder, self.tree, &declaration, attribute)
+        })
     }
 
     /// A value outside any body bound for an editor: a parameter's default,
@@ -234,7 +236,9 @@ impl<'a> SemanticModel<'a> {
                 )
             })
             .unwrap_or_else(|| value.clone());
-        BodyBinder::bind_default_for_editor(&self.binder, self.tree, &declaration, value)
+        crate::parallel::deep(|| {
+            BodyBinder::bind_default_for_editor(&self.binder, self.tree, &declaration, value)
+        })
     }
 
     /// The type of an expression.
@@ -257,6 +261,10 @@ impl<'a> SemanticModel<'a> {
     /// Everything the bodies of this file report.
     #[must_use]
     pub fn body_diagnostics(&self) -> Diagnostics {
+        crate::parallel::deep(|| self.body_diagnostics_here())
+    }
+
+    fn body_diagnostics_here(&self) -> Diagnostics {
         let root = self.compilation().trees()[self.tree].root();
         let mut diagnostics = Diagnostics::new();
         for node in root.descendants() {

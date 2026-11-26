@@ -291,10 +291,66 @@ impl GreenNode {
     }
 
     fn write_full_text(&self, out: &mut String) {
+        if self.height > DEEP {
+            return self.write_full_text_deep(out);
+        }
         for child in &self.children {
             child.write_full_text(out);
         }
     }
+
+    /// [`Self::write_full_text`] without recursion, for a tree as deep as a
+    /// chain of thousands of terms: that took a frame of the caller's stack
+    /// for each level.
+    fn write_full_text_deep(&self, out: &mut String) {
+        let mut open = vec![self.children.iter()];
+        while let Some(children) = open.last_mut() {
+            match children.next() {
+                None => {
+                    open.pop();
+                }
+                Some(GreenElement::Token(token)) => token.write_full_text(out),
+                Some(GreenElement::Node(node)) => open.push(node.children.iter()),
+            }
+        }
+    }
+}
+
+/// How deep a node is before what is done to every level of it is done by
+/// a loop and not by recursion: a tree this deep takes a frame of stack for
+/// each level, and the parser lets one go thousands deep (a chain of
+/// calls, an `else if` ladder).
+const DEEP: u16 = 256;
+
+/// A deep tree is taken apart in a loop and not by the recursion of
+/// dropping each child in turn, which took the stack of whatever thread
+/// dropped the last reference to a chain of thousands of calls: the two
+/// megabytes of a test's, the megabyte of a main thread's on some systems.
+impl Drop for GreenNode {
+    fn drop(&mut self) {
+        if self.height <= DEEP {
+            return;
+        }
+        let mut pending = Vec::new();
+        take_nodes(&mut self.children, &mut pending);
+        while let Some(node) = pending.pop() {
+            // Only the last reference to a node takes it apart; what is
+            // shared with another tree stays whole in it.
+            if let Some(mut node) = Arc::into_inner(node) {
+                take_nodes(&mut node.children, &mut pending);
+            }
+        }
+    }
+}
+
+/// The child nodes of a node, taken out of it and put on `pending`.
+fn take_nodes(children: &mut Box<[GreenElement]>, pending: &mut Vec<Arc<GreenNode>>) {
+    pending.extend(std::mem::take(children).into_vec().into_iter().filter_map(
+        |child| match child {
+            GreenElement::Node(node) => Some(node),
+            GreenElement::Token(_) => None,
+        },
+    ));
 }
 
 /// A child of a green node: either another node or a token.

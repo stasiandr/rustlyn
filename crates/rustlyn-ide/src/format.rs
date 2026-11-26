@@ -2296,6 +2296,33 @@ mod tests {
         formatting.join().expect("the formatting");
     }
 
+    /// What generated code is full of: a table written as an `else if` for
+    /// each case, a call for each step, a term for each piece. The tree is
+    /// as deep as the ladder is long, and the formatter walks it on the
+    /// stack the editor gives it.
+    #[test]
+    fn ladders_and_chains_of_thousands_are_formatted() {
+        let formatting = std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                let n = 5000;
+                // Not `assert_eq!`: the text is long.
+                let ladder = format!(
+                    "        if (a) b();{}",
+                    "\n        else if (a) b();".repeat(n)
+                );
+                assert!(in_method(&ladder) == ladder, "the ladder moved");
+                let ternary = format!("        x = {}0;", "a ? 1 : ".repeat(n));
+                assert!(in_method(&ternary) == ternary, "the ternary moved");
+                let calls = format!("        x = a{};", ".B()".repeat(n));
+                assert!(in_method(&calls) == calls, "the calls moved");
+                let terms = format!("        x = a{};", " + b".repeat(n));
+                assert!(in_method(&terms) == terms, "the terms moved");
+            })
+            .expect("a thread to format on");
+        formatting.join().expect("the formatting");
+    }
+
     #[test]
     fn braces_on_one_line_stay_on_one_line() {
         assert_eq!(format("class C{}\n"), "class C { }\n");

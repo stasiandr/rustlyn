@@ -1659,7 +1659,17 @@ fn a_chain_grown_too_long_is_cs8078() {
                 in_method(&format!("int{} y;", "[]?".repeat(n))),
             ]
         };
-        for text in chains(100_000) {
+        // The ladders are read in a loop, and are as deep as a chain.
+        let ladders = |n: usize| {
+            [
+                in_method(&format!(
+                    "if (b) x = 1; {}",
+                    "else if (b) x = 2; ".repeat(n)
+                )),
+                in_method(&format!("x = {}x;", "b ? x : ".repeat(n))),
+            ]
+        };
+        for text in chains(100_000).into_iter().chain(ladders(100_000)) {
             let tree = tree_of(&text);
             assert_eq!(tree.text(), text);
             let codes: Vec<String> = tree
@@ -1670,12 +1680,156 @@ fn a_chain_grown_too_long_is_cs8078() {
             assert_eq!(codes, ["CS8078"], "{}…", &text[..60]);
         }
         // Two thousand terms are a generated file, and parse.
-        for text in chains(1500) {
+        for text in chains(1500).into_iter().chain(ladders(1500)) {
             let tree = tree_of(&text);
             assert_eq!(tree.text(), text);
             assert!(!tree.has_errors(), "{:?}", tree.diagnostics());
         }
     });
+}
+
+/// What generated code really contains: an `else if` for every case of a
+/// table, a ternary for every row, a call for every step of a builder, a
+/// term for every piece of a string. Roslyn compiles five thousand of them,
+/// and so does the parser, with no error and every byte in the tree.
+#[test]
+fn flat_chains_and_ladders_of_thousands_parse() {
+    on_the_editors_stack(|| {
+        let n = 5000;
+        let in_method = |body: &str| format!("class C {{ void M(bool b, int x) {{ {body} }} }}");
+        let texts = [
+            in_method(&format!(
+                "if (b) x = 0; {}",
+                "else if (b) x = 1; ".repeat(n)
+            )),
+            in_method(&format!(
+                "if (b) x = 0; {}else x = 2;",
+                "else if (b) x = 1; ".repeat(n)
+            )),
+            in_method(&format!("x = {}0;", "b ? 1 : ".repeat(n))),
+            in_method(&format!("x = b{};", ".M()".repeat(n))),
+            in_method(&format!("x = 0{};", " + 1".repeat(n))),
+            in_method(&format!("b = b{};", " && b".repeat(n))),
+        ];
+        for text in texts {
+            let tree = tree_of(&text);
+            assert_eq!(tree.text(), text);
+            assert!(
+                !tree.has_errors(),
+                "{}…: {:?}",
+                &text[..60],
+                tree.diagnostics()
+            );
+        }
+        // Each rung is a statement of its own, in the tree where Roslyn
+        // puts it: an `if` in the `else` of the one before.
+        let text = in_method(&format!(
+            "if (b) x = 0; {}",
+            "else if (b) x = 1; ".repeat(n)
+        ));
+        let tree = tree_of(&text);
+        let ifs = tree
+            .root()
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::IfStatement)
+            .count();
+        assert_eq!(ifs, n + 1);
+        let elses = tree
+            .root()
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::ElseClause)
+            .count();
+        assert_eq!(elses, n);
+    });
+}
+
+/// A tree thousands of levels deep is let go, and printed, without a frame
+/// of stack for each level: by whichever thread holds the last reference,
+/// which may be a main thread's megabyte, a test's two, or less.
+#[test]
+fn a_tree_ten_thousand_levels_deep_is_dropped_and_printed_on_a_small_stack() {
+    let text = format!(
+        "class C {{ void M(bool b, int x) {{ x = b{}; }} }}",
+        ".M()".repeat(5000)
+    );
+    let (tree, deepest) = {
+        let text = text.clone();
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                let tree = tree_of(&text);
+                assert!(!tree.has_errors());
+                let deepest = tree
+                    .root()
+                    .descendants()
+                    .filter(|node| node.kind() == SyntaxKind::InvocationExpression)
+                    .last()
+                    .expect("the innermost call");
+                (tree, deepest)
+            })
+            .expect("a thread to parse on")
+            .join()
+            .expect("the parse")
+    };
+    std::thread::Builder::new()
+        .stack_size(256 << 10)
+        .spawn(move || {
+            assert_eq!(tree.text(), text);
+            // The red nodes up to the root are let go with the last of them.
+            let root = tree.root();
+            assert_eq!(root.full_text(), text);
+            drop(tree);
+            drop(root);
+            assert!(deepest.ancestors().count() >= 10_000);
+            drop(deepest);
+        })
+        .expect("a thread with a small stack")
+        .join()
+        .expect("the tree dropped and printed");
+}
+
+/// Ladders are read in a loop and not by recursion, and must come out the
+/// way recursion made them.
+#[test]
+fn ladders_nest_to_the_right() {
+    assert_eq!(
+        expression("a ? b : c ? d : e"),
+        "(ConditionalExpression IdentifierName IdentifierName \
+         (ConditionalExpression IdentifierName IdentifierName IdentifierName))"
+    );
+    // A rung's condition takes the operators that bind tighter, and its
+    // last branch takes the assignment and whatever else follows.
+    assert_eq!(
+        expression("a ? b : c + 1 ? d : e = f"),
+        "(ConditionalExpression IdentifierName IdentifierName \
+         (ConditionalExpression (AddExpression IdentifierName NumericLiteralExpression) \
+         IdentifierName (SimpleAssignmentExpression IdentifierName IdentifierName)))"
+    );
+    // A conditional in the branch taken is nested, not part of the ladder.
+    assert_eq!(
+        expression("a ? b ? c : d : e ? f : g"),
+        "(ConditionalExpression IdentifierName \
+         (ConditionalExpression IdentifierName IdentifierName IdentifierName) \
+         (ConditionalExpression IdentifierName IdentifierName IdentifierName))"
+    );
+    // What follows a ladder belongs to its last rung, as ever.
+    assert_eq!(
+        expression("a ? b : c ? d : e ?? f"),
+        "(ConditionalExpression IdentifierName IdentifierName \
+         (ConditionalExpression IdentifierName IdentifierName \
+         (CoalesceExpression IdentifierName IdentifierName)))"
+    );
+    let source = "class C { void M() { if (a) if (b) x; else y; else if (c) z; else w; } }";
+    let text = shape_of(&tree_of(source).root());
+    assert!(
+        text.contains(
+            "(IfStatement IdentifierName (IfStatement IdentifierName \
+             (ExpressionStatement IdentifierName) (ElseClause (ExpressionStatement IdentifierName))) \
+             (ElseClause (IfStatement IdentifierName (ExpressionStatement IdentifierName) \
+             (ElseClause (ExpressionStatement IdentifierName)))))"
+        ),
+        "{text}"
+    );
 }
 
 /// Chains inside chains do not add up to a tree deeper than either may be:
@@ -1702,7 +1856,7 @@ fn chains_nested_in_chains_stay_within_the_depth() {
             }
             deepest
         }
-        assert!(depth(&tree.root()) < 8192, "{}", depth(&tree.root()));
+        assert!(depth(&tree.root()) < 14_000, "{}", depth(&tree.root()));
     });
 }
 

@@ -8,10 +8,24 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// How much stack a worker gets. Parsing and binding recurse as deep as the
-/// source nests, and a generated file nests deeper than a thread's default
-/// two megabytes; this is only reserved, not touched.
-pub(crate) const STACK: usize = 256 << 20;
+/// How much stack a thread that binds or emits gets. Both recurse as deep
+/// as the tree they are given, which the parser lets go 12,288 levels deep
+/// (`MAX_DEPTH` in rustlyn-syntax). An unoptimized build takes up to 40 KB
+/// of stack for a level (`bind_expression_core` alone has a frame of 29
+/// KB): 480 MB for the deepest tree of the worst shape, and twice that is
+/// reserved. An optimized build takes a fraction of it, and a 32-bit
+/// address space has no room for a gigabyte, so only a 64-bit debug build
+/// asks for it. This is only reserved, not touched.
+pub const STACK: usize = if cfg!(all(debug_assertions, target_pointer_width = "64")) {
+    1 << 30
+} else {
+    256 << 20
+};
+
+/// How much stack a thread that only parses gets: the parser recurses as
+/// deep as the source nests, which it limits to 1,024 levels, and takes a
+/// few megabytes of an unoptimized build's stack for them.
+pub(crate) const PARSE_STACK: usize = 256 << 20;
 
 /// How many threads work is spread over: one per core, or what
 /// `RUSTLYN_THREADS` says — `1` makes a compile run on one, as it did before

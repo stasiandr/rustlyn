@@ -1320,7 +1320,7 @@ impl Emitter<'_> {
                 let slots = std::sync::Arc::clone(&slots);
                 let (owners, next) = (&owners, &next);
                 std::thread::Builder::new()
-                    .stack_size(256 << 20)
+                    .stack_size(rustlyn_semantics::parallel::STACK)
                     .spawn_scoped(scope, move || {
                         let binder = Binder::new(compilation);
                         loop {

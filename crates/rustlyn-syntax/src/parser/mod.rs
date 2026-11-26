@@ -93,17 +93,30 @@ pub fn parse_with(source: SourceText, options: &ParseOptions) -> SyntaxTree {
 /// and an optimized parser takes this many levels in under a megabyte of
 /// stack, a main thread's on any system (an unoptimized one, several times
 /// that). A thousand levels is what the editor's own tests nest blocks to;
-/// nothing written by hand comes near.
+/// nothing written by hand comes near. What is long and not nested — a chain
+/// of operators or calls, a ladder of `else if` or `?:` — is read in a loop
+/// and costs no level here, only depth in the tree ([`MAX_DEPTH`]).
 pub(crate) const MAX_NESTING: u32 = 1024;
 
 /// How deep a tree the parser hands out ([`GreenNode::height`]). A chain
-/// — `a + b + c + …`, `a.b().c().d()…` — takes no recursion to read and
-/// still makes a tree as deep as it is long, which everything after the
-/// parser walks by recursion: binding, lowering, the emitter, the editor.
-/// Generated code does concatenate a few thousand strings in one
-/// expression, so this is well above [`MAX_NESTING`]; what walks trees
-/// runs on a stack sized for it (`rustlyn_semantics::parallel`).
-pub(crate) const MAX_DEPTH: u32 = 4096;
+/// — `a + b + c + …`, `a.b().c().d()…` — and a ladder — `if … else if …`,
+/// `a ? x : b ? y : …` — take no recursion to read and still make a tree as
+/// deep as they are long, which everything after the parser walks by
+/// recursion: binding, lowering, the emitter, the editor. Generated code
+/// writes thousands of rungs and terms in one statement (Roslyn compiles
+/// five thousand), so this is well above [`MAX_NESTING`]: 12,288 levels are
+/// about 6,100 rungs of an `else if` or links of a call chain, which take
+/// two levels each, and 12,200 terms of a sum or links of a `?:` ladder.
+///
+/// What walks trees runs on a stack sized for it
+/// (`rustlyn_semantics::parallel::STACK`). An unoptimized build binds and
+/// emits a tree this deep on 480 MB of stack at most, measured on a `?:`
+/// ladder of 12,281 links (a sum of as many terms takes 395 MB, a chain of
+/// 6,141 calls 287 MB, 6,140 rungs of an `else if` 90 MB; the bulk is 29 KB
+/// for each level of `bind_expression_core`), in a stack of 1 GB. The
+/// editor's formatter and the other walks of the syntax tree itself take a
+/// few hundred bytes a level.
+pub(crate) const MAX_DEPTH: u32 = 12288;
 
 /// A saved position, so a speculative parse can be undone.
 #[derive(Clone, Copy, Debug)]
@@ -403,7 +416,20 @@ impl Parser {
     /// step: whether `built`, where it stands, is still within
     /// [`MAX_DEPTH`]. Where it is not, the parse gives up.
     fn fits(&mut self, built: &GreenElement) {
-        if self.depth + u32::from(built.height()) >= MAX_DEPTH {
+        self.fits_under(built, 0);
+    }
+
+    /// [`Self::fits`] for what is built inside `levels` nodes still to be
+    /// made: the conditionals and `if` statements of a ladder that is read
+    /// in a loop, whose nodes do not exist until the end of it is reached.
+    fn fits_under(&mut self, built: &GreenElement, levels: usize) {
+        let levels = u32::try_from(levels).unwrap_or(u32::MAX);
+        if self
+            .depth
+            .saturating_add(levels)
+            .saturating_add(u32::from(built.height()))
+            >= MAX_DEPTH
+        {
             self.give_up();
         }
     }

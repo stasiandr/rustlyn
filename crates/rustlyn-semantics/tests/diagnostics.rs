@@ -1625,6 +1625,99 @@ fn a_long_chain_of_additions_binds_in_time_proportional_to_it() {
     );
 }
 
+/// Generated code writes chains and ladders of thousands, which compile; the
+/// parser stops reading a tree it cannot hand on safely (CS8078, as Roslyn
+/// reports when it runs out of stack), and what was read is still bound.
+/// Neither the parser nor the binder, nor whatever walks a bound body
+/// after it, may run a thread out of stack for it: that takes the process.
+#[test]
+fn source_nested_too_deep_is_cs8078_and_not_a_stack_overflow_in_binding() {
+    let started = std::time::Instant::now();
+    std::thread::Builder::new()
+        // What the editor parses on; binding has a stack of its own.
+        .stack_size(64 << 20)
+        .spawn(|| {
+            let n = 20_000;
+            let in_method = |body: &str| {
+                format!("class C {{ object M(object x, bool b) {{ {body} return x; }} }}")
+            };
+            for text in [
+                in_method(&format!("x = {}x{};", "(".repeat(n), ")".repeat(n))),
+                in_method(&format!("{}x = 1;{}", "{".repeat(n), "}".repeat(n))),
+                in_method(&format!("x = {}x;", "!".repeat(n))),
+                in_method(&format!("x = {}x{};", "M(".repeat(n), ", b)".repeat(n))),
+                in_method(&format!(
+                    "x = {}x{};",
+                    "y => M(".repeat(n),
+                    ", b)".repeat(n)
+                )),
+                in_method(&format!(
+                    "x = {}null{};",
+                    "new[] { ".repeat(n),
+                    " }".repeat(n)
+                )),
+                in_method(&format!("{}x = 1;", "if (b) ".repeat(n))),
+                in_method(&format!("var r = x is {}null;", "not ".repeat(n))),
+                // Past what a chain may be, and a ladder.
+                in_method(&format!("x = x{};", " && b".repeat(n))),
+                in_method(&format!(
+                    "if (b) x = 1; {}",
+                    "else if (b) x = 2; ".repeat(n)
+                )),
+            ] {
+                let found = codes(&text);
+                assert_eq!(
+                    found.iter().filter(|code| *code == "CS8078").count(),
+                    1,
+                    "{}...: {found:?}",
+                    &text[..60]
+                );
+            }
+        })
+        .expect("a thread to bind on")
+        .join()
+        .expect("every file bound, none ran out of stack");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(120),
+        "took {:?}",
+        started.elapsed()
+    );
+}
+
+/// What Roslyn compiles -- five thousand rungs of an `else if`, `?:` or call
+/// chain, as many terms of a sum -- is not an error here, however it is
+/// asked.
+#[test]
+fn flat_chains_and_ladders_of_thousands_are_not_cs8078() {
+    let n = 5000;
+    let ladder: String = (1..n)
+        .map(|i| format!("else if (n == {i}) n = {i}; "))
+        .collect();
+    let ternary: String = (0..n).map(|i| format!("n == {i} ? {i} : ")).collect();
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || {
+            for body in [
+                format!("if (n == 0) n = 0; {ladder}"),
+                format!("n = {ternary}-1;"),
+                format!("string s = b.ToString(){};", ".ToString()".repeat(n)),
+                format!("n = n{};", " + 1".repeat(n)),
+                format!("string s = b.ToString(){};", " + b".repeat(n)),
+                format!("b = b{};", " && b".repeat(n)),
+            ] {
+                let found = codes(&with_flag(&body));
+                assert!(
+                    found.is_empty(),
+                    "{}...: {found:?}",
+                    &body[..body.len().min(60)]
+                );
+            }
+        })
+        .expect("a thread to bind on")
+        .join()
+        .expect("every file bound");
+}
+
 #[test]
 fn a_constant_cast_out_of_its_types_range_is_an_error_unless_unchecked() {
     // CS0221: constants are checked whatever `/checked` says.

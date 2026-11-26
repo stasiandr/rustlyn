@@ -154,6 +154,19 @@ struct NodeData {
     slot: u32,
 }
 
+/// The parents of a deep node are let go in a loop: each holds the one
+/// above it, and dropping the last reference to the bottom of a tree
+/// thousands of levels deep took a frame of stack for each of them.
+impl Drop for NodeData {
+    fn drop(&mut self) {
+        let mut parent = self.parent.take();
+        while let Some(SyntaxNode(node)) = parent {
+            // Only the last reference to a node lets go of what it holds.
+            parent = Arc::into_inner(node).and_then(|mut data| data.parent.take());
+        }
+    }
+}
+
 impl SyntaxNode {
     fn root(green: Arc<GreenNode>) -> Self {
         Self(Arc::new(NodeData {

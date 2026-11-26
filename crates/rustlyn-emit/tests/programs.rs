@@ -6658,3 +6658,83 @@ False
 ",
     );
 }
+
+// MARK: - long flat chains
+
+// Generated code is full of them: an `else if` for every case of a table, a
+// `?:` for every row, a call for every step of a builder, a term for every
+// piece of a string. Roslyn compiles five thousand of each, and so does
+// this, through binding, definite assignment and emitting, with the
+// program running to the same answer. The trees are as deep as the chains
+// are long, and the compiler walks them on a stack of its own.
+
+/// A program that runs `body` in `Main`, with `helpers` in the class around
+/// it.
+fn flat_program(helpers: &str, body: &str) -> String {
+    format!(
+        "using System;\nclass P\n{{\n{helpers}\nstatic int Main()\n{{\n{body}\nreturn 0;\n}}\n}}\n"
+    )
+}
+
+#[test]
+fn five_thousand_else_ifs_compile_and_run() {
+    let n = 5000;
+    let ladder: String = (1..n)
+        .map(|i| format!("else if (x == {i}) x = {i};\n"))
+        .collect();
+    let source = flat_program(
+        "",
+        &format!(
+            "int x = {}; if (x == 0) x = 0;\n{ladder}Console.WriteLine(x);",
+            n - 3
+        ),
+    );
+    check("ElseIfLadder", &source, "4997\n");
+}
+
+#[test]
+fn a_five_thousand_link_ternary_ladder_compiles_and_runs() {
+    let n = 5000;
+    let ladder: String = (0..n).map(|i| format!("x == {i} ? {} : ", i * 2)).collect();
+    let source = flat_program(
+        "",
+        &format!(
+            "int x = {}; int y = {ladder}-1;\nConsole.WriteLine(y);",
+            n - 3
+        ),
+    );
+    check("TernaryLadder", &source, "9994\n");
+}
+
+#[test]
+fn five_thousand_chained_calls_compile_and_run() {
+    let source = flat_program(
+        "",
+        &format!(
+            "int x = 7; string s = x.ToString(){};\nConsole.WriteLine(s);",
+            ".ToString()".repeat(5000)
+        ),
+    );
+    check("CallChain", &source, "7\n");
+}
+
+#[test]
+fn a_five_thousand_term_sum_of_ints_compiles_and_runs() {
+    let terms: String = (0..5000).map(|i| format!(" + {}", i % 7)).collect();
+    let expected: i32 = 3 + (0..5000).map(|i| i % 7).sum::<i32>();
+    let source = flat_program(
+        "",
+        &format!("int x = 3; int y = x{terms};\nConsole.WriteLine(y);"),
+    );
+    check("IntSum", &source, &format!("{expected}\n"));
+}
+
+#[test]
+fn a_five_thousand_term_concatenation_of_strings_compiles_and_runs() {
+    // Not constants: the compiler may not fold them.
+    let source = flat_program(
+        &format!("static string Join(string s) => s{};", " + s".repeat(5000)),
+        "Console.WriteLine(Join(\"ab\").Length);",
+    );
+    check("StringSum", &source, &format!("{}\n", 5001 * 2));
+}

@@ -22,13 +22,17 @@ implements the behaviour.
   takes its number from the text and is correct; in a string the surrogate stays
   `U+FFFD`. This is the one place where C# genuinely requires UTF-16.
 * XML inside documentation comments is not parsed into the tree.
-* Source nested too deep is CS8078 at a fixed depth, not where the stack runs out:
+* Source nested too deep is CS8078 at fixed limits, not where the stack runs out:
   1,024 levels of the parser's own recursion (parentheses, blocks, type arguments,
-  patterns, nested types) and a tree 4,096 nodes deep however it got there (a chain of
-  `+` or of calls takes no recursion to read). Roslyn asks the runtime how much stack is
-  left, so its limit moves with the thread and the build; a fixed one gives the same
-  file the same answer everywhere. The rest of the file is kept in the tree as skipped
-  tokens.
+  patterns, nested types, a `?:` inside the branch taken) and a tree 12,288 nodes deep
+  however it got there. A long flat shape takes no recursion to read, so only the depth
+  of its tree counts: an `else if` ladder or a chain of calls or member accesses takes two
+  levels a link (about 6,100 of them), a `?:` ladder or a chain of `+`, `&&` or `[i]`
+  one (about 12,200). Roslyn compiles 5,000 of each and asks the runtime how much stack
+  is left, so its limit moves with the thread and the build; a fixed one gives the same
+  file the same answer everywhere. Threads that bind and emit get a 1 GB stack in a
+  debug build (an unoptimized binder spends up to 40 KB on a level), and 256 MB in an
+  optimized one. The rest of the file is kept in the tree as skipped tokens.
 
 ## Binding and emitting
 

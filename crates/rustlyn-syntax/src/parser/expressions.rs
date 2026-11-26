@@ -43,12 +43,17 @@ impl Parser {
         expression
     }
 
-    fn parse_sub_expression_here(&mut self, min: Precedence) -> GreenElement {
+    fn parse_sub_expression_here(&mut self, mut min: Precedence) -> GreenElement {
         let mut left = self.parse_unary_expression(min);
+        // The conditionals whose last branch is being read: condition, `?`,
+        // the branch taken, `:`. A ladder — `a ? x : b ? y : c ? z : …` —
+        // nests to the right, and generated code writes thousands of rungs,
+        // so it is read here, one after another, and not by recursion.
+        let mut open: Vec<[GreenElement; 4]> = Vec::new();
 
         loop {
             // `a + b + c + …` grows by a level each time round.
-            self.fits(&left);
+            self.fits_under(&left, open.len());
             let token = self.kind();
 
             // Assignment is the loosest level and groups to the right, so the
@@ -91,11 +96,12 @@ impl Parser {
                     let question = self.eat_token();
                     let when_true = self.parse_sub_expression(Precedence::Expression);
                     let colon = self.expect(SyntaxKind::ColonToken);
-                    let when_false = self.parse_sub_expression(Precedence::Expression);
-                    left = node(
-                        SyntaxKind::ConditionalExpression,
-                        vec![left, question, when_true, colon, when_false],
-                    );
+                    open.push([left, question, when_true, colon]);
+                    // What follows the colon is a whole expression, which
+                    // takes everything an expression may, and so ends the
+                    // chain here as the recursive reading would.
+                    min = Precedence::Expression;
+                    left = self.parse_unary_expression(min);
                 }
                 SyntaxKind::DotDotToken if min <= Precedence::Range => {
                     let operator = self.eat_token();
@@ -124,6 +130,12 @@ impl Parser {
             }
         }
 
+        while let Some([condition, question, when_true, colon]) = open.pop() {
+            left = node(
+                SyntaxKind::ConditionalExpression,
+                vec![condition, question, when_true, colon, left],
+            );
+        }
         left
     }
 

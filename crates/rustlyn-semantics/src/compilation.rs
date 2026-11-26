@@ -347,7 +347,7 @@ impl Compilation {
             // up to is not ready, so one core fewer parses throughout.
             for _ in 0..crate::parallel::threads().saturating_sub(1).max(1) {
                 std::thread::Builder::new()
-                    .stack_size(crate::parallel::STACK)
+                    .stack_size(crate::parallel::PARSE_STACK)
                     .spawn_scoped(scope, || while queue.parse_next() {})
                     .expect("a parsing thread should start");
             }

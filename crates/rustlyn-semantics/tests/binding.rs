@@ -244,6 +244,31 @@ fn names_in_a_file_being_edited_find_their_scopes_once() {
     asking.join().expect("the questions");
 }
 
+/// A body is bound as deep as it nests, and the editor asks from whatever
+/// thread it is on: the model binds on a stack of its own, so a chain of
+/// thousands of terms (generated code) does not take the editor down with
+/// the two megabytes of a test thread.
+#[test]
+fn a_body_of_thousands_of_terms_is_bound_on_any_thread() {
+    let text = format!(
+        "class C {{ int M(int a) {{ return a{}; }} }}",
+        " + a".repeat(5000)
+    );
+    let compilation = compile(&text);
+    let model = model(&compilation);
+    let owner = first(&compilation, SyntaxKind::MethodDeclaration);
+    assert!(model.bind_body(&owner).diagnostics.is_empty());
+    assert!(model.bind_body_for_editor(&owner).diagnostics.is_empty());
+    let name = compilation.source_trees()[0]
+        .root()
+        .descendants()
+        .filter(|node| node.kind() == SyntaxKind::IdentifierName)
+        .last()
+        .expect("the last term");
+    assert_eq!(model.type_of(&name).display(compilation.symbols()), "int");
+    assert!(model.body_diagnostics().is_empty());
+}
+
 #[test]
 fn an_inner_scope_wins_over_an_outer_one() {
     let compilation = compile(

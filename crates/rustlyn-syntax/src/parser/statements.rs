@@ -92,19 +92,39 @@ impl Parser {
     // -- control flow ------------------------------------------------------
 
     fn parse_if_statement(&mut self) -> GreenElement {
-        let keyword = self.expect(SyntaxKind::IfKeyword);
-        let open = self.expect(SyntaxKind::OpenParenToken);
-        let condition = self.parse_expression();
-        let close = self.expect(SyntaxKind::CloseParenToken);
-        let then = self.parse_embedded_statement();
+        // The `if` statements whose `else` is being read: all they have so
+        // far, and the `else` keyword. A ladder — `if … else if … else if …`
+        // — nests to the right, and generated code writes thousands of
+        // rungs, so it is read here, one after another, and not by
+        // recursion.
+        let mut open: Vec<(Vec<GreenElement>, GreenElement)> = Vec::new();
+        let mut last = loop {
+            let keyword = self.expect(SyntaxKind::IfKeyword);
+            let open_paren = self.expect(SyntaxKind::OpenParenToken);
+            let condition = self.parse_expression();
+            let close = self.expect(SyntaxKind::CloseParenToken);
+            let then = self.parse_embedded_statement();
 
-        let mut children = vec![keyword, open, condition, close, then];
-        if self.at(SyntaxKind::ElseKeyword) {
+            let mut children = vec![keyword, open_paren, condition, close, then];
+            if !self.at(SyntaxKind::ElseKeyword) {
+                break node(SyntaxKind::IfStatement, children);
+            }
             let else_keyword = self.eat_token();
+            if self.at(SyntaxKind::IfKeyword) {
+                // Two levels for each rung: the `if` and its `else`.
+                self.fits_under(&children[4], open.len() * 2 + 2);
+                open.push((children, else_keyword));
+                continue;
+            }
             let otherwise = self.parse_embedded_statement();
             children.push(node(SyntaxKind::ElseClause, vec![else_keyword, otherwise]));
+            break node(SyntaxKind::IfStatement, children);
+        };
+        while let Some((mut children, else_keyword)) = open.pop() {
+            children.push(node(SyntaxKind::ElseClause, vec![else_keyword, last]));
+            last = node(SyntaxKind::IfStatement, children);
         }
-        node(SyntaxKind::IfStatement, children)
+        last
     }
 
     fn parse_while_statement(&mut self) -> GreenElement {
