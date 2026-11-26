@@ -425,11 +425,7 @@ impl BodyBinder<'_> {
         // A lambda is the other: its body is bound here, against the
         // parameters the delegate names.
         if let BoundExpressionKind::UnboundLambda(at) = value.kind {
-            let Some(node) = self
-                .binder
-                .tree_root(self.tree)
-                .and_then(|root| root.find_node(at))
-            else {
+            let Some(node) = self.syntax_at(at) else {
                 return BoundExpression::error(value.span);
             };
             let bound = self.bind_lambda_body(&node, target);
@@ -440,10 +436,7 @@ impl BodyBinder<'_> {
         }
         // `new(a, b)` is a creation of whatever it is being converted to.
         if let BoundExpressionKind::UnboundCreation(at) = value.kind {
-            let node = self
-                .binder
-                .tree_root(self.tree)
-                .and_then(|root| root.find_node(at));
+            let node = self.syntax_at(at);
             return match node {
                 // `Alignment? a = new(direction, width)` makes an `Alignment`
                 // and wraps it: a `Nullable<T>` has no such constructor.
@@ -477,10 +470,7 @@ impl BodyBinder<'_> {
                     || self.constant_fits(&arm.value, target)
                     || (arm.value.is_interpolated_string() && self.is_handler_type(target))
             })
-            && let Some(node) = self
-                .binder
-                .tree_root(self.tree)
-                .and_then(|root| root.find_node(value.span))
+            && let Some(node) = self.syntax_at(value.span)
             && node.kind() == SyntaxKind::SwitchExpression
         {
             let made = self.bind_switch_expression(&node, Some(target));
@@ -492,10 +482,7 @@ impl BodyBinder<'_> {
         // A `switch` expression whose arms have no type of their own takes
         // the one it is given, arm by arm.
         if let BoundExpressionKind::UnboundSwitch(at) = value.kind {
-            let node = self
-                .binder
-                .tree_root(self.tree)
-                .and_then(|root| root.find_node(at));
+            let node = self.syntax_at(at);
             return match node {
                 Some(node) => {
                     let made = self.bind_switch_expression(&node, Some(target));
@@ -506,10 +493,7 @@ impl BodyBinder<'_> {
             };
         }
         if let BoundExpressionKind::UnboundConditional(at) = value.kind {
-            let node = self
-                .binder
-                .tree_root(self.tree)
-                .and_then(|root| root.find_node(at));
+            let node = self.syntax_at(at);
             return match node {
                 Some(node) => {
                     let made = self.bind_conditional(&node, Some(target));
@@ -615,10 +599,7 @@ impl BodyBinder<'_> {
         }
         // `[a, b]` is made into whatever it is being converted to.
         if let BoundExpressionKind::UnboundCollection(at) = value.kind {
-            let node = self
-                .binder
-                .tree_root(self.tree)
-                .and_then(|root| root.find_node(at));
+            let node = self.syntax_at(at);
             return match node {
                 Some(node) => {
                     let made = self.bind_collection(&node, target);

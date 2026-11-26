@@ -1572,6 +1572,32 @@ fn a_local_of_a_lambda_in_a_field_initializer_sees_the_lambda_parameters() {
     );
 }
 
+/// Lambdas written inside one another, as generated code has them. Each
+/// level is bound again for every binding of the ones around it, against
+/// delegate types that are themselves as deep as what is left, so the work
+/// grows with the cube of the depth: 300 levels took half a minute. This
+/// bound is a generous one, there to catch it getting very much worse.
+#[test]
+fn lambdas_nested_a_hundred_and_fifty_deep_bind_in_bounded_time() {
+    let source = format!(
+        "class P {{ static void Main() {{ System.Func<object> f = {}1; }} }}",
+        "() => ".repeat(150)
+    );
+    let started = std::time::Instant::now();
+    let found = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || codes(&source))
+        .expect("a thread")
+        .join()
+        .expect("bound");
+    assert!(found.is_empty(), "{found:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "binding took {:?}",
+        started.elapsed()
+    );
+}
+
 #[test]
 fn a_long_chain_of_additions_binds_in_time_proportional_to_it() {
     // Each `+` used to fold, test and copy the whole chain to its left: a

@@ -1004,7 +1004,7 @@ impl BodyBinder<'_> {
         // is compiled into. A return type the lambda wrote is what it
         // returns, whatever the body's expression is, and the probe says so.
         let delegate = self.delegate_within(target);
-        self.probe_lambda(lambda, &delegate)
+        self.probe_lambda(lambda, delegate)
             .map(|probe| probe.returns)
     }
 
@@ -1224,7 +1224,12 @@ impl BodyBinder<'_> {
     /// The delegate a lambda is bound against: the type itself, or the
     /// `TDelegate` of an `Expression<TDelegate>`, whose lambda has the same
     /// parameters and result whatever it is compiled into (§12.19.3).
-    pub(super) fn delegate_within(&self, target: &Type) -> Type {
+    ///
+    /// Borrowed where it can be: a lambda nested inside others is converted to
+    /// a delegate whose type argument is the delegate of the one inside it,
+    /// and copying that at every lookup made the binding of a chain of them
+    /// grow with its depth for each lookup.
+    pub(super) fn delegate_within<'t>(&self, target: &'t Type) -> &'t Type {
         if let Type::Named {
             symbol,
             type_arguments,
@@ -1233,13 +1238,13 @@ impl BodyBinder<'_> {
             && self.binder.compilation().symbols().qualified_name(*symbol)
                 == "System.Linq.Expressions.Expression`1"
         {
-            return type_arguments[0].clone();
+            return &type_arguments[0];
         }
-        target.clone()
+        target
     }
 
     fn delegate_parameters(&mut self, target: &Type) -> Option<Vec<Type>> {
-        let target = &self.delegate_within(target);
+        let target = self.delegate_within(target);
         let symbols = self.binder.compilation().symbols();
         let invoke = target
             .symbol()
@@ -1262,7 +1267,7 @@ impl BodyBinder<'_> {
 
     /// What a delegate takes and gives back, as this construction of it.
     pub(super) fn delegate_signature(&self, target: &Type) -> Option<(Vec<Type>, Type)> {
-        let target = &self.delegate_within(target);
+        let target = self.delegate_within(target);
         let symbols = self.binder.compilation().symbols();
         let invoke = target
             .symbol()
@@ -2315,7 +2320,7 @@ impl BodyBinder<'_> {
 
     /// The type a delegate's `Invoke` gives back.
     fn delegate_return(&mut self, target: &Type) -> Option<Type> {
-        let target = &self.delegate_within(target);
+        let target = self.delegate_within(target);
         let symbols = self.binder.compilation().symbols();
         let invoke = target
             .symbol()

@@ -137,6 +137,8 @@ pub struct BodyBinder<'a> {
     /// What binding a lambda against a delegate showed, by the lambda, the
     /// delegate and the locals around it (see `probe_lambda`).
     lambda_probes: HashMap<LambdaKey, Option<LambdaProbe>>,
+    /// The nodes `syntax_at` has found, by span.
+    syntax_found: std::cell::RefCell<HashMap<TextSpan, Option<SyntaxNode>>>,
     /// The outermost of `lambda_answers` read since this was last reset, by
     /// its place on the stack: a lambda's binding that read the answers of a
     /// resolution it did not start depends on more than its key.
@@ -493,6 +495,7 @@ impl<'a> BodyBinder<'a> {
             typeless_holes: HashMap::new(),
             pending_receiver: None,
             lambda_probes: HashMap::new(),
+            syntax_found: std::cell::RefCell::new(HashMap::new()),
             answers_read: std::cell::Cell::new(usize::MAX),
             recover_lambdas: false,
             lambda_guesses: HashMap::new(),
@@ -503,8 +506,17 @@ impl<'a> BodyBinder<'a> {
     /// The node at `span` of the tree being bound, as this binding sees it:
     /// the editor's text where it speculates about an edit. A span the body
     /// recorded is of that text, not of the one compiled.
+    ///
+    /// Found once per span: a lambda is bound again for each delegate a call
+    /// tries, and every lookup from the root walks down as many levels as the
+    /// lambda is nested, so a chain of them cost its depth cubed.
     fn syntax_at(&self, span: TextSpan) -> Option<SyntaxNode> {
-        self.binder.tree_root(self.tree)?.find_node(span)
+        if let Some(found) = self.syntax_found.borrow().get(&span) {
+            return found.clone();
+        }
+        let found = self.binder.tree_root(self.tree)?.find_node(span);
+        self.syntax_found.borrow_mut().insert(span, found.clone());
+        found
     }
 
     fn report(&mut self, code: ErrorCode, span: TextSpan, args: &[&str]) {
