@@ -1143,6 +1143,7 @@ impl Metadata {
         // TypeRef: resolution scope, name, namespace.
         let scope_rows = self
             .rows_in(table::MODULE)
+            .max(self.rows_in(table::MODULE_REF))
             .max(self.rows_in(table::ASSEMBLY_REF))
             .max(self.rows_in(table::TYPE_REF));
         for row in &self.type_refs {
@@ -1206,8 +1207,11 @@ impl Metadata {
             out.coded(*interface, type_rows, 2);
         }
 
-        // MemberRef: class, name, signature.
-        let parent_rows = type_rows.max(self.rows_in(table::METHOD_DEF));
+        // MemberRef: class, name, signature. A `MemberRefParent` names a
+        // `TypeDef`, `TypeRef`, `ModuleRef`, `MethodDef` or `TypeSpec`.
+        let parent_rows = type_rows
+            .max(self.rows_in(table::MODULE_REF))
+            .max(self.rows_in(table::METHOD_DEF));
         for row in &self.member_refs {
             out.coded(row.parent, parent_rows, 3);
             out.string(row.name);
@@ -1244,10 +1248,13 @@ impl Metadata {
             table::MEMBER_REF,
             table::MODULE,
             table::PROPERTY,
+            table::EVENT,
             table::STAND_ALONE_SIG,
+            table::MODULE_REF,
             table::TYPE_SPEC,
             table::ASSEMBLY,
             table::ASSEMBLY_REF,
+            table::MANIFEST_RESOURCE,
             table::GENERIC_PARAM,
             table::GENERIC_PARAM_CONSTRAINT,
             table::METHOD_SPEC,
@@ -1472,12 +1479,12 @@ impl Metadata {
 
         // NestedClass: the nested type and the one it sits in, sorted by the
         // nested type, which §II.22 requires.
-        let type_rows = self.rows_in(table::TYPE_DEF);
+        let type_def_rows = self.rows_in(table::TYPE_DEF);
         let mut nested = self.nested_classes.clone();
         nested.sort_unstable();
         for (inner, outer) in &nested {
-            out.index(type_rows, *inner);
-            out.index(type_rows, *outer);
+            out.index(type_def_rows, *inner);
+            out.index(type_def_rows, *outer);
         }
 
         // GenericParam: number, flags, owner, name. A `TypeOrMethodDef` owner
@@ -1510,20 +1517,33 @@ impl Metadata {
         // GenericParamConstraint: the parameter and what it is constrained to.
         // The parameter is found by owner and position, because the rows above
         // were just sorted and a row number from before that means nothing.
+        // Looked up, not searched for: a search per constraint is the
+        // square of how many type parameters a large project has.
+        let parameter_rows: HashMap<(u32, u16), u32> = generic_params
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(row, (number, _, owner, _))| ((*owner, *number), row as u32 + 1))
+            .collect();
         let mut constraints: Vec<(u32, u32)> = self
             .generic_param_constraints
             .iter()
             .filter_map(|(owner, number, constraint)| {
-                let row = generic_params
-                    .iter()
-                    .position(|(at, _, of, _)| of == owner && at == number)?;
-                Some((row as u32 + 1, *constraint))
+                let row = parameter_rows.get(&(*owner, *number))?;
+                Some((*row, *constraint))
             })
             .collect();
         // Sorted by owner, which the runtime binary-searches on.
         constraints.sort_by_key(|(parameter, _)| *parameter);
         for (parameter, constraint) in &constraints {
             out.index(self.rows_in(table::GENERIC_PARAM), *parameter);
+            // A `TypeDefOrRef`: as wide as the largest of `TypeDef`,
+            // `TypeRef` and `TypeSpec` calls for — the same `type_rows` an
+            // `extends` or an `InterfaceImpl` is written with. Written at
+            // `TypeDef`'s width alone, a project with more constructed
+            // types than declared ones (every `List<T>` it names is one)
+            // wrote two bytes where a reader takes four, and every row
+            // after the first was read out of place.
             out.coded(*constraint, type_rows, 2);
         }
 

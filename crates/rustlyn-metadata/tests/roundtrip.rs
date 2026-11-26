@@ -405,3 +405,57 @@ class Sigs
         constructed.returns
     );
 }
+
+/// A column that names a type is as wide as the largest of `TypeDef`,
+/// `TypeRef` and `TypeSpec` calls for. A constraint was written at
+/// `TypeDef`'s width alone: a project naming more constructed types than it
+/// declares types — and past 16,383 of them — wrote two bytes where every
+/// reader, the runtime first, takes four.
+#[test]
+fn a_constraint_is_as_wide_as_the_largest_type_table() {
+    use std::fmt::Write as _;
+    // 130 classes, and `Pair<Ai, Aj>` for each two of them: 16,900
+    // constructed types from 134 declared ones.
+    let count = 130;
+    let mut source = String::from(
+        "interface IConstraint { }\n\
+         class Marker : IConstraint { }\n\
+         class Holder<T> where T : IConstraint { }\n\
+         class Pair<T, U> { }\n",
+    );
+    for index in 0..count {
+        writeln!(source, "class A{index} {{ }}").expect("a string");
+    }
+    source.push_str("static class Program {\n    static void Use(object o) { }\n");
+    for first in 0..count {
+        writeln!(source, "    static void Fill{first}() {{").expect("a string");
+        for second in 0..count {
+            writeln!(source, "        Use(new Pair<A{first}, A{second}>());").expect("a string");
+        }
+        source.push_str("    }\n");
+    }
+    source.push_str("    static void Main() { Use(new Holder<Marker>()); }\n}\n");
+
+    let bytes = build("Wide", &source);
+    let assembly = Assembly::read(&bytes).expect("the tables as wide as their columns say");
+    assert!(assembly.rows(table::TYPE_SPEC) >= 1 << 14);
+    assert!(assembly.rows(table::TYPE_DEF) < 1 << 14);
+    let heaps = assembly.heaps();
+    let constraints: Vec<String> = assembly
+        .table(table::GENERIC_PARAM_CONSTRAINT)
+        .iter()
+        .map(|row| {
+            let parameter = assembly
+                .table(table::GENERIC_PARAM)
+                .row(row.number(0))
+                .expect("the parameter constrained");
+            let constraint = assembly.row(row.token(1)).expect("the constraint");
+            format!(
+                "{} : {}",
+                heaps.string(parameter.number(3)),
+                heaps.string(constraint.number(1))
+            )
+        })
+        .collect();
+    assert_eq!(constraints, ["T : IConstraint"]);
+}
