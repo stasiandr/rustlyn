@@ -10,7 +10,7 @@ use crate::binder::Diagnostics;
 use crate::bound::{
     BoundCaseLabel, BoundCatch, BoundExpression, BoundExpressionKind, BoundPattern,
     BoundPatternKind, BoundStatement, BoundStatementKind, BoundSwitchLabel, BoundSwitchSection,
-    BoundUsingResource,
+    BoundUsingResource, ConstantValue,
 };
 use crate::corlib::SpecialType;
 use crate::symbol::{Modifiers, SymbolId, SymbolKind};
@@ -800,6 +800,33 @@ impl BodyBinder<'_> {
             && self.constant_operator(value, to).is_none()
             && self.tuple_literal_operator(value, to).is_none()
         {
+            // An `int` constant that does not fit a smaller integral type is
+            // CS0031, not CS0266: Roslyn reports the value itself. The `int`
+            // source is the only one that does (a `uint`, `long` or `char`
+            // constant is CS0266), and so are the targets below (an enum or
+            // `char` target is CS0266 too).
+            if self.binder.special_of(from) == Some(SpecialType::Int32)
+                && let Some(ConstantValue::Int32(number)) = self.binder.folded(value)
+                && matches!(
+                    self.binder.special_of(to),
+                    Some(
+                        SpecialType::SByte
+                            | SpecialType::Byte
+                            | SpecialType::Int16
+                            | SpecialType::UInt16
+                            | SpecialType::UInt32
+                            | SpecialType::UInt64
+                    )
+                )
+            {
+                let to = self.display(to);
+                self.report(
+                    ErrorCode::ErrConstOutOfRange,
+                    node.span(),
+                    &[&number.to_string(), &to],
+                );
+                return;
+            }
             let code = if self.converts_explicitly(from, to) {
                 ErrorCode::ErrNoImplicitConvCast
             } else {

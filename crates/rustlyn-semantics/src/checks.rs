@@ -63,6 +63,7 @@ impl Compilation {
         checker.attributes();
         checker.types();
         checker.constants();
+        checker.enumerators();
         let trees = match tree {
             Some(tree) => tree..tree + 1,
             None => self.corlib_trees..self.trees().len(),
@@ -737,6 +738,71 @@ impl Checker<'_> {
             }
             let display = member_display(compilation, member, &Frame::new(), None);
             self.report(location, ErrorCode::ErrCircConstValue, &[&display]);
+        }
+    }
+
+    /// CS0543: an enumerator without a value of its own is one more than the
+    /// member before it, so it overflows when that member holds the last
+    /// value of the underlying type. Only the first overflowing member of a
+    /// run is reported: the members after it have no value to count from.
+    fn enumerators(&mut self) {
+        let compilation = self.compilation;
+        let symbols = compilation.symbols();
+        for symbol in symbols.iter() {
+            if compilation.is_from_metadata(symbol.id) {
+                break;
+            }
+            if symbol.kind != SymbolKind::NamedType
+                || compilation.is_from_corlib(symbol.id)
+                || symbol.type_kind() != Some(TypeKind::Enum)
+                || !symbol
+                    .locations
+                    .iter()
+                    .any(|location| self.covers(location.tree))
+            {
+                continue;
+            }
+            let enum_type = Type::named(symbol.id);
+            let Some(underlying) = self.binder.enum_underlying(&enum_type) else {
+                continue;
+            };
+            let Some(max) = self
+                .binder
+                .special_of(&underlying)
+                .and_then(max_of_integral)
+            else {
+                continue;
+            };
+            // The value the previous member has: `Some(-1)` before the first
+            // one, so that it counts from zero. `None` once there is none to
+            // count from, which is after an overflow or an erroneous value.
+            let mut previous: Option<i128> = Some(-1);
+            for &member in &symbol.members {
+                if symbols.get(member).kind != SymbolKind::Field {
+                    continue;
+                }
+                if self.binder.has_initializer(member) {
+                    previous = self
+                        .binder
+                        .constant_value(member)
+                        .and_then(|value| crate::constant::as_exact(&value));
+                    continue;
+                }
+                match previous {
+                    Some(value) if value == max => {
+                        previous = None;
+                        let Some(location) = symbols.get(member).locations.first().copied() else {
+                            continue;
+                        };
+                        if self.covers(location.tree) {
+                            let display = member_display(compilation, member, &Frame::new(), None);
+                            self.report(location, ErrorCode::ErrEnumeratorOverflow, &[&display]);
+                        }
+                    }
+                    Some(value) => previous = Some(value + 1),
+                    None => {}
+                }
+            }
         }
     }
 
@@ -2454,5 +2520,22 @@ fn modifier_rule(declaration: &SyntaxNode) -> Option<ModifierRule> {
         is_type,
         in_interface,
         at,
+    })
+}
+
+/// The last value of an integral type: the one an enumerator without a
+/// value of its own cannot be one past.
+fn max_of_integral(special: crate::corlib::SpecialType) -> Option<i128> {
+    use crate::corlib::SpecialType;
+    Some(match special {
+        SpecialType::SByte => i128::from(i8::MAX),
+        SpecialType::Byte => i128::from(u8::MAX),
+        SpecialType::Int16 => i128::from(i16::MAX),
+        SpecialType::UInt16 => i128::from(u16::MAX),
+        SpecialType::Int32 => i128::from(i32::MAX),
+        SpecialType::UInt32 => i128::from(u32::MAX),
+        SpecialType::Int64 => i128::from(i64::MAX),
+        SpecialType::UInt64 => i128::from(u64::MAX),
+        _ => return None,
     })
 }

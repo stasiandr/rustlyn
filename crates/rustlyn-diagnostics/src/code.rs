@@ -125,6 +125,8 @@ error_codes! {
     ErrIntDivByZero = 20, Error, "Division by constant zero";
     ErrCircConstValue = 110, Error, "The evaluation of the constant value for '{0}' involves a circular definition";
     ErrConstOutOfRangeChecked = 221, Error, "Constant value '{0}' cannot be converted to a '{1}' (use 'unchecked' syntax to override)";
+    ErrEnumeratorOverflow = 543, Error, "'{0}': the enumerator value is too large to fit in its type";
+    ErrConstOutOfRange = 31, Error, "Constant value '{0}' cannot be converted to a '{1}'";
     ErrObjectRequired = 120, Error, "An object reference is required for the non-static field, method, or property '{0}'";
     ErrObjectProhibited = 176, Error, "Member '{0}' cannot be accessed with an instance reference; qualify it with a type name instead";
     ErrNoNewAbstract = 144, Error, "Cannot create an instance of the abstract type or interface '{0}'";

@@ -213,7 +213,7 @@ impl Binder<'_> {
     }
 
     /// Whether a field's declaration gives it a value: `= ...`.
-    fn has_initializer(&self, field: SymbolId) -> bool {
+    pub(crate) fn has_initializer(&self, field: SymbolId) -> bool {
         let compilation = self.compilation();
         let Some(&(tree, span)) = compilation.declaration_nodes(field).first() else {
             return false;
