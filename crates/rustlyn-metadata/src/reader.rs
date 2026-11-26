@@ -8,7 +8,7 @@
 //! table after it reads plausible nonsense.
 
 use crate::heaps::Heaps;
-use crate::pe::Image;
+use crate::pe::{Image, slice};
 use crate::tables::{self, Column};
 use crate::{Error, Token};
 
@@ -138,10 +138,8 @@ impl<'a> Assembly<'a> {
         let image = Image::read(bytes)?;
         let cli = image.cli_header as usize;
         let read32 = |at: usize| -> Result<u32, Error> {
-            bytes
-                .get(at..at + 4)
+            slice(bytes, at, 4)
                 .map(|slice| u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
-                .ok_or(Error::Truncated)
         };
 
         // The CLI header points at the metadata root and names the entry
@@ -150,47 +148,40 @@ impl<'a> Assembly<'a> {
         let metadata_size = read32(cli + 12)? as usize;
         let entry_point = Token(read32(cli + 20)?);
         let root = image.offset_of(metadata_rva)? as usize;
-        let metadata = bytes
-            .get(root..root + metadata_size)
-            .ok_or(Error::Truncated)?;
+        let metadata = slice(bytes, root, metadata_size)?;
         if metadata.get(..4) != Some(b"BSJB") {
             return Err(Error::NotMetadata);
         }
+        // Everything from here on is read at a place the file names, and a
+        // damaged file names places it does not have: each read says the
+        // file ends early there instead of reading past the end.
+        let word = |at: usize| -> Result<usize, Error> {
+            slice(metadata, at, 4)
+                .map(|slice| u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as usize)
+        };
 
         // The root is a header, a version string of its own length, then one
         // header per stream.
-        let version_length =
-            u32::from_le_bytes([metadata[12], metadata[13], metadata[14], metadata[15]]) as usize;
-        let mut at = 16 + version_length;
-        let streams = u16::from_le_bytes([metadata[at + 2], metadata[at + 3]]);
+        let version_length = word(12)?;
+        let mut at = version_length.checked_add(16).ok_or(Error::Truncated)?;
+        let streams = slice(metadata, at.checked_add(2).ok_or(Error::Truncated)?, 2)
+            .map(|slice| u16::from_le_bytes([slice[0], slice[1]]))?;
         at += 4;
 
         let mut heaps = Heaps::default();
         let mut table_stream: &[u8] = &[];
         for _ in 0..streams {
-            let offset = u32::from_le_bytes([
-                metadata[at],
-                metadata[at + 1],
-                metadata[at + 2],
-                metadata[at + 3],
-            ]) as usize;
-            let size = u32::from_le_bytes([
-                metadata[at + 4],
-                metadata[at + 5],
-                metadata[at + 6],
-                metadata[at + 7],
-            ]) as usize;
+            let offset = word(at)?;
+            let size = word(at + 4)?;
             at += 8;
             let start = at;
             while metadata.get(at).is_some_and(|byte| *byte != 0) {
                 at += 1;
             }
-            let name = std::str::from_utf8(&metadata[start..at]).unwrap_or("");
+            let name = std::str::from_utf8(slice(metadata, start, at - start)?).unwrap_or("");
             // Each header is padded to a four-byte boundary.
             at = (at + 4) & !3;
-            let body = metadata
-                .get(offset..offset + size)
-                .ok_or(Error::Truncated)?;
+            let body = slice(metadata, offset, size)?;
             match name {
                 "#Strings" => heaps.strings = body,
                 "#US" => heaps.user_strings = body,
@@ -209,8 +200,12 @@ impl<'a> Assembly<'a> {
 
         // The table stream's own header: the heap widths, then which tables
         // are present, then a row count for each.
-        let heap_sizes = table_stream[6];
-        let valid = u64::from_le_bytes(table_stream[8..16].try_into().unwrap_or([0; 8]));
+        let heap_sizes = *table_stream.get(6).ok_or(Error::Truncated)?;
+        let valid = u64::from_le_bytes(
+            slice(table_stream, 8, 8)?
+                .try_into()
+                .map_err(|_| Error::Truncated)?,
+        );
         let mut widths = Widths {
             string: if heap_sizes & 0x01 == 0 { 2 } else { 4 },
             guid: if heap_sizes & 0x02 == 0 { 2 } else { 4 },
@@ -220,8 +215,11 @@ impl<'a> Assembly<'a> {
         let mut at = 24;
         for number in 0..64u8 {
             if valid >> number & 1 == 1 {
-                widths.rows[number as usize] =
-                    u32::from_le_bytes(table_stream[at..at + 4].try_into().unwrap_or([0; 4]));
+                widths.rows[number as usize] = u32::from_le_bytes(
+                    slice(table_stream, at, 4)?
+                        .try_into()
+                        .map_err(|_| Error::Truncated)?,
+                );
                 at += 4;
             }
         }
@@ -237,8 +235,24 @@ impl<'a> Assembly<'a> {
                 .sum();
         }
         for number in 0..64u8 {
+            let rows = widths.rows[number as usize] as usize;
+            // Rows of a table whose columns are not known cannot be stepped
+            // over, so nothing after them can be found — and a row count is
+            // a number anyone can write: four thousand million rows of no
+            // width took as long to walk as that many of any.
+            if rows > 0 && row_sizes[number as usize] == 0 {
+                return Err(Error::Malformed("rows in a table that does not exist"));
+            }
             starts[number as usize] = at;
-            at += row_sizes[number as usize] * widths.rows[number as usize] as usize;
+            at = rows
+                .checked_mul(row_sizes[number as usize])
+                .and_then(|length| at.checked_add(length))
+                .ok_or(Error::Truncated)?;
+            // The rows the header counts are there to be read: a count past
+            // the end of the stream is a table nobody could walk.
+            if at > table_stream.len() {
+                return Err(Error::Truncated);
+            }
         }
 
         Ok(Self {
@@ -262,21 +276,33 @@ impl<'a> Assembly<'a> {
         &self.image
     }
 
-    /// How many rows a table has.
+    /// How many rows a table has: none, for a number that is no table's
+    /// (a token read out of a file may carry any).
     #[must_use]
-    pub const fn rows(&self, number: u8) -> u32 {
-        self.widths.rows[number as usize]
+    pub fn rows(&self, number: u8) -> u32 {
+        self.widths.rows.get(number as usize).copied().unwrap_or(0)
     }
 
-    /// One table, ready to be stepped through.
+    /// One table, ready to be stepped through; an empty one for a number
+    /// that is no table's.
     #[must_use]
     pub fn table(&self, number: u8) -> Table<'_> {
-        let start = self.starts[number as usize];
-        let size = self.row_sizes[number as usize];
-        let length = size * self.widths.rows[number as usize] as usize;
+        let index = number as usize;
+        if index >= self.starts.len() {
+            return Table {
+                number,
+                rows: 0,
+                row_size: 0,
+                bytes: &[],
+                widths: &self.widths,
+            };
+        }
+        let start = self.starts[index];
+        let size = self.row_sizes[index];
+        let length = size * self.widths.rows[index] as usize;
         Table {
             number,
-            rows: self.widths.rows[number as usize],
+            rows: self.widths.rows[index],
             row_size: size,
             bytes: self.stream.get(start..start + length).unwrap_or(&[]),
             widths: &self.widths,

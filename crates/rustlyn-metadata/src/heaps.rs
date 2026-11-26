@@ -66,8 +66,8 @@ impl<'a> Heaps<'a> {
         if index == 0 {
             return None;
         }
-        let at = (index as usize - 1) * 16;
-        self.guids.get(at..at + 16)
+        let at = (index as usize - 1).checked_mul(16)?;
+        crate::pe::slice(self.guids, at, 16).ok()
     }
 
     /// A run of bytes with its length compressed in front, as §II.23.2 writes
@@ -81,7 +81,7 @@ impl<'a> Heaps<'a> {
             let second = *heap.get(at + 1).ok_or(Error::Truncated)?;
             ((u32::from(first & 0x3F) << 8) | u32::from(second), at + 2)
         } else {
-            let rest = heap.get(at + 1..at + 4).ok_or(Error::Truncated)?;
+            let rest = crate::pe::slice(heap, at + 1, 3)?;
             (
                 (u32::from(first & 0x1F) << 24)
                     | (u32::from(rest[0]) << 16)
@@ -90,7 +90,6 @@ impl<'a> Heaps<'a> {
                 at + 4,
             )
         };
-        heap.get(start..start + length as usize)
-            .ok_or(Error::Truncated)
+        crate::pe::slice(heap, start, length as usize)
     }
 }

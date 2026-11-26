@@ -103,11 +103,11 @@ fn main() {
                 continue;
             }
             let name = heaps.string(method.number(3));
-            let Ok(offset) = assembly.image().offset_of(rva) else {
+            let Ok(rest) = assembly.image().from_rva(rva) else {
                 failed.push(format!("{path}: {name}: address {rva:#x} is in no section"));
                 continue;
             };
-            match Body::read(&assembly.image().bytes()[offset as usize..]) {
+            match Body::read(rest) {
                 Ok(body) => {
                     bodies += 1;
                     instructions += body.instructions.len() as u64;

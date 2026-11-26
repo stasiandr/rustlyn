@@ -6,6 +6,7 @@
 //! is what makes [`crate::opcodes`] the load-bearing part.
 
 use crate::opcodes::{self, Operand};
+use crate::pe::slice;
 use crate::{Error, Token};
 
 /// What an instruction carries.
@@ -92,53 +93,48 @@ impl Body {
         let first = *bytes.first().ok_or(Error::Truncated)?;
         // The low two bits say which header this is; a tiny one packs the code
         // size into the rest of the same byte.
-        let (code_at, code_size, max_stack, locals, init_locals, more_sections) =
-            if first & 0x03 == 0x02 {
-                (1usize, u32::from(first >> 2), 8u16, None, false, false)
-            } else {
-                let flags = u16::from_le_bytes([bytes[0], *bytes.get(1).ok_or(Error::Truncated)?]);
-                let header_size = ((flags >> 12) * 4) as usize;
-                let read16 = |at: usize| -> Result<u16, Error> {
-                    bytes
-                        .get(at..at + 2)
-                        .map(|s| u16::from_le_bytes([s[0], s[1]]))
-                        .ok_or(Error::Truncated)
-                };
-                let read32 = |at: usize| -> Result<u32, Error> {
-                    bytes
-                        .get(at..at + 4)
-                        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-                        .ok_or(Error::Truncated)
-                };
-                let signature = read32(8)?;
-                (
-                    header_size,
-                    read32(4)?,
-                    read16(2)?,
-                    (signature != 0).then_some(Token(signature)),
-                    flags & 0x0010 != 0,
-                    flags & 0x0008 != 0,
-                )
+        let (code_at, code_size, max_stack, locals, init_locals, more_sections) = if first & 0x03
+            == 0x02
+        {
+            (1usize, u32::from(first >> 2), 8u16, None, false, false)
+        } else {
+            let flags = u16::from_le_bytes([bytes[0], *bytes.get(1).ok_or(Error::Truncated)?]);
+            let header_size = ((flags >> 12) * 4) as usize;
+            let read16 = |at: usize| slice(bytes, at, 2).map(|s| u16::from_le_bytes([s[0], s[1]]));
+            let read32 = |at: usize| {
+                slice(bytes, at, 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
             };
+            let signature = read32(8)?;
+            (
+                header_size,
+                read32(4)?,
+                read16(2)?,
+                (signature != 0).then_some(Token(signature)),
+                flags & 0x0010 != 0,
+                flags & 0x0008 != 0,
+            )
+        };
 
-        let code = bytes
-            .get(code_at..code_at + code_size as usize)
-            .ok_or(Error::Truncated)?;
+        let code = slice(bytes, code_at, code_size as usize)?;
         let instructions = decode(code)?;
 
         let mut regions = Vec::new();
         if more_sections {
             // The section starts on a four-byte boundary after the code.
-            let mut at = (code_at + code_size as usize + 3) & !3;
+            let mut at = (code_at + code_size as usize)
+                .checked_add(3)
+                .ok_or(Error::Truncated)?
+                & !3;
             loop {
-                let kind = *bytes.get(at).ok_or(Error::Truncated)?;
+                let header = slice(bytes, at, 4)?;
+                let kind = header[0];
                 let fat = kind & 0x40 != 0;
                 let size = if fat {
-                    u32::from(bytes[at + 1])
-                        | (u32::from(bytes[at + 2]) << 8)
-                        | (u32::from(bytes[at + 3]) << 16)
+                    u32::from(header[1])
+                        | (u32::from(header[2]) << 8)
+                        | (u32::from(header[3]) << 16)
                 } else {
-                    u32::from(bytes[at + 1])
+                    u32::from(header[1])
                 };
                 if kind & 0x01 != 0 {
                     read_clauses(bytes, at + 4, size, fat, &mut regions)?;
@@ -146,7 +142,14 @@ impl Body {
                 if kind & 0x80 == 0 {
                     break;
                 }
-                at += size as usize;
+                // The next section is this one's size further on, and a
+                // section is at least its own header: one that says it has
+                // no size at all, and that another follows, was read again
+                // for ever.
+                if size < 4 {
+                    return Err(Error::Malformed("a method data section of no size"));
+                }
+                at = at.checked_add(size as usize).ok_or(Error::Truncated)?;
             }
         }
 
@@ -173,7 +176,7 @@ fn read_clauses(
     let count = (size as usize).saturating_sub(4) / width;
     for index in 0..count {
         let clause = at + index * width;
-        let slice = bytes.get(clause..clause + width).ok_or(Error::Truncated)?;
+        let slice = slice(bytes, clause, width)?;
         let (flags, try_offset, try_length, handler_offset, handler_length, extra) = if fat {
             let word = |at: usize| {
                 u32::from_le_bytes([slice[at], slice[at + 1], slice[at + 2], slice[at + 3]])
@@ -232,7 +235,7 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, Error> {
         };
         let (name, operand) = opcodes::describe(opcode).ok_or(Error::Truncated)?;
 
-        let take = |at: usize, width: usize| code.get(at..at + width).ok_or(Error::Truncated);
+        let take = |at: usize, width: usize| slice(code, at, width);
         let value = match operand {
             Operand::None => Value::None,
             Operand::Short => Value::Variable(u16::from(*code.get(at).ok_or(Error::Truncated)?)),
@@ -281,7 +284,12 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, Error> {
             Operand::Switch => {
                 let slice = take(at, 4)?;
                 let count = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as usize;
-                let after = at + 4 + count * 4;
+                // The count is the file's word, and the targets it counts
+                // have to be there before room is made for them: a `switch`
+                // of four thousand million cases is four bytes of file.
+                let table = count.checked_mul(4).ok_or(Error::Truncated)?;
+                take(at + 4, table)?;
+                let after = at + 4 + table;
                 let mut targets = Vec::with_capacity(count);
                 for index in 0..count {
                     let slice = take(at + 4 + index * 4, 4)?;

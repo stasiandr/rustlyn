@@ -52,11 +52,10 @@ fn main() {
 fn print_body(assembly: &Assembly<'_>, name: &str, rva: u32) {
     // A body has no length until its header is read, so take what is left of
     // the section and let the header say how much of it to use.
-    let Ok(offset) = assembly.image().offset_of(rva) else {
+    let Ok(rest) = assembly.image().from_rva(rva) else {
         println!("\n.method {name}  // address {rva:#x} is in no section");
         return;
     };
-    let rest = &assembly.image().bytes()[offset as usize..];
     let body = match Body::read(rest) {
         Ok(body) => body,
         Err(error) => {

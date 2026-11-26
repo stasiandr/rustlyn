@@ -62,12 +62,11 @@ fn main() -> std::process::ExitCode {
             if rva == 0 {
                 continue;
             }
-            let Ok(offset) = assembly.image().offset_of(rva) else {
+            let Ok(rest) = assembly.image().from_rva(rva) else {
                 println!("{full}: address {rva:#x} is in no section");
                 refused += 1;
                 continue;
             };
-            let rest = &assembly.image().bytes()[offset as usize..];
             let body = match Body::read(rest) {
                 Ok(body) => body,
                 Err(error) => {

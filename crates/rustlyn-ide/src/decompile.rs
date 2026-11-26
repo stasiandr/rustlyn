@@ -254,12 +254,13 @@ impl MethodBody {
             });
         }
 
-        let Ok(offset) = assembly.image().offset_of(rva) else {
+        // The section may be one the file ends before: a damaged file's
+        // word for where a body is, is only that.
+        let Ok(rest) = assembly.image().from_rva(rva) else {
             return Err(Failure::Damaged(format!(
                 "the body address {rva:#x} is in no section"
             )));
         };
-        let rest = &assembly.image().bytes()[offset as usize..];
         let body = Body::read(rest).map_err(Failure::from)?;
         let text = print_body(&body, &names, &name);
         Ok(Self {

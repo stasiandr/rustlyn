@@ -39,6 +39,9 @@ impl Token {
         Self(((table as u32) << 24) | row)
     }
 
+    /// The table the token points into. A token read out of a file may
+    /// name one that does not exist (there are sixty-four); nothing has rows
+    /// there.
     #[must_use]
     pub const fn table(self) -> u8 {
         (self.0 >> 24) as u8
@@ -76,6 +79,10 @@ pub enum Error {
     BadAddress(u32),
     /// The file ends where something was expected.
     Truncated,
+    /// The file says something no assembly says: a table this does not know
+    /// with rows in it, a type nested deeper than any is, a section of no
+    /// size. A file that is damaged, or made to be.
+    Malformed(&'static str),
 }
 
 impl std::fmt::Display for Error {
@@ -87,6 +94,7 @@ impl std::fmt::Display for Error {
             Self::MissingStream(name) => write!(f, "the `{name}` stream is missing"),
             Self::BadAddress(rva) => write!(f, "the address {rva:#x} is in no section"),
             Self::Truncated => f.write_str("the file ends early"),
+            Self::Malformed(what) => write!(f, "the file is malformed: {what}"),
         }
     }
 }

@@ -36,17 +36,16 @@ impl<'a> Image<'a> {
     /// Returns an error when the file is not a PE image, or is one with no CLI
     /// header — a native executable rather than a .NET assembly.
     pub fn read(bytes: &'a [u8]) -> Result<Self, Error> {
+        // Every offset below is the file's own word for where something
+        // is, and a damaged file says anything: the sums are checked, so
+        // that one past the end of the address space is "the file ends
+        // early" like any other.
         let at = |offset: usize| -> Result<u32, Error> {
-            bytes
-                .get(offset..offset + 4)
+            slice(bytes, offset, 4)
                 .map(|slice| u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
-                .ok_or(Error::Truncated)
         };
         let at16 = |offset: usize| -> Result<u16, Error> {
-            bytes
-                .get(offset..offset + 2)
-                .map(|slice| u16::from_le_bytes([slice[0], slice[1]]))
-                .ok_or(Error::Truncated)
+            slice(bytes, offset, 2).map(|slice| u16::from_le_bytes([slice[0], slice[1]]))
         };
 
         if bytes.get(..2) != Some(b"MZ") {
@@ -54,7 +53,7 @@ impl<'a> Image<'a> {
         }
         // The DOS stub ends with the offset of the PE signature.
         let pe = at(0x3C)? as usize;
-        if bytes.get(pe..pe + 4) != Some(b"PE\0\0") {
+        if slice(bytes, pe, 4).ok() != Some(b"PE\0\0") {
             return Err(Error::NotAnImage);
         }
 
@@ -70,12 +69,10 @@ impl<'a> Image<'a> {
         }
 
         let table = pe + 24 + optional;
-        let mut parsed = Vec::with_capacity(sections);
+        let mut parsed = Vec::new();
         for index in 0..sections {
             let at_section = table + 40 * index;
-            let name = bytes
-                .get(at_section..at_section + 8)
-                .ok_or(Error::Truncated)?;
+            let name = slice(bytes, at_section, 8)?;
             let name = String::from_utf8_lossy(name)
                 .trim_end_matches('\0')
                 .to_string();
@@ -115,10 +112,28 @@ impl<'a> Image<'a> {
         self.sections
             .iter()
             .find(|section| {
-                rva >= section.virtual_address && rva < section.virtual_address + section.raw_size
+                rva >= section.virtual_address
+                    && u64::from(rva)
+                        < u64::from(section.virtual_address) + u64::from(section.raw_size)
             })
-            .map(|section| section.raw_offset + (rva - section.virtual_address))
+            .and_then(|section| {
+                section
+                    .raw_offset
+                    .checked_add(rva - section.virtual_address)
+            })
             .ok_or(Error::BadAddress(rva))
+    }
+
+    /// The file from a relative virtual address on: what a method body is
+    /// read out of, which has no length until its header says one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the address is in no section, or in one the
+    /// file ends before.
+    pub fn from_rva(&self, rva: u32) -> Result<&'a [u8], Error> {
+        let offset = self.offset_of(rva)? as usize;
+        self.bytes.get(offset..).ok_or(Error::Truncated)
     }
 
     /// A slice of the file at a relative virtual address.
@@ -129,8 +144,15 @@ impl<'a> Image<'a> {
     /// past the end of the file.
     pub fn at_rva(&self, rva: u32, length: usize) -> Result<&'a [u8], Error> {
         let offset = self.offset_of(rva)? as usize;
-        self.bytes
-            .get(offset..offset + length)
-            .ok_or(Error::Truncated)
+        slice(self.bytes, offset, length)
     }
+}
+
+/// `length` bytes at `offset`, or [`Error::Truncated`] where the file does
+/// not have them — the sum checked, since both are whatever a file said.
+pub(crate) fn slice(bytes: &[u8], offset: usize, length: usize) -> Result<&[u8], Error> {
+    offset
+        .checked_add(length)
+        .and_then(|end| bytes.get(offset..end))
+        .ok_or(Error::Truncated)
 }

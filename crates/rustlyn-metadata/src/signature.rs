@@ -126,12 +126,24 @@ fn required(modifiers: &[CustomModifier]) -> Vec<Token> {
 pub struct Blob<'a> {
     bytes: &'a [u8],
     at: usize,
+    /// How many types deep the one being read is; see [`MAX_NESTING`].
+    depth: u32,
 }
+
+/// How deep a type in a signature nests: `int*****[]` is six. Each level is
+/// a call to itself, and a blob of nothing but `PTR` bytes — a megabyte of
+/// them fits in a file — ran the reader out of stack. Real signatures nest a
+/// handful deep.
+const MAX_NESTING: u32 = 256;
 
 impl<'a> Blob<'a> {
     #[must_use]
     pub const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
+        Self {
+            bytes,
+            at: 0,
+            depth: 0,
+        }
     }
 
     #[must_use]
@@ -200,6 +212,24 @@ impl<'a> Blob<'a> {
     ///
     /// Returns an error when the blob ends in the middle of a type.
     pub fn type_sig(&mut self) -> Result<TypeSig, Error> {
+        if self.depth >= MAX_NESTING {
+            return Err(Error::Malformed("a type nested too deep in a signature"));
+        }
+        self.depth += 1;
+        let ty = self.type_sig_here();
+        self.depth -= 1;
+        ty
+    }
+
+    /// Room for `count` things still to be read: at most one per byte left,
+    /// whatever the count says — it is a number in a file, and half a
+    /// thousand million parameters asked for before the first is read is
+    /// memory nobody has.
+    fn room<T>(&self, count: usize) -> Vec<T> {
+        Vec::with_capacity(count.min(self.bytes.len().saturating_sub(self.at)))
+    }
+
+    fn type_sig_here(&mut self) -> Result<TypeSig, Error> {
         // Custom modifiers sit in front of the type they modify and say
         // nothing this needs, so they are stepped over rather than kept.
         while let Some(0x1F | 0x20) = self.peek() {
@@ -245,7 +275,7 @@ impl<'a> Blob<'a> {
             0x15 => {
                 let definition = Box::new(self.type_sig()?);
                 let count = self.unsigned()?;
-                let mut arguments = Vec::with_capacity(count as usize);
+                let mut arguments = self.room(count as usize);
                 for _ in 0..count {
                     arguments.push(self.type_sig()?);
                 }
@@ -315,8 +345,8 @@ impl<'a> Blob<'a> {
         let count = self.unsigned()? as usize;
         let returns_modifiers = self.modifiers()?;
         let returns = self.type_sig()?;
-        let mut parameters = Vec::with_capacity(count);
-        let mut parameters_modifiers = Vec::with_capacity(count);
+        let mut parameters = self.room(count);
+        let mut parameters_modifiers = self.room(count);
         let mut sentinel = None;
         for _ in 0..count {
             // `SENTINEL` marks where a vararg call's extra arguments begin.
@@ -364,8 +394,8 @@ impl<'a> Blob<'a> {
         let count = self.unsigned()? as usize;
         let returns_modifiers = self.modifiers()?;
         let returns = self.type_sig()?;
-        let mut parameters = Vec::with_capacity(count);
-        let mut parameters_modifiers = Vec::with_capacity(count);
+        let mut parameters = self.room(count);
+        let mut parameters_modifiers = self.room(count);
         for _ in 0..count {
             parameters_modifiers.push(self.modifiers()?);
             parameters.push(self.type_sig()?);
@@ -394,7 +424,7 @@ impl<'a> Blob<'a> {
     pub fn locals_sig(&mut self) -> Result<Vec<TypeSig>, Error> {
         self.byte()?;
         let count = self.unsigned()? as usize;
-        let mut locals = Vec::with_capacity(count);
+        let mut locals = self.room(count);
         for _ in 0..count {
             locals.push(self.type_sig()?);
         }
