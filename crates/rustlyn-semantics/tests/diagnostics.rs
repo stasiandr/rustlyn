@@ -2670,3 +2670,25 @@ fn a_call_one_overload_takes_best_is_not_cs0121() {
         assert!(found.is_empty(), "{call}: {found:?}");
     }
 }
+
+#[test]
+fn an_extension_block_property_takes_an_array_as_its_collection_receiver() {
+    // `xs.Total` reaches `extension(IEnumerable<int> source)` through the
+    // array's implicit reference conversion; the string initializer makes
+    // the property's `int` visible, which an unbound access would hide.
+    let found = codes(
+        "using System.Collections.Generic;
+static class Ext { extension(IEnumerable<int> source) { public int Total => 1; } extension<T>(IEnumerable<T> s) { public int N => 1; } }
+class C { void M(int[] xs, string[] ss) { string a = xs.Total; string b = ss.N; } }",
+    );
+    assert_eq!(found, ["CS0029", "CS0029"], "{found:?}");
+}
+
+#[test]
+fn an_extension_block_property_takes_no_numeric_conversion_of_its_receiver() {
+    let found = codes(
+        "static class Ext { extension(long x) { public long P => x; } }
+class C { long M(int i, long l) => i.P + l.P; }",
+    );
+    assert_eq!(found, ["CS1061"], "{found:?}");
+}

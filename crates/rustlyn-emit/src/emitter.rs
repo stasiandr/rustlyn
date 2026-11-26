@@ -11605,7 +11605,30 @@ impl Emitter<'_> {
         }
         let mut inferred = HashMap::new();
         if let Some(first) = first {
-            unify(&self.type_of(first), receiver, &mut inferred);
+            let pattern = self.type_of(first);
+            // A receiver that only converts to the parameter's type — an
+            // array for an `IEnumerable<T>`, a `List<int>` for an
+            // `IReadOnlyList<T>` — says what `T` is through the
+            // construction of that type it reaches.
+            let actual = match (&pattern, receiver) {
+                (Type::Named { symbol, .. }, receiver) if receiver.symbol() != Some(*symbol) => {
+                    let span_element = match receiver {
+                        Type::Array {
+                            element: given,
+                            rank: 1,
+                        } if self.binder.span_parts(&pattern).is_some() => Some(Type::Named {
+                            symbol: *symbol,
+                            type_arguments: vec![(**given).clone()],
+                        }),
+                        _ => None,
+                    };
+                    span_element
+                        .or_else(|| self.binder.constructed_from(receiver, *symbol))
+                        .unwrap_or_else(|| receiver.clone())
+                }
+                _ => receiver.clone(),
+            };
+            unify(&pattern, &actual, &mut inferred);
         }
         let arguments: Vec<Type> = generics
             .iter()

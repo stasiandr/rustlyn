@@ -1370,6 +1370,32 @@ impl BodyBinder<'_> {
             // from an extension method: `items.Cast<string>()` is a method
             // group over the array, closed for the call to resolve.
             let Some(array) = self.as_system_array(&receiver, name) else {
+                // A member of an extension block (C# 14) whose receiver the
+                // array reaches by a reference conversion: `array.Total`
+                // against `extension(IEnumerable<int> source)`.
+                let methods_first = self
+                    .binder
+                    .extensions_in_scope(&self.context, name)
+                    .into_iter()
+                    .any(|method| self.extension_takes(method, &receiver.ty));
+                if !methods_first
+                    && let Some(access) = self.extension_member_access(&receiver, name, span)
+                {
+                    self.body
+                        .references
+                        .insert(right.span(), BoundSymbol::Declared(access.1));
+                    return access.0;
+                }
+                if let Some(read) = self.bind_extension_call(
+                    &format!("get_{name}"),
+                    right,
+                    receiver.clone(),
+                    &[],
+                    &[],
+                    span,
+                ) {
+                    return read;
+                }
                 let extensions = self.extensions_here(name);
                 if !extensions.is_empty() {
                     return BoundExpression::new(
@@ -1717,9 +1743,19 @@ impl BodyBinder<'_> {
                             .binder
                             .type_of(candidate, &mut sink)
                             .substitute(&inferred);
+                        // An array or a `Span<T>` reaches a span receiver
+                        // through the span conversion, made where it is read.
+                        let mut receiver = receiver.clone();
+                        if !on_type && let Some(first) = detail.parameters.first() {
+                            let taken =
+                                self.binder.type_of(*first, &mut sink).substitute(&inferred);
+                            if self.binder.span_parts(&taken).is_some() && receiver.ty != taken {
+                                receiver = self.convert(receiver, &taken);
+                            }
+                        }
                         let access = BoundExpression::new(
                             BoundExpressionKind::Property {
-                                receiver: (!on_type).then(|| Box::new(receiver.clone())),
+                                receiver: (!on_type).then(|| Box::new(receiver)),
                                 property: candidate,
                             },
                             ty,
@@ -1773,9 +1809,16 @@ impl BodyBinder<'_> {
             {
                 return false;
             }
+            if !self.satisfies_constraints(generics, inferred) {
+                return false;
+            }
         }
         let taken = taken.substitute(inferred);
-        self.binder.converts_implicitly(receiver, &taken) || *receiver == taken
+        // Only the conversions a receiver may take: not a numeric, enumeration
+        // or nullable one, so `5.P` does not reach `extension(long x)`.
+        (self.binder.converts_implicitly(receiver, &taken)
+            && self.receiver_converts(receiver, &taken))
+            || *receiver == taken
     }
 
     /// Whether an extension method's `this` parameter takes a receiver of

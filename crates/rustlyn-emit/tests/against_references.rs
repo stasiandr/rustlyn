@@ -18297,3 +18297,63 @@ class Other
         "9223372036854775807 -9223372036854775808 18446744073709551615 0 8 8 True 1 2\nSystem.IntPtr\n0\n16\nMaxValue\n9223372036854775807\n9\nTrue 77\n9\n5\n",
     );
 }
+
+#[test]
+fn extension_block_members_take_the_receivers_a_classic_extension_does() {
+    check(
+        "extension_block_receivers",
+        r#"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+interface IShape { int Sides { get; } }
+struct Square : IShape { public int Sides => 4; }
+class Animal { }
+class Dog : Animal { }
+
+static class Ext
+{
+    extension(IEnumerable<int> source) { public int Total => source.Sum(); public int Twice() => source.Sum() * 2; }
+    extension(IEnumerable<object> items) { public int Count2 => items.Count(); }
+    extension(IList<int> list) { public int First2 => list[0]; }
+    extension(IReadOnlyList<int> list) { public int Last2 => list[list.Count - 1]; }
+    extension(IShape shape) { public int Doubled => shape.Sides * 2; }
+    extension(IEnumerable<char> chars) { public int Letters => chars.Count(); }
+    extension(Animal animal) { public string Kind => "animal"; }
+    extension<T>(IEnumerable<T> source) { public int N => source.Count(); }
+    extension<T>(T value) where T : IShape { public int Sided => value.Sides + 1; }
+    extension(ReadOnlySpan<int> span) { public int SpanLength => span.Length; }
+    extension<T>(ReadOnlySpan<T> span) { public int Generic => span.Length; }
+    extension(long number) { public long Next => number + 1; }
+}
+
+static class Program
+{
+    static int Through<T>(T value) where T : IShape => value.Sided;
+
+    static void Main()
+    {
+        int[] numbers = [1, 2, 3];
+        string[] words = ["a", "b"];
+        List<int> list = [4, 5];
+        Console.WriteLine(numbers.Total + " " + numbers.Twice() + " " + list.Total);
+        Console.WriteLine(words.Count2 + " " + numbers.First2 + " " + numbers.Last2);
+        Console.WriteLine(new Square().Doubled + " " + Through(new Square()));
+        Console.WriteLine("abc".Letters + " " + new Dog().Kind);
+        Console.WriteLine(numbers.N + " " + words.N + " " + list.N + " " + new Dog[] { new Dog() }.N);
+        Console.WriteLine(numbers.SpanLength + " " + numbers.Generic);
+        Console.WriteLine(5L.Next);
+    }
+}
+"#,
+        "6 12 9
+2 1 3
+8 5
+3 animal
+3 2 2 1
+3 3
+6
+",
+    );
+}
