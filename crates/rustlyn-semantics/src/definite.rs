@@ -18,10 +18,17 @@
 //! they only ever lose locals, so they do — and only the last walk's
 //! findings count.
 //!
+//! A `break`, a `continue`, a `return` or a `goto` that leaves a `try` with
+//! a `finally` runs the `finally` on its way, so it arrives at its target
+//! with what it had when it jumped plus whatever the `finally` is sure to
+//! assign: the same combination as at the normal end of the `try`, made
+//! once for each `finally` it passes through, nested ones included. A jump
+//! that stays inside the `try` passes through nothing. For an `out`
+//! parameter this means a `return` counts what the `finally` assigned.
+//!
 //! Like the rest of the flow analysis it would rather say nothing than
-//! something wrong. A body with a construct the binder does not model, a
-//! `goto` out of a `try` with a `finally`, or an expression that did not
-//! bind gets no CS0165 at all, and a
+//! something wrong. A body with a construct the binder does not model or an
+//! expression that did not bind gets no CS0165 at all, and a
 //! local is only watched where its type leaves no doubt about what assigning
 //! it means: a struct is assigned field by field as well as whole, so one
 //! whose fields the body touches is left alone, as is one from another
@@ -144,6 +151,8 @@ pub(crate) fn check(
         arriving: HashMap::new(),
         arriving_changed: false,
         follows_gotos: !shape.gotos.is_empty(),
+        guards: Vec::new(),
+        label_tries: shape.label_tries.clone(),
     };
     // A `goto` may jump over a declaration: `goto L; int x = 1; L: Use(x);`
     // reads an `x` nothing assigned. A local counts as assigned until its
@@ -177,6 +186,7 @@ pub(crate) fn check(
             walk.settled(|walk| {
                 walk.state = State::assigned(slots);
                 walk.targets.clear();
+                walk.guards.clear();
                 walk.checking = Vec::new();
                 for local in function.captured.iter().chain(&declared) {
                     walk.state.unassign(*local);
@@ -211,6 +221,7 @@ pub(crate) fn check(
                     walk.state.unassign(*local);
                 }
                 walk.targets.clear();
+                walk.guards.clear();
                 walk.checking = owner.map(outs_of).unwrap_or_default();
                 for parameter in walk.checking.clone() {
                     if let Some(slot) = walk.out_slot(parameter) {
@@ -365,6 +376,12 @@ struct Shape {
     /// and the labels its `goto`s name.
     labels: Vec<String>,
     gotos: Vec<String>,
+    /// The `try` statements with a `finally` whose body or catches the
+    /// shape is inside, outermost first, each named by its address.
+    tries: Vec<usize>,
+    /// For each label, the `try`s with a `finally` it is inside: a `goto`
+    /// to it leaves the ones it is in beyond these.
+    label_tries: HashMap<String, Vec<usize>>,
 }
 
 impl Shape {
@@ -372,7 +389,10 @@ impl Shape {
         match &statement.kind {
             BoundStatementKind::Unsupported(_) => self.unsure = true,
             BoundStatementKind::Goto(label) => self.gotos.push(label.clone()),
-            BoundStatementKind::Label(label) => self.labels.push(label.clone()),
+            BoundStatementKind::Label(label) => {
+                self.labels.push(label.clone());
+                self.label_tries.insert(label.clone(), self.tries.clone());
+            }
             BoundStatementKind::Block(statements) => {
                 for inner in statements {
                     self.statement(inner);
@@ -467,6 +487,9 @@ impl Shape {
                 catches,
                 finally,
             } => {
+                if finally.is_some() {
+                    self.tries.push(std::ptr::from_ref(statement) as usize);
+                }
                 self.statement(body);
                 for catch in catches {
                     if let Some(filter) = &catch.filter {
@@ -475,13 +498,7 @@ impl Shape {
                     self.statement(&catch.body);
                 }
                 if let Some(finally) = finally {
-                    // A `break` or a `return` out of a `try` runs the
-                    // `finally` on its way, and the state it carries would
-                    // have to include what the `finally` assigns; that is
-                    // not modelled.
-                    if jumps(body) || catches.iter().any(|catch| jumps(&catch.body)) {
-                        self.unsure = true;
-                    }
+                    self.tries.pop();
                     self.statement(finally);
                 }
             }
@@ -646,23 +663,6 @@ fn struct_parameter(receiver: &BoundExpression) -> Option<SymbolId> {
         } => struct_parameter(inner),
         _ => None,
     }
-}
-
-/// Whether a statement holds a `break`, a `continue`, a `return` or a
-/// `goto`: each leaves through the `finally` around it, which may assign
-/// what the jump needs assigned.
-fn jumps(statement: &BoundStatement) -> bool {
-    let mut found = false;
-    each_nested_statement(statement, &mut |inner| {
-        found |= matches!(
-            inner.kind,
-            BoundStatementKind::Break(_)
-                | BoundStatementKind::Continue(_)
-                | BoundStatementKind::Return(_)
-                | BoundStatementKind::Goto(_)
-        );
-    });
-    found
 }
 
 fn each_nested_statement(statement: &BoundStatement, visit: &mut impl FnMut(&BoundStatement)) {
@@ -1026,6 +1026,19 @@ impl State {
     }
 }
 
+/// A `try` with a `finally` whose body or catches are being walked, and
+/// what its `finally` is sure to assign, which every jump out of it picks up.
+struct Guard {
+    /// Which `try` it is, as `Shape` named it.
+    id: usize,
+    /// How many loops and `switch`es were being walked around it: a jump to
+    /// one of those leaves it, a jump to a later one does not.
+    depth: usize,
+    /// The state after the `finally`, walked from the state the `try` began
+    /// with.
+    finally: State,
+}
+
 /// A loop or a `switch` being walked, and the states its jumps carry.
 struct Target {
     is_switch: bool,
@@ -1065,6 +1078,11 @@ struct Walk<'a, 'b> {
     /// Whether the body has a `goto`, and so its declared locals start out
     /// unassigned rather than becoming so where they are declared.
     follows_gotos: bool,
+    /// The `try`s with a `finally` the walk is inside, outermost first, in
+    /// the lambda or method being walked.
+    guards: Vec<Guard>,
+    /// For each label, the ids of the `try`s with a `finally` it is inside.
+    label_tries: HashMap<String, Vec<usize>>,
 }
 
 impl Walk<'_, '_> {
@@ -1248,6 +1266,22 @@ impl Walk<'_, '_> {
                 finally,
             } => {
                 let entry = self.state.clone();
+                // The `finally` is walked first, from where the `try`
+                // began, so that the jumps in the body know what it
+                // assigns; its findings go after the body's, where they
+                // belong.
+                let mut finally_found = Vec::new();
+                if let Some(finally) = finally {
+                    let mark = self.found.len();
+                    self.statement(finally);
+                    finally_found = self.found.split_off(mark);
+                    let after = std::mem::replace(&mut self.state, entry.clone());
+                    self.guards.push(Guard {
+                        id: std::ptr::from_ref(statement) as usize,
+                        depth: self.targets.len(),
+                        finally: after,
+                    });
+                }
                 self.statement(body);
                 let mut end = self.state.clone();
                 for catch in catches {
@@ -1258,10 +1292,11 @@ impl Walk<'_, '_> {
                     self.statement(&catch.body);
                     end.join(&self.state);
                 }
-                if let Some(finally) = finally {
-                    self.state = entry;
-                    self.statement(finally);
-                    end.then(&self.state);
+                if finally.is_some()
+                    && let Some(guard) = self.guards.pop()
+                {
+                    end.then(&guard.finally);
+                    self.found.extend(finally_found);
                 }
                 self.state = end;
             }
@@ -1286,6 +1321,7 @@ impl Walk<'_, '_> {
                 if let Some(value) = value {
                     self.expression(value);
                 }
+                self.pass_finallys(0);
                 self.leaving(statement.span);
                 self.state = State::unreachable(self.count());
             }
@@ -1299,20 +1335,24 @@ impl Walk<'_, '_> {
                 self.state = State::unreachable(self.count());
             }
             BoundStatementKind::Break(outward) => {
-                if let Some(target) = self.targets.iter_mut().rev().nth(*outward) {
-                    target.breaks.join(&self.state);
+                if let Some(index) = self.targets.len().checked_sub(*outward + 1) {
+                    self.pass_finallys_to(index);
+                    self.targets[index].breaks.join(&self.state);
                 }
                 self.state = State::unreachable(self.count());
             }
             BoundStatementKind::Continue(outward) => {
-                if let Some(target) = self
+                let index = self
                     .targets
-                    .iter_mut()
+                    .iter()
+                    .enumerate()
                     .rev()
-                    .filter(|t| !t.is_switch)
+                    .filter(|(_, t)| !t.is_switch)
                     .nth(*outward)
-                {
-                    target.continues.join(&self.state);
+                    .map(|(index, _)| index);
+                if let Some(index) = index {
+                    self.pass_finallys_to(index);
+                    self.targets[index].continues.join(&self.state);
                 }
                 self.state = State::unreachable(self.count());
             }
@@ -1324,6 +1364,19 @@ impl Walk<'_, '_> {
                 }
             }
             BoundStatementKind::Goto(label) => {
+                // The label is outside every `try` it is not inside, and
+                // those are the ones the jump leaves; a label somewhere
+                // else than around the `goto` is not one to follow.
+                match self.label_tries.get(label) {
+                    Some(inside)
+                        if inside.len() <= self.guards.len()
+                            && inside.iter().zip(&self.guards).all(|(id, g)| *id == g.id) =>
+                    {
+                        let kept = inside.len();
+                        self.pass_finallys(kept);
+                    }
+                    _ => self.unsure = true,
+                }
                 let count = self.count();
                 let arriving = self
                     .arriving
@@ -1338,6 +1391,22 @@ impl Walk<'_, '_> {
             }
             BoundStatementKind::Empty | BoundStatementKind::Unsupported(_) => {}
         }
+    }
+
+    /// A jump leaves every `try` with a `finally` from the `keep`th outward
+    /// in, and takes on what each `finally` assigns on the way.
+    fn pass_finallys(&mut self, keep: usize) {
+        for index in keep..self.guards.len() {
+            let after = self.guards[index].finally.clone();
+            self.state.then(&after);
+        }
+    }
+
+    /// A jump to the loop or `switch` at `target` in the stack leaves the
+    /// `try`s that began before it was entered.
+    fn pass_finallys_to(&mut self, target: usize) {
+        let keep = self.guards.iter().take_while(|g| g.depth <= target).count();
+        self.pass_finallys(keep);
     }
 
     /// Walks a body with `once` until the states its `goto`s carry to their
@@ -1998,6 +2067,7 @@ impl Walk<'_, '_> {
                 if let Some(lambda) = self.body.lambdas.get(*index) {
                     let saved = self.state.clone();
                     let targets = std::mem::take(&mut self.targets);
+                    let guards = std::mem::take(&mut self.guards);
                     // A lambda written where nothing reaches still has a
                     // body that starts somewhere: what is around it counts
                     // as assigned, and what it declares starts out not.
@@ -2020,6 +2090,7 @@ impl Walk<'_, '_> {
                     self.statement(&lambda.body);
                     self.lambdas -= 1;
                     self.targets = targets;
+                    self.guards = guards;
                     self.state = saved;
                 }
             }
