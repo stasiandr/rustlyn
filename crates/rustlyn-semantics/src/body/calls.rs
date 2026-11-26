@@ -720,43 +720,15 @@ impl BodyBinder<'_> {
                 // CS0121: another overload the arguments reach as well, and
                 // neither the better. The first declared was called, and
                 // nothing said that the other could have been meant.
-                if let Some(rival) = self.certain_rival(
+                self.report_if_ambiguous(
                     introduced,
                     &candidates,
                     &arguments,
                     &receiver_type,
                     &explicit,
-                ) {
-                    let compilation = self.binder.compilation();
-                    let symbols = compilation.symbols();
-                    // As Roslyn names them: in the order they are declared.
-                    let place = |method: SymbolId| {
-                        symbols
-                            .get(method)
-                            .locations
-                            .first()
-                            .map(|location| (location.tree, location.span.start()))
-                    };
-                    let (first, second) = if place(rival) < place(introduced) {
-                        (rival, introduced)
-                    } else {
-                        (introduced, rival)
-                    };
-                    let display = |method: SymbolId| {
-                        crate::checks::member_display(
-                            compilation,
-                            method,
-                            &Default::default(),
-                            None,
-                        )
-                    };
-                    let (first, second) = (display(first), display(second));
-                    self.report(
-                        ErrorCode::ErrAmbigCall,
-                        name_node.span(),
-                        &[&first, &second],
-                    );
-                }
+                    false,
+                    name_node.span(),
+                );
                 if receiver.is_none()
                     && matches!(
                         callee.kind(),
@@ -1127,6 +1099,20 @@ impl BodyBinder<'_> {
                     && self.lambdas_fit(&resolved, &unbound, &Type::Void, explicit)
                         == super::Fit::Bad;
                 if !rejected {
+                    // CS0121 among the extension methods of this scope: the
+                    // receiver is the first argument, and names or lambdas
+                    // leave the judging to the resolution.
+                    if names.iter().all(Option::is_none) {
+                        self.report_if_ambiguous(
+                            resolved.method,
+                            candidates,
+                            &unbound,
+                            &Type::Void,
+                            explicit,
+                            true,
+                            name_node.span(),
+                        );
+                    }
                     settled = Some((resolved, arguments));
                     break;
                 }

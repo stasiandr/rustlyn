@@ -62,16 +62,19 @@ implements the behaviour.
   wrong value.
 * An error that says code is wrong is reported only where that is certain; where the
   binder cannot tell, it lets the code through rather than refuse code Roslyn accepts.
-  CS0030 (a cast nothing can make) is judged for classes and structs only — not for
-  interfaces, delegates, arrays, tuples or type parameters, whose conversions have rules
-  of their own. CS0121 (an ambiguous call) is judged for methods of one type that are
-  not generic and take exactly the arguments given, by value; an ambiguity that turns on
-  a lambda, a generic method, `params` or an optional parameter still resolves to the
-  first candidate. A protected nested *type* of a referenced assembly can still be named
-  from anywhere (its members cannot).
-* Definite assignment follows `goto`, except out of a `try` with a `finally`: a body
-  that jumps through one gets no CS0165 at all, as does a body the binder did not fully
-  understand.
+  CS0030 (a cast nothing can make) is judged for classes, structs, interfaces,
+  delegates, arrays and tuples — not for type parameters, nor where it turns on variance
+  or on an array against a collection interface. CS0121 (an ambiguous call) is judged
+  for methods, constructors, indexers and extension methods whose arguments are by value
+  and in position; an ambiguity that turns on a lambda, a named argument, a default left
+  unfilled, a type parameter used more than once, an unsigned type or three candidates
+  that tie still resolves to the first candidate. CS0122 for a nested type is reported
+  where it is named through its owner (`Outer.Hidden`); by its bare name in a type
+  derived from the owner it is CS0246, and inside `nameof` it is let through. CS0031 (a constant that does not fit) is
+  reported for a declaration or an assignment, not for an element of an array
+  initializer.
+* Definite assignment follows `goto`, through a `finally` too; a body the binder did not
+  fully understand gets no CS0165 at all.
 
 ## Interpreter
 

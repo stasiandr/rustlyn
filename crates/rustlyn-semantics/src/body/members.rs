@@ -541,6 +541,8 @@ impl<'a> BodyBinder<'a> {
         );
         let argument_types: Vec<Type> = arguments.iter().map(|a| a.ty.clone()).collect();
         let mut arguments = arguments;
+        let written_arguments =
+            (candidates.len() > 1 && names.iter().all(Option::is_none)).then(|| arguments.clone());
 
         let constructor = target
             .clone()
@@ -551,6 +553,29 @@ impl<'a> BodyBinder<'a> {
                 self.resolve_with_lambdas(&candidates, &mut arguments, &receiver, &[], false)
                     .map(|resolved| resolved.method)
             });
+        if let (Some(constructor), Some(receiver), Some(written)) =
+            (constructor, target.as_ref(), &written_arguments)
+        {
+            // Blamed on the keyword, as an unusable call is.
+            let keyword = node
+                .child_tokens()
+                .find(|token| {
+                    matches!(
+                        token.kind(),
+                        SyntaxKind::BaseKeyword | SyntaxKind::ThisKeyword
+                    )
+                })
+                .map_or(node.span(), |token| token.span());
+            self.report_if_ambiguous(
+                constructor,
+                &candidates,
+                written,
+                receiver,
+                &[],
+                false,
+                keyword,
+            );
+        }
         let arguments = match (constructor, target.as_ref()) {
             (Some(constructor), Some(receiver)) => self.convert_arguments(
                 constructor,

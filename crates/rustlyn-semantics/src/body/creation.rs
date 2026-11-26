@@ -1648,6 +1648,10 @@ impl BodyBinder<'_> {
         }
         let candidates = self.named_candidates(&candidates, &names);
         let mut arguments = self.reorder_named(&candidates, &names, arguments, &ty);
+        // Resolution may rewrite lambdas among the arguments; whether two
+        // constructors are ambiguous is judged on them as written.
+        let written_arguments =
+            (candidates.len() > 1 && names.iter().all(Option::is_none)).then(|| arguments.clone());
         let constructor = if candidates.is_empty()
             || (arguments.is_empty() && self.implicit_struct_constructor(&ty, &candidates))
         {
@@ -1656,6 +1660,14 @@ impl BodyBinder<'_> {
             self.resolve_with_lambdas(&candidates, &mut arguments, &ty, &[], false)
                 .map(|resolved| resolved.method)
         };
+        if let (Some(constructor), Some(written)) = (constructor, &written_arguments) {
+            // Blamed on the type's name, or on `new` where there is none.
+            let at = node
+                .children()
+                .find(|child| child.kind().is_type_node())
+                .map_or(node.span(), |name| name.span());
+            self.report_if_ambiguous(constructor, &candidates, written, &ty, &[], false, at);
+        }
         let written = node.children().find(|child| child.kind().is_type_node());
         if let Some(written) = &written {
             self.check_creation(node, written, &ty, &candidates, constructor, &arguments);

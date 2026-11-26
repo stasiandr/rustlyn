@@ -630,6 +630,19 @@ impl BodyBinder<'_> {
         let indices = self.reorder_named(&indexers, names, indices, &other);
         match self.pick_indexer(&indexers, &indices, &other) {
             Some(indexer) => {
+                // CS0121 where two indexers fit the indices and neither is
+                // better, as two methods do.
+                if names.iter().all(Option::is_none) {
+                    self.report_if_ambiguous(
+                        indexer,
+                        &indexers,
+                        &indices,
+                        &other,
+                        &[],
+                        false,
+                        span,
+                    );
+                }
                 let ty = self.member_type(indexer, &other);
                 // `token[2]` on a `this[object key]` boxes the `2`:
                 // each index converts to the parameter it is for.
