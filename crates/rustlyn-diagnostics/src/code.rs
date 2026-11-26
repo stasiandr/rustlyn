@@ -119,6 +119,7 @@ error_codes! {
     ErrBadArgCount = 1501, Error, "No overload for method '{0}' takes {1} arguments";
     ErrBadArgType = 1503, Error, "Argument {0}: cannot convert from '{1}' to '{2}'";
     ErrNoSuchMemberOrExtension = 1061, Error, "'{0}' does not contain a definition for '{1}' and no accessible extension method '{1}' accepting a first argument of type '{0}' could be found (are you missing a using directive or an assembly reference?)";
+    ErrBadExtensionReceiver = 1929, Error, "'{0}' does not contain a definition for '{1}' and the best extension method overload '{2}' requires a receiver of type '{3}'";
     ErrBadCtorArgCount = 1729, Error, "'{0}' does not contain a constructor that takes {1} arguments";
     ErrNoCorrespondingArgument = 7036, Error, "There is no argument given that corresponds to the required parameter '{0}' of '{1}'";
     ErrNoImplicitConvCast = 266, Error, "Cannot implicitly convert type '{0}' to '{1}'. An explicit conversion exists (are you missing a cast?)";

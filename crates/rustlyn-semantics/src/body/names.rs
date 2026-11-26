@@ -248,6 +248,120 @@ impl BodyBinder<'_> {
         found
     }
 
+    /// `receiver.name` as a member an extension gives the receiver: an
+    /// instance property of an extension block (C# 14) or a static member of
+    /// one, read through a `get_Name(receiver)` extension method, or the
+    /// extension methods of that name named without a call, a group closed
+    /// over the receiver a delegate is made from. With `fitting`, only what
+    /// the receiver is taken by counts, as when it is a member the receiver
+    /// has but may not reach that the extension stands in for.
+    pub(super) fn extension_member_on(
+        &mut self,
+        receiver: &BoundExpression,
+        right: &SyntaxNode,
+        name: &str,
+        span: TextSpan,
+        fitting: bool,
+    ) -> Option<BoundExpression> {
+        // A property for this receiver is reached first, unless a method of
+        // the name is in a nearer place (see `extension_method_nearer`).
+        if let Some(access) = self.extension_member_access(receiver, name, span)
+            && (matches!(receiver.kind, BoundExpressionKind::TypeExpression(_))
+                || !self.extension_method_nearer(name, access.1, &receiver.ty))
+        {
+            self.body
+                .references
+                .insert(right.span(), BoundSymbol::Declared(access.1));
+            return Some(access.0);
+        }
+        // An extension block's property (C# 14) is read through a
+        // `get_Name(receiver)` the block declared as an extension method.
+        if let Some(read) = self.bind_extension_call(
+            &format!("get_{name}"),
+            right,
+            receiver.clone(),
+            &[],
+            &[],
+            span,
+        ) {
+            return Some(read);
+        }
+        // `types.All(symbol.IsContainingSymbolOfAllTypeParameters)` names
+        // an extension method without calling it: a method group closed
+        // over the receiver, which a delegate is made from.
+        let extensions = self.extensions_here(name);
+        if extensions.is_empty()
+            || (fitting
+                && !extensions
+                    .iter()
+                    .any(|method| self.extension_takes(*method, &receiver.ty)))
+        {
+            return None;
+        }
+        Some(BoundExpression::new(
+            BoundExpressionKind::MethodGroup {
+                receiver: Some(Box::new(receiver.clone())),
+                candidates: extensions,
+            },
+            Type::Error,
+            span,
+        ))
+    }
+
+    /// Whether an extension of this name is in scope that a call on a value
+    /// (or, on a type, a static member of an extension block) could mean.
+    pub(super) fn has_extension_named(&self, name: &str, on_type: bool) -> bool {
+        let members = !self
+            .binder
+            .extension_members_in_scope(&self.context, name)
+            .is_empty();
+        members || (!on_type && !self.extensions_here(name).is_empty())
+    }
+
+    /// Whether an extension method called `name` that takes the receiver is
+    /// brought into view from a nearer place than `property`, a member of an
+    /// extension block. Extension members are looked for place by place
+    /// (§12.8.10.3), methods and properties together: the nearer place with
+    /// one that applies decides, so `array.Count` is the property of a block
+    /// beside it and not `Enumerable.Count` from a `using` further out, and
+    /// is the method group where the method is the nearer.
+    pub(super) fn extension_method_nearer(
+        &self,
+        name: &str,
+        property: SymbolId,
+        receiver: &Type,
+    ) -> bool {
+        let Some(level) = self.binder.extension_level(&self.context, property) else {
+            return false;
+        };
+        self.extensions_here(name).into_iter().any(|method| {
+            self.extension_takes(method, receiver)
+                && self
+                    .binder
+                    .extension_level(&self.context, method)
+                    .is_some_and(|nearer| nearer < level)
+        })
+    }
+
+    /// `x.P` as the call `x.P()` names it: the property an extension block
+    /// gave `x`, where it holds a delegate and no extension method of that
+    /// name is nearer. A property that holds none cannot be invoked, and the
+    /// extension methods answer for the name as for any other.
+    pub(super) fn extension_delegate_property(
+        &mut self,
+        receiver: &BoundExpression,
+        name: &str,
+        span: TextSpan,
+    ) -> Option<BoundExpression> {
+        if matches!(receiver.kind, BoundExpressionKind::TypeExpression(_)) {
+            return None;
+        }
+        let (target, property) = self.extension_member_access(receiver, name, span)?;
+        (self.is_invocable(&target.ty)
+            && !self.extension_method_nearer(name, property, &receiver.ty))
+        .then_some(target)
+    }
+
     /// CS0122: a member the code here may not name, where nothing else of
     /// that name up the hierarchy is one it may.
     pub(super) fn check_accessible(&mut self, member: SymbolId, name: &str, span: TextSpan) {
@@ -1373,39 +1487,9 @@ impl BodyBinder<'_> {
                 // A member of an extension block (C# 14) whose receiver the
                 // array reaches by a reference conversion: `array.Total`
                 // against `extension(IEnumerable<int> source)`.
-                let methods_first = self
-                    .binder
-                    .extensions_in_scope(&self.context, name)
-                    .into_iter()
-                    .any(|method| self.extension_takes(method, &receiver.ty));
-                if !methods_first
-                    && let Some(access) = self.extension_member_access(&receiver, name, span)
+                if let Some(access) = self.extension_member_on(&receiver, right, name, span, false)
                 {
-                    self.body
-                        .references
-                        .insert(right.span(), BoundSymbol::Declared(access.1));
-                    return access.0;
-                }
-                if let Some(read) = self.bind_extension_call(
-                    &format!("get_{name}"),
-                    right,
-                    receiver.clone(),
-                    &[],
-                    &[],
-                    span,
-                ) {
-                    return read;
-                }
-                let extensions = self.extensions_here(name);
-                if !extensions.is_empty() {
-                    return BoundExpression::new(
-                        BoundExpressionKind::MethodGroup {
-                            receiver: Some(Box::new(receiver)),
-                            candidates: extensions,
-                        },
-                        Type::Error,
-                        span,
-                    );
+                    return access;
                 }
                 return BoundExpression::error(span);
             };
@@ -1504,50 +1588,24 @@ impl BodyBinder<'_> {
                         || (!self.is_static(*member) && self.accessible(*member))
                 })
         });
-        let Some(found) = found else {
-            // A member of an extension block (C# 14): an instance property
-            // of what the receiver is, or a static member of the type named.
-            // An extension method for this receiver found by the same
-            // name is reached first, as a group closed over the receiver.
-            let methods_first = !matches!(receiver.kind, BoundExpressionKind::TypeExpression(_))
-                && self
-                    .binder
-                    .extensions_in_scope(&self.context, name)
-                    .into_iter()
-                    .any(|method| self.extension_takes(method, &receiver.ty));
-            if !methods_first
-                && let Some(access) = self.extension_member_access(&receiver, name, span)
+        // A member this code may not name is no candidate for `value.M`
+        // either, and an extension member of that name is looked for as if
+        // it were not there: it is the one called, and only where none
+        // applies is the member itself the error (CS0122).
+        let found = match found {
+            Some(hidden)
+                if self.kind_of(hidden) != SymbolKind::NamedType && !self.accessible(hidden) =>
             {
-                self.body
-                    .references
-                    .insert(right.span(), BoundSymbol::Declared(access.1));
-                return access.0;
+                match self.extension_member_on(&receiver, right, name, span, true) {
+                    Some(access) => return access,
+                    None => Some(hidden),
+                }
             }
-            // An extension block's property (C# 14) is read through a
-            // `get_Name(receiver)` the block declared as an extension method.
-            if let Some(read) = self.bind_extension_call(
-                &format!("get_{name}"),
-                right,
-                receiver.clone(),
-                &[],
-                &[],
-                span,
-            ) {
-                return read;
-            }
-            // `types.All(symbol.IsContainingSymbolOfAllTypeParameters)` names
-            // an extension method without calling it: a method group closed
-            // over the receiver, which a delegate is made from.
-            let extensions = self.extensions_here(name);
-            if !extensions.is_empty() {
-                return BoundExpression::new(
-                    BoundExpressionKind::MethodGroup {
-                        receiver: Some(Box::new(receiver)),
-                        candidates: extensions,
-                    },
-                    Type::Error,
-                    span,
-                );
+            found => found,
+        };
+        let Some(found) = found else {
+            if let Some(access) = self.extension_member_on(&receiver, right, name, span, false) {
+                return access;
             }
             let container = self.display(&receiver.ty);
             let code = missing_member_code(&receiver);

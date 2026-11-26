@@ -209,11 +209,28 @@ impl BodyBinder<'_> {
                 let Some(symbol) = receiver.ty.symbol() else {
                     let explicit = self.explicit_type_arguments(&right);
                     if !receiver.ty.is_error()
-                        && let Some(call) = self.bind_extension_call(
-                            &name, &right, receiver, &arguments, &explicit, span,
-                        )
+                        && let Some(target) =
+                            self.extension_delegate_property(&receiver, &name, span)
                     {
-                        return call;
+                        return self.invoke_delegate(target, arguments, span);
+                    }
+                    if !receiver.ty.is_error() {
+                        let types: Vec<Type> = arguments.iter().map(|a| a.ty.clone()).collect();
+                        let spans: Vec<TextSpan> = arguments.iter().map(|a| a.span).collect();
+                        let seen = receiver.clone();
+                        if let Some(call) = self.bind_extension_call(
+                            &name, &right, receiver, &arguments, &explicit, span,
+                        ) {
+                            return call;
+                        }
+                        self.report_no_extension_overload(
+                            &name,
+                            &seen,
+                            &types,
+                            &spans,
+                            &explicit,
+                            right.span(),
+                        );
                     }
                     return BoundExpression::error(span);
                 };
@@ -306,11 +323,28 @@ impl BodyBinder<'_> {
                     // arguments, and they go with the call.
                     let explicit = self.explicit_type_arguments(&right);
                     if !receiver.ty.is_error()
-                        && let Some(call) = self.bind_extension_call(
-                            &name, &right, receiver, &arguments, &explicit, span,
-                        )
+                        && let Some(target) =
+                            self.extension_delegate_property(&receiver, &name, span)
                     {
-                        return call;
+                        return self.invoke_delegate(target, arguments, span);
+                    }
+                    if !receiver.ty.is_error() {
+                        let types: Vec<Type> = arguments.iter().map(|a| a.ty.clone()).collect();
+                        let spans: Vec<TextSpan> = arguments.iter().map(|a| a.span).collect();
+                        let seen = receiver.clone();
+                        if let Some(call) = self.bind_extension_call(
+                            &name, &right, receiver, &arguments, &explicit, span,
+                        ) {
+                            return call;
+                        }
+                        self.report_no_extension_overload(
+                            &name,
+                            &seen,
+                            &types,
+                            &spans,
+                            &explicit,
+                            right.span(),
+                        );
                     }
                     return BoundExpression::error(span);
                 };
@@ -377,6 +411,18 @@ impl BodyBinder<'_> {
                 })
             })
             .collect();
+        // Methods this code may not call are no candidates, and where an
+        // extension of that name is in scope they hide nothing from it: it
+        // is called, or reported against, as if they were not there. Only
+        // where there is none are they the error (CS0122).
+        let mut inaccessible: Vec<SymbolId> = Vec::new();
+        if !candidates.is_empty()
+            && candidates.iter().all(|id| !self.accessible(*id))
+            && (receiver.is_some() || names_a_type == Some(true))
+            && self.has_extension_named(&name, receiver.is_none())
+        {
+            inaccessible = std::mem::take(&mut candidates);
+        }
         // `C.Make()` reaching a static method an extension block (C# 14)
         // gave `C`, where `C` has none of that name itself.
         if candidates.is_empty() && names_a_type == Some(true) {
@@ -530,6 +576,16 @@ impl BodyBinder<'_> {
             )
         };
 
+        // A property an extension block (C# 14) gave the receiver, holding a
+        // delegate, is what `x.P()` calls where no extension method of the
+        // name is nearer than the block.
+        if resolved.is_none()
+            && candidates.is_empty()
+            && let Some(receiver) = receiver.as_deref()
+            && let Some(target) = self.extension_delegate_property(receiver, &name, span)
+        {
+            return self.invoke_delegate(target, arguments, span);
+        }
         // Nothing on the type answered. An extension method still might: it is
         // found by the name the call site wrote, among the static classes the
         // file imported, and only then checked against the receiver.
@@ -607,6 +663,7 @@ impl BodyBinder<'_> {
         // `Type.Instance()` and `value.Static()`: the method is there, on
         // the wrong side of the dot.
         if candidates.is_empty()
+            && inaccessible.is_empty()
             && callee.kind() == SyntaxKind::SimpleMemberAccessExpression
             && let Some(wanted) = names_a_type
         {
@@ -634,7 +691,43 @@ impl BodyBinder<'_> {
                 return BoundExpression::error(span);
             }
         }
+        if candidates.is_empty() && !inaccessible.is_empty() {
+            // No extension answered: what the extensions of the name were
+            // given is what is wrong with the call, where there is such a
+            // method; otherwise the methods it may not call are.
+            let spans: Vec<TextSpan> = arguments.iter().map(|argument| argument.span).collect();
+            if let Some(receiver) = receiver.as_deref()
+                && self.report_no_extension_overload(
+                    &name,
+                    receiver,
+                    &argument_types,
+                    &spans,
+                    &explicit,
+                    name_node.span(),
+                )
+            {
+                return BoundExpression::error(span);
+            }
+            self.check_accessible(inaccessible[0], &name, name_node.span());
+            return BoundExpression::error(span);
+        }
         if candidates.is_empty() {
+            if let Some(receiver) = receiver.as_deref()
+                && !matches!(receiver.kind, BoundExpressionKind::TypeExpression(_))
+                && !receiver_type.is_error()
+            {
+                let spans: Vec<TextSpan> = arguments.iter().map(|argument| argument.span).collect();
+                if self.report_no_extension_overload(
+                    &name,
+                    receiver,
+                    &argument_types,
+                    &spans,
+                    &explicit,
+                    name_node.span(),
+                ) {
+                    return BoundExpression::error(span);
+                }
+            }
             let container_name = if receiver_type.is_error() {
                 self.binder
                     .compilation()
@@ -1571,7 +1664,7 @@ impl BodyBinder<'_> {
 
     /// Whether a value of the type is called by writing `(...)` after it: a
     /// delegate, or a function pointer.
-    fn is_invocable(&self, ty: &Type) -> bool {
+    pub(super) fn is_invocable(&self, ty: &Type) -> bool {
         self.is_delegate(ty) || matches!(ty, Type::FunctionPointer(_))
     }
 

@@ -1189,6 +1189,32 @@ impl<'a> Binder<'a> {
         levels
     }
 
+    /// How far out the place is that brings an extension member into view,
+    /// counted as [`extension_levels`](Self::extension_levels) lists them: a
+    /// smaller number is nearer. A property of an extension block and a
+    /// method of another static class in the same place are equally near,
+    /// which Roslyn calls ambiguous; a nearer one wins outright.
+    #[must_use]
+    pub fn extension_level(&self, context: &Context, member: SymbolId) -> Option<usize> {
+        let symbols = self.compilation.symbols();
+        let container = symbols.get(member).container?;
+        let namespace = symbols.get(container).container;
+        context.scopes.iter().enumerate().find_map(|(at, scope)| {
+            if scope.namespace.is_some() && namespace == scope.namespace {
+                return Some(at * 2);
+            }
+            scope
+                .imports
+                .iter()
+                .any(|import| match import {
+                    Import::Namespace(imported) => Some(*imported) == namespace,
+                    Import::Static(ty) => *ty == container,
+                    Import::Alias { .. } => false,
+                })
+                .then_some(at * 2 + 1)
+        })
+    }
+
     fn visible_extensions(&self, context: &Context, all: &[SymbolId]) -> Vec<SymbolId> {
         if all.is_empty() {
             return Vec::new();

@@ -187,3 +187,107 @@ class Stranger
         ]
     );
 }
+
+#[test]
+fn a_method_the_code_may_not_call_hides_no_extension_of_the_name() {
+    let found = diagnose(
+        r#"
+using System;
+class A { private void M(int x) { } private static void S(int x) { } private int P => 1; }
+class Base { private void Hid(int x) { } }
+class Der : Base { }
+class G { private void Gen<T>(T t) { } }
+static class Ext
+{
+    public static void M(this A a, int x) { }
+    public static void Hid(this Base b, long x) { }
+    public static void Gen<T>(this G g, T t) { }
+    extension(A a) { public int P => 100; }
+    extension(A) { public static void S(int x) { } }
+}
+class Outside
+{
+    void T(A a, Der d, G g)
+    {
+        a.M(1);
+        d.Hid(1);
+        g.Gen(1);
+        g.Gen<string>("s");
+        Action<int> action = a.M;
+        var group = a.M;
+        int p = a.P;
+        A.S(1);
+    }
+}
+"#,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn where_the_extensions_of_the_name_are_not_taken_they_are_what_is_reported() {
+    let found = diagnose(
+        r#"
+class A { private void M(int x) { } private void N(int x) { } private void K(int x) { } }
+static class Ext
+{
+    public static void M(this A a, int x) { }
+    public static void K(this string s, int x) { }
+}
+class Outside
+{
+    void T(A a)
+    {
+        a.M(1, 2);
+        a.M();
+        a.M("s");
+        a.N(1);
+        a.N(1, 2);
+        a.K(1);
+        a.K(1, 2);
+    }
+}
+"#,
+    );
+    assert_eq!(
+        found,
+        [
+            "CS1501 'M'",
+            "CS7036 'M'",
+            "CS1503 '\"s\"'",
+            "CS0122 'N'",
+            "CS0122 'N'",
+            "CS1929 'a'",
+            "CS1501 'K'",
+        ]
+    );
+}
+
+#[test]
+fn an_extension_property_of_the_name_of_an_extension_method_binds() {
+    let found = diagnose(
+        r#"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+static class E
+{
+    extension(IEnumerable<int> source) { public int Count => 5; }
+    extension(int n) { public int First => n; }
+}
+class Program
+{
+    static void Main()
+    {
+        int[] a = { 7 };
+        int c = a.Count;
+        var d = a.Count;
+        int e = a.Count();
+        int f = 3.First;
+        Func<int> g = a.Count;
+    }
+}
+"#,
+    );
+    assert_eq!(found, ["CS0029 'a.Count'"]);
+}

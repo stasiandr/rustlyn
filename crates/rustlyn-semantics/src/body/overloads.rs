@@ -641,6 +641,147 @@ impl BodyBinder<'_> {
         }
     }
 
+    /// Says why no extension method of this name took the call, as Roslyn
+    /// judges it against them alone: the receiver is the first argument, and
+    /// the numbers an error quotes count the ones written. Whether anything
+    /// was said is returned; where it is not certain what is wrong, nothing
+    /// is, and the caller reports what it would have.
+    pub(super) fn report_no_extension_overload(
+        &mut self,
+        name: &str,
+        receiver: &BoundExpression,
+        arguments: &[Type],
+        argument_spans: &[TextSpan],
+        explicit: &[Type],
+        at: TextSpan,
+    ) -> bool {
+        let symbols = self.binder.compilation().symbols();
+        let candidates: Vec<SymbolId> = self
+            .extensions_here(name)
+            .into_iter()
+            .filter(|candidate| {
+                symbols
+                    .get(*candidate)
+                    .as_method()
+                    .is_some_and(|detail| detail.is_extension)
+            })
+            .collect();
+        if candidates.is_empty()
+            || receiver.ty.is_error()
+            || matches!(receiver.ty, Type::Null | Type::Void)
+            || arguments.iter().any(Type::is_error)
+        {
+            return false;
+        }
+        let mut given = vec![receiver.ty.clone()];
+        given.extend(arguments.iter().cloned());
+        let counts: Vec<(SymbolId, usize, Option<usize>)> = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let detail = symbols.get(*candidate).as_method()?;
+                let parameters: Vec<_> = detail
+                    .parameters
+                    .iter()
+                    .filter_map(|parameter| symbols.get(*parameter).as_parameter())
+                    .collect();
+                let required = parameters
+                    .iter()
+                    .filter(|parameter| !parameter.has_default && !parameter.is_params)
+                    .count();
+                let most = (!parameters.iter().any(|parameter| parameter.is_params))
+                    .then_some(parameters.len());
+                Some((*candidate, required, most))
+            })
+            .collect();
+        let fitting: Vec<SymbolId> = counts
+            .iter()
+            .filter(|(_, required, most)| {
+                given.len() >= *required && most.is_none_or(|most| given.len() <= most)
+            })
+            .map(|(candidate, _, _)| *candidate)
+            .collect();
+        if fitting.is_empty() {
+            // One extension, called with too few: which parameter has nothing.
+            if let [(candidate, required, _)] = counts.as_slice()
+                && given.len() < *required
+                && let Some(parameter) = symbols
+                    .get(*candidate)
+                    .as_method()
+                    .and_then(|detail| detail.parameters.get(given.len()))
+            {
+                let parameter_name = symbols.get(*parameter).name.clone();
+                let member = crate::checks::member_display(
+                    self.binder.compilation(),
+                    *candidate,
+                    &Default::default(),
+                    None,
+                );
+                self.report(
+                    ErrorCode::ErrNoCorrespondingArgument,
+                    at,
+                    &[&parameter_name, &member],
+                );
+                return true;
+            }
+            let count = arguments.len().to_string();
+            self.report(ErrorCode::ErrBadArgCount, at, &[name, &count]);
+            return true;
+        }
+        // Several that take this many are not told apart here.
+        let [candidate] = fitting.as_slice() else {
+            return false;
+        };
+        if symbols
+            .get(*candidate)
+            .as_method()
+            .is_none_or(|detail| !detail.type_parameters.is_empty())
+        {
+            return false;
+        }
+        let Some(shape) = self.candidate_shape(*candidate, &given, &Type::Void, explicit, &[])
+        else {
+            return false;
+        };
+        let bad: Vec<usize> = given
+            .iter()
+            .zip(&shape.parameters)
+            .enumerate()
+            .filter(|(_, (argument, parameter))| {
+                !self.binder.converts_implicitly(argument, parameter)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        match bad.as_slice() {
+            // The receiver is the only thing wrong with it.
+            [0] => {
+                let (shown, wanted) = (self.display(&given[0]), self.display(&shape.parameters[0]));
+                let member = crate::checks::member_display(
+                    self.binder.compilation(),
+                    *candidate,
+                    &Default::default(),
+                    None,
+                );
+                self.report(
+                    ErrorCode::ErrBadExtensionReceiver,
+                    receiver.span,
+                    &[&shown, name, &member, &wanted],
+                );
+                true
+            }
+            [first, ..] if *first > 0 => {
+                let position = first.to_string();
+                let (from, to) = (
+                    self.display(&given[*first]),
+                    self.display(&shape.parameters[*first]),
+                );
+                let place = argument_spans.get(first - 1).copied().unwrap_or(at);
+                self.report(ErrorCode::ErrBadArgType, place, &[&position, &from, &to]);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// CS0121 at `at` where `certain_rival` finds the call ambiguous.
     ///
     /// The two are named as Roslyn names them, in the order they are

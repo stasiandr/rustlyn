@@ -18475,3 +18475,136 @@ static class Program
 ",
     );
 }
+
+#[test]
+fn an_extension_property_wins_over_an_extension_method_of_its_name_that_is_no_nearer() {
+    check(
+        "extension_property_and_method_names",
+        r#"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using N1;
+
+namespace N1
+{
+    static class Far { extension(A a) { public int Prop => 1; public Func<int> D => () => 5; } }
+}
+
+class A { }
+
+static class Near
+{
+    public static int Prop(this A a) => 2;
+    public static int D(this A a) => 6;
+}
+
+static class E
+{
+    extension(IEnumerable<int> s) { public int Count => 5; public Func<int> Peek => () => 99; }
+    extension(int n) { public int First => n; }
+    extension(string t) { public int Max => 77; public Func<int> Min => () => 66; }
+}
+
+static class Program
+{
+    static void Main()
+    {
+        int[] a = { 7, 8 };
+        var x = a.Count;
+        Console.WriteLine(a.Count + " " + x + " " + a.Count() + " " + a.Count(v => v > 7));
+        List<int> list = new() { 1, 2, 3 };
+        IEnumerable<int> items = list;
+        Console.WriteLine(list.Count + " " + items.Count + " " + items.Count());
+        Console.WriteLine(3.First + " " + "abc".Max + " " + "abc".Min() + " " + "abc".Count());
+        Func<int> peek = a.Peek;
+        Console.WriteLine(a.Peek() + " " + peek() + " " + a.Peek);
+        var near = new A();
+        Func<int> group = near.Prop;
+        Console.WriteLine(group() + " " + near.Prop() + " " + near.D());
+    }
+}
+"#,
+        "5 5 2 1
+3 5 3
+3 77 66 3
+99 99 System.Func`1[System.Int32]
+2 2 6
+",
+    );
+}
+
+#[test]
+fn a_method_the_code_may_not_call_hides_no_extension_of_its_name() {
+    check(
+        "private_method_and_extension",
+        r#"
+using System;
+
+class A
+{
+    private void M(int x) { Console.WriteLine("A.M " + x); }
+    public void In(A a) { a.M(1); this.M(2); M(3); Action<int> d = a.M; d(4); }
+}
+class Base { private void Hid(int x) { Console.WriteLine("Base.Hid"); } }
+class Der : Base { public void T() { this.Hid(1); this.Hid(1L); } }
+class G
+{
+    private void Gen<T>(T t) { Console.WriteLine("G.Gen"); }
+    private static void St(int x) { Console.WriteLine("G.St"); }
+    private int Size => 1;
+    public static void In(G g) { g.Gen(1); St(2); G.St(3); Console.WriteLine(g.Size); }
+}
+
+static class Ext
+{
+    public static void M(this A a, int x) { Console.WriteLine("Ext.M " + x); }
+    public static void Hid(this Base b, long x) { Console.WriteLine("Ext.Hid"); }
+    public static void Gen<T>(this G g, T t) { Console.WriteLine("Ext.Gen"); }
+    extension(G) { public static void St(int x) { Console.WriteLine("Ext.St"); } }
+    extension(G g) { public int Size => 100; }
+}
+
+static class Program
+{
+    static void Main()
+    {
+        var a = new A();
+        a.In(a);
+        a.M(5);
+        Action<int> d = a.M;
+        d(6);
+        var f = a.M;
+        f(7);
+        new Der().T();
+        new Base().Hid(1);
+        var g = new G();
+        G.In(g);
+        g.Gen(1);
+        g.Gen<string>("s");
+        G.St(9);
+        Console.WriteLine(g.Size);
+    }
+}
+"#,
+        "A.M 1
+A.M 2
+A.M 3
+A.M 4
+Ext.M 5
+Ext.M 6
+Ext.M 7
+Ext.Hid
+Ext.Hid
+Ext.Hid
+G.Gen
+G.St
+G.St
+1
+Ext.Gen
+Ext.Gen
+Ext.St
+100
+",
+    );
+}
