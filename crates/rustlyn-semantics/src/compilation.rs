@@ -1365,6 +1365,21 @@ impl Compilation {
             sink.extend(crate::model::SemanticModel::new(self, tree).body_diagnostics());
         }
 
+        // A type written once can be asked about many times — an alias at
+        // each use, a field-like event for itself and each accessor — and
+        // says the same about the access to it each time (CS0122).
+        let mut told: std::collections::HashSet<(usize, u32, u32, String)> =
+            std::collections::HashSet::new();
+        sink.retain(|(tree, diagnostic)| {
+            diagnostic.code() != rustlyn_diagnostics::ErrorCode::ErrBadAccess
+                || told.insert((
+                    *tree,
+                    diagnostic.span().start(),
+                    diagnostic.span().end(),
+                    diagnostic.message().to_string(),
+                ))
+        });
+
         // What a `#pragma warning disable` switched off is not reported.
         let mut pragmas: HashMap<usize, crate::pragma::WarningState> = HashMap::new();
         sink.into_iter()

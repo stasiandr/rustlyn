@@ -18023,3 +18023,155 @@ class Elsewhere { int M(Derived d) => d.Mixed; }
     };
     assert_eq!(found, Vec::<String>::new());
 }
+
+/// The nested types a library keeps for the types derived from its own.
+const NESTED_LIBRARY: &str = r#"
+public class Base
+{
+    protected class Prot { public int V; public class Deep { } }
+    protected internal class ProtInt { }
+    internal class Hidden { }
+    public class Pub { }
+    protected enum Kind { A }
+    public class Open { protected class InnerProt { } public class InnerPub { } }
+}
+public class Gen<T> { protected class In { public T V; } }
+public class Mid : Base { }
+"#;
+
+/// A protected type read out of a reference could be named from any class:
+/// `new Base.Prot()` compiled in one that is no `Base`. It is for the types
+/// derived from its owner, as one in the same compilation is, and
+/// `protected internal` from another assembly is protected and no more.
+/// The errors are at the type's own name, as Roslyn has them.
+#[test]
+fn a_protected_nested_type_of_a_reference_is_for_derived_types_only() {
+    let stranger = r#"
+using System;
+using System.Collections.Generic;
+class Stranger : List<Base.Prot>
+{
+    Base.Prot field;
+    Base.ProtInt other;
+    void M(object o, Mid m)
+    {
+        var a = new Base.Prot();
+        Base.Prot b = null;
+        var c = (Base.Prot)o;
+        var t = typeof(Base.Prot);
+        var l = new List<Base.Prot>();
+        bool z = o is Base.Prot;
+        var d = new Base.Prot.Deep();
+        var k = Base.Kind.A;
+        var g = new Gen<int>.In();
+        var viaMid = new Mid.Prot();
+        var i = new Base.Open.InnerProt();
+        var fine = new Base.Pub();
+        var alsoFine = new Base.Open.InnerPub();
+    }
+}
+"#;
+    let Some(found) = errors_with_library("NestedAbroad", NESTED_LIBRARY, stranger) else {
+        println!("note: skipped; no .NET shared framework was found");
+        return;
+    };
+    assert_eq!(
+        found,
+        [
+            "CS0122 'Prot'",
+            "CS0122 'Prot'",
+            "CS0122 'ProtInt'",
+            "CS0122 'Prot'",
+            "CS0122 'Prot'",
+            "CS0122 'Prot'",
+            "CS0122 'Prot'",
+            "CS0122 'Prot'",
+            "CS0122 'Prot'",
+            "CS0122 'Prot'",
+            "CS0122 'Kind'",
+            "CS0122 'In'",
+            "CS0122 'Prot'",
+            "CS0122 'InnerProt'",
+        ]
+    );
+}
+
+#[test]
+fn a_type_derived_from_a_references_reaches_its_protected_nested_types() {
+    let derived = r#"
+using System;
+using System.Collections.Generic;
+class Derived : Base
+{
+    Base.Prot f1; Derived.Prot f2; Prot f3; Base.Prot.Deep f4; Base.ProtInt f5; Base.Kind f6;
+    List<Base.Prot> list;
+    Base.Prot M(Base.Prot p) => p;
+    class Inner : Base.Prot { Base.Prot x; void Z() { var a = new Base.Prot(); } }
+    void N(object o)
+    {
+        var a = new Base.Prot(); var b = new Derived.Prot(); var c = new Prot();
+        var d = new Base.Prot.Deep(); var e = Base.Kind.A; var g = typeof(Base.Prot);
+        var h = (Base.Prot)o; bool z = o is Base.Prot; var i = new List<Base.Prot>();
+        var j = new Base.ProtInt(); var k = new Base.Pub(); var l = new Base.Open.InnerPub();
+        Action act = () => { var w = new Base.Prot(); };
+        void Local() { var w = new Base.Prot(); }
+    }
+}
+class FurtherDown : Derived { void N() { var a = new Base.Prot(); var b = new FurtherDown.Prot(); } }
+class ThroughMid : Mid { void N() { var a = new Base.Prot(); var b = new Mid.Prot(); } }
+class Generic<T> : Base { void N() { var a = new Base.Prot(); var b = new Generic<T>.Prot(); var c = new Generic<int>.Prot(); } }
+class OfGeneric : Gen<string> { void N() { var a = new Gen<string>.In(); var b = new In(); var c = new OfGeneric.In(); } }
+class OfGenericAgain<U> : Gen<U>
+{
+    void N() { var a = new Gen<U>.In(); var b = new OfGenericAgain<U>.In(); }
+    class Q { void R() { var a = new Gen<U>.In(); } }
+}
+class Outside { class Nested : Base { void N() { var a = new Base.Prot(); } } }
+class Deep : Base { class A { class B { void N() { var a = new Base.Prot(); var b = new Deep.Prot(); } } } }
+class FromOpen : Base.Open { void N() { var a = new InnerProt(); var b = new Base.Open.InnerProt(); } }
+class Anyone { void N() { var a = new Base.Pub(); var b = new Base.Open.InnerPub(); } }
+"#;
+    let Some(found) = errors_with_library("NestedDerived", NESTED_LIBRARY, derived) else {
+        println!("note: skipped; no .NET shared framework was found");
+        return;
+    };
+    assert_eq!(found, Vec::<String>::new());
+}
+
+/// The assembly an `[InternalsVisibleTo]` names reaches the library's
+/// `protected internal` types as internal ones, from any class.
+#[test]
+fn a_friend_reaches_a_protected_internal_nested_type_of_a_reference() {
+    let Some(mut bytes) = references() else {
+        println!("note: skipped; no .NET shared framework was found");
+        return;
+    };
+    let library = r#"
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("Friend")]
+public class Base { protected internal class ProtInt { } protected class Prot { } }
+"#;
+    let compilation = compiled("FriendNestedLibrary", library, &bytes);
+    let emitted = rustlyn_emit::emit_library(&compilation, "FriendNestedLibrary")
+        .unwrap_or_else(|error| panic!("FriendNestedLibrary could not be emitted: {error}"));
+    bytes.push(emitted.assembly);
+    let images: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
+    let program =
+        "class Anyone { void M() { var a = new Base.ProtInt(); var b = new Base.Prot(); } }";
+    let found = |name: &str| -> Vec<String> {
+        let trees = vec![parse(SourceText::new("Program.cs", program))];
+        let compilation = Compilation::create_with_references_as(trees, &images, name);
+        compilation
+            .semantic_diagnostics()
+            .iter()
+            .map(|entry| compilation.render(entry))
+            .collect()
+    };
+    let friend = found("Friend");
+    assert_eq!(friend.len(), 1, "{friend:#?}");
+    assert!(
+        friend[0].contains("CS0122") && friend[0].contains("'Base.Prot'"),
+        "{friend:#?}"
+    );
+    let stranger = found("Stranger");
+    assert_eq!(stranger.len(), 2, "{stranger:#?}");
+}

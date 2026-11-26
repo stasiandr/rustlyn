@@ -2322,6 +2322,10 @@ impl<'a> Binder<'a> {
             return Type::Error;
         }
 
+        if node.kind() == SyntaxKind::QualifiedName {
+            self.check_nested_type_access(node, context, diagnostics);
+        }
+
         let symbols = self.compilation.symbols();
         match symbols.get(symbol).kind {
             SymbolKind::TypeParameter => Type::TypeParameter(symbol),
@@ -2362,6 +2366,129 @@ impl<'a> Binder<'a> {
             span,
             &[&first, &ty, &second],
         ))
+    }
+
+    /// CS0122 for each dotted part of a type name that is a nested type the
+    /// code here may not name: `Outer.Inner` where `Inner` is private to
+    /// `Outer`, or protected and written outside any type derived from it.
+    /// The error is at the part itself, as Roslyn has it.
+    ///
+    /// Only dotted parts are judged. A bare name was found by walking out
+    /// through the types around the code, or through a base of one of them,
+    /// which is the very thing that makes it accessible.
+    fn check_nested_type_access(
+        &self,
+        node: &SyntaxNode,
+        context: &Context,
+        diagnostics: &mut Diagnostics,
+    ) {
+        let symbols = self.compilation.symbols();
+        let in_base_list = node
+            .ancestors()
+            .any(|ancestor| ancestor.kind() == SyntaxKind::BaseList);
+        let mut part = node.clone();
+        // A long dotted name is not worth the lookups it would take; the
+        // parts that matter are the last few.
+        for _ in 0..6 {
+            if part.kind() != SyntaxKind::QualifiedName {
+                return;
+            }
+            let mut children = part.children();
+            let (Some(left), Some(right)) = (children.next(), children.next()) else {
+                return;
+            };
+            if let Some(found) = self.resolve_namespace_or_type(&part, context)
+                && symbols.get(found).kind == SymbolKind::NamedType
+                && !self.nested_type_accessible(found, context, in_base_list)
+            {
+                let name = Type::named(found).display(symbols);
+                diagnostics.push((
+                    context.tree,
+                    Diagnostic::new(ErrorCode::ErrBadAccess, right.span(), &[&name]),
+                ));
+            }
+            part = left;
+        }
+    }
+
+    /// Whether code written in `context` may name the nested type `ty`; true
+    /// whenever this cannot tell.
+    ///
+    /// In the base list of a type its bases are what is being worked out, so
+    /// that type is not asked whether it derives from the owner, which would
+    /// ask the very question being answered.
+    fn nested_type_accessible(&self, ty: SymbolId, context: &Context, in_base_list: bool) -> bool {
+        use crate::symbol::Accessibility;
+        let symbols = self.compilation.symbols();
+        let symbol = symbols.get(ty);
+        let Some(owner) = symbol
+            .container
+            .filter(|owner| symbols.get(*owner).kind == SymbolKind::NamedType)
+        else {
+            return true;
+        };
+        if symbols.get(owner).type_kind() == Some(crate::TypeKind::Interface) {
+            return true;
+        }
+        let from_metadata = self.compilation.is_from_metadata(ty);
+        let protected = match symbol.accessibility {
+            Accessibility::Private => false,
+            Accessibility::Protected => true,
+            // `private protected` is for the assembly's own derived types;
+            // from another one it is for none, which is not judged.
+            Accessibility::ProtectedAndInternal => true,
+            // Inside the assembly (or a friend's) `protected internal` is
+            // internal.
+            Accessibility::ProtectedOrInternal => {
+                if !from_metadata || self.compilation.befriended_by(ty, context.tree) {
+                    return true;
+                }
+                true
+            }
+            _ => return true,
+        };
+        let enclosing = context.enclosing_types();
+        let inside = enclosing.iter().any(|around| {
+            let mut current = Some(*around);
+            let mut depth = 0;
+            while let Some(id) = current {
+                if id == owner || depth > 64 {
+                    return true;
+                }
+                current = symbols
+                    .get(id)
+                    .container
+                    .filter(|outer| symbols.get(*outer).kind == SymbolKind::NamedType);
+                depth += 1;
+            }
+            false
+        });
+        if inside {
+            return true;
+        }
+        if !protected {
+            return false;
+        }
+        // A protected type is for what derives from its owner; the types
+        // around the code are among `enclosing`, each judged by its bases.
+        // In a base list the type declared is left out: it is no more
+        // derived from its owner for listing the owner beside the name
+        // (Roslyn reports `class C : Owner, I<Owner.Prot>`).
+        enclosing
+            .iter()
+            .skip(usize::from(in_base_list))
+            .any(|around| {
+                let mut current = Some(*around);
+                let mut depth = 0;
+                while let Some(id) = current {
+                    if id == owner || depth > 32 {
+                        return true;
+                    }
+                    current = self.base_class_of(id).and_then(|base| base.symbol());
+                    depth += 1;
+                }
+                false
+            })
     }
 
     /// Says why a type name did not resolve, the way Roslyn words it: the

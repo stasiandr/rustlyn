@@ -253,10 +253,17 @@ impl BodyBinder<'_> {
     pub(super) fn check_accessible(&mut self, member: SymbolId, name: &str, span: TextSpan) {
         let compilation = self.binder.compilation();
         let symbols = compilation.symbols();
-        if !matches!(
-            symbols.get(member).kind,
-            SymbolKind::Field | SymbolKind::Property | SymbolKind::Method | SymbolKind::Event
-        ) || self.accessible(member)
+        // A nested type is judged like a member of its owner, once the
+        // assembly it is in is one this code sees at all: a type that is not
+        // seen is not there, and is reported as missing instead.
+        let nested_type = symbols.get(member).kind == SymbolKind::NamedType
+            && compilation.sees(member, self.context.tree());
+        if !(nested_type
+            || matches!(
+                symbols.get(member).kind,
+                SymbolKind::Field | SymbolKind::Property | SymbolKind::Method | SymbolKind::Event
+            ))
+            || self.accessible(member)
         {
             return;
         }
@@ -288,7 +295,11 @@ impl BodyBinder<'_> {
             current = self.binder.base_class_of(ty).and_then(|base| base.symbol());
             depth += 1;
         }
-        let display = crate::checks::member_display(compilation, member, &Default::default(), None);
+        let display = if nested_type {
+            Type::named(member).display(symbols)
+        } else {
+            crate::checks::member_display(compilation, member, &Default::default(), None)
+        };
         self.report(ErrorCode::ErrBadAccess, span, &[&display]);
     }
 
