@@ -166,12 +166,23 @@ pub struct BoundExpression {
     pub kind: BoundExpressionKind,
     pub ty: Type,
     pub span: TextSpan,
+    /// What folding this expression came to, with the type it was folded
+    /// as: kept so that an operator over a long chain of constants is not
+    /// worked out again, from the leaves up, at every operator above it.
+    /// Only the folder reads or writes it.
+    /// Boxed: most expressions are never folded, and each one carries this.
+    pub(crate) folded: std::sync::OnceLock<Box<(Type, Option<ConstantValue>)>>,
 }
 
 impl BoundExpression {
     #[must_use]
     pub const fn new(kind: BoundExpressionKind, ty: Type, span: TextSpan) -> Self {
-        Self { kind, ty, span }
+        Self {
+            kind,
+            ty,
+            span,
+            folded: std::sync::OnceLock::new(),
+        }
     }
 
     #[must_use]

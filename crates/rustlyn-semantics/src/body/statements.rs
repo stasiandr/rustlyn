@@ -769,6 +769,15 @@ impl BodyBinder<'_> {
         if to.is_error() || from.is_error() {
             return;
         }
+        // An operand that divided by zero or overflowed has no value, and
+        // the error about it is the only one: what it would have been
+        // converted to is nobody's business.
+        if self.reported_within(value.span) {
+            return;
+        }
+        // Parentheses, `checked` and `unchecked` bind to what they hold, and
+        // the error is about that: `byte b = unchecked(256);` is at the 256.
+        let node = &inside_wrappers(node);
         // `stackalloc T[n]` reaches a `Span<T>` (§12.8.22).
         if let BoundExpressionKind::StackAlloc { element, .. } = &value.kind
             && self.is_span_of(to, element)
@@ -1663,4 +1672,24 @@ fn unused_deconstruction(node: &SyntaxNode, value: BoundExpression) -> BoundExpr
     } else {
         value
     }
+}
+
+/// What a value's syntax is once the parentheses, `checked(...)` and
+/// `unchecked(...)` around it are taken off: an expression that is wrapped
+/// is bound as the one inside, and an error about its value is reported
+/// there.
+fn inside_wrappers(node: &SyntaxNode) -> SyntaxNode {
+    let mut node = node.clone();
+    while matches!(
+        node.kind(),
+        SyntaxKind::ParenthesizedExpression
+            | SyntaxKind::CheckedExpression
+            | SyntaxKind::UncheckedExpression
+    ) {
+        let Some(inner) = node.children().find(|child| child.kind().is_expression()) else {
+            break;
+        };
+        node = inner;
+    }
+    node
 }

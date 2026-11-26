@@ -204,3 +204,84 @@ fn integer_constants_fold_as_the_numbers_they_are() {
         ]
     );
 }
+
+#[test]
+fn an_integer_cast_to_a_float_type_is_the_nearest_number_it_has() {
+    // Left as the integer it was written as, `(int)(float)16777217` came
+    // back as 16777217, and `(long)(float)9223372036854775807` as 0.
+    let source = "class C {
+        const int A = (int)(float)16777217;
+        const long B = (long)(float)123456789;
+        const double E = (float)16777217 + 0.0;
+        const double F = (double)(float)123456789;
+        const long G = unchecked((long)(float)9223372036854775807);
+        const int H = unchecked((int)(float)2147483647);
+        const float I = 16777217;
+        const float J = 18446744073709551615;
+        const double K = 18446744073709551615;
+        const float L = 16777217L + 1f;
+        const double M = (double)(9223372036854775807 - 1);
+        const double N = (float)'a' / 3;
+        const bool Same = (float)0.1 == 0.1;
+        const double Mixed = 0.1f + 0.2;
+        const float Summed = 16777216f + 1 + 1;
+    }";
+    assert_eq!(
+        values(
+            source,
+            &[
+                "C.A", "C.B", "C.E", "C.F", "C.G", "C.H", "C.I", "C.J", "C.K", "C.L", "C.M", "C.N",
+                "C.Same", "C.Mixed", "C.Summed"
+            ]
+        ),
+        [
+            "Int32(16777216)",
+            "Int64(123456792)",
+            "Double(16777216.0)",
+            "Double(123456792.0)",
+            "Int64(0)",
+            "Int32(0)",
+            "Single(16777216.0)",
+            "Single(1.8446744e19)",
+            "Double(1.8446744073709552e19)",
+            "Single(16777216.0)",
+            "Double(9.223372036854776e18)",
+            "Double(32.33333206176758)",
+            "Boolean(false)",
+            "Double(0.30000000149011613)",
+            "Single(16777216.0)",
+        ]
+    );
+}
+
+#[test]
+fn a_chain_of_thousands_of_constants_binds_in_linear_time() {
+    // Every operator asked its operands for their value, and each of those
+    // worked it out from the first term again: 4,000 terms took half a
+    // minute. Whatever the machine, a few seconds is far from that.
+    let ones = "+1".repeat(3000);
+    let strings = "+\"a\"".repeat(3000);
+    let source = format!(
+        "class C {{
+            const int Sum = 1{ones};
+            const string Text = \"a\"{strings};
+            static int Plain(int x) => 1{ones} + x;
+            static int Left(int x) => x{ones};
+        }}"
+    );
+    // A chain this long is as deep as the parser goes, which a test thread's
+    // stack is not.
+    rustlyn_semantics::parallel::deep(|| {
+        let started = std::time::Instant::now();
+        let compilation = compile(&source);
+        assert_eq!(value(&compilation, "C.Sum").as_deref(), Some("Int32(3001)"));
+        let text = value(&compilation, "C.Text").expect("a constant string");
+        assert_eq!(text.len(), "String(\"\")".len() + 3001);
+        assert!(compilation.semantic_diagnostics().is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "binding took {:?}",
+            started.elapsed()
+        );
+    });
+}

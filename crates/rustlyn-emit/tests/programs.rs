@@ -6573,3 +6573,88 @@ static class Easing
         "5 7\n",
     );
 }
+
+#[test]
+fn an_integer_constant_cast_to_a_float_type_is_rounded_to_it() {
+    // `(float)16777217` is 16777216, so what is made of it afterwards is made
+    // of that: the constants folded, and the same casts left to run, agree.
+    check(
+        "RoundedConstants",
+        r"
+using System;
+class P {
+    const int A = (int)(float)16777217;
+    const long B = (long)(float)123456789;
+    const double E = (float)16777217 + 0.0;
+    const double F = (double)(float)123456789;
+    const long G = unchecked((long)(float)9223372036854775807);
+    const int H = unchecked((int)(float)2147483647);
+    const float I = 16777217;
+    const float J = 18446744073709551615;
+    const double K = (double)9223372036854775807;
+    const float O = 16777217 + 1f;
+    const float O3 = 16777217L + 1f;
+    const bool N = (float)0.1 == 0.1;
+    const bool N2 = (float)0.1 == 0.1f;
+    const double S2 = 0.1f + 0.2;
+    const double U5 = (double)(9223372036854775807 - 1);
+    static void Main() {
+        Console.WriteLine(A);
+        Console.WriteLine(B);
+        Console.WriteLine(E);
+        Console.WriteLine(F);
+        Console.WriteLine(G);
+        Console.WriteLine(H);
+        Console.WriteLine((double)I);
+        Console.WriteLine((double)J);
+        Console.WriteLine(K);
+        Console.WriteLine((double)O);
+        Console.WriteLine((double)O3);
+        Console.WriteLine(N);
+        Console.WriteLine(N2);
+        Console.WriteLine(S2);
+        Console.WriteLine(U5);
+        Console.WriteLine((int)(float)16777217);
+        Console.WriteLine(unchecked((long)(float)9223372036854775807));
+        Console.WriteLine((double)(float)123456789);
+        Console.WriteLine((float)16777217 == 16777216f);
+        Console.WriteLine((float)0.1 == 0.1);
+        Console.WriteLine((double)(float)0.1);
+        Console.WriteLine((double)(float)9007199254740993L);
+        Console.WriteLine((double)(16777216f + 1 + 1));
+        Console.WriteLine((double)(float)'a');
+        int n = 16777217;
+        Console.WriteLine((double)(float)n);
+        Console.WriteLine((int)(float)n);
+    }
+}
+",
+        r"16777216
+123456792
+16777216
+123456792
+0
+0
+16777216
+1.8446744073709552E+19
+9.223372036854776E+18
+16777216
+16777216
+False
+True
+0.30000000149011613
+9.223372036854776E+18
+16777216
+0
+123456792
+True
+False
+0.10000000149011612
+9007199254740992
+16777216
+97
+16777216
+16777216
+",
+    );
+}

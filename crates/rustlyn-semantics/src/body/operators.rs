@@ -120,7 +120,7 @@ impl BodyBinder<'_> {
     /// Whether a part of the expression at `span` has overflowed or divided
     /// by zero already: it has no value then, and what is worked out from it
     /// is not a second mistake.
-    fn reported_within(&self, span: TextSpan) -> bool {
+    pub(super) fn reported_within(&self, span: TextSpan) -> bool {
         self.body.diagnostics.iter().any(|(tree, diagnostic)| {
             *tree == self.tree
                 && matches!(
@@ -182,11 +182,14 @@ impl BodyBinder<'_> {
                 (range.0 <= value && value <= range.1, value.to_string())
             }
             // A floating constant is truncated toward zero, and has to land
-            // inside the range; NaN and the infinities land nowhere.
+            // inside the range; NaN and the infinities land nowhere. The
+            // top of the range is compared as the power of two past it:
+            // `long.MaxValue` itself is no `double`, and the one that
+            // stands for it is 2^63, which is out.
             ConstantValue::Single(value) => {
                 let value = f64::from(*value).trunc();
                 (
-                    value.is_finite() && range.0 as f64 <= value && value <= range.1 as f64,
+                    value.is_finite() && range.0 as f64 <= value && value < (range.1 + 1) as f64,
                     value.to_string(),
                 )
             }
@@ -195,7 +198,7 @@ impl BodyBinder<'_> {
                 (
                     truncated.is_finite()
                         && range.0 as f64 <= truncated
-                        && truncated <= range.1 as f64,
+                        && truncated < (range.1 + 1) as f64,
                     value.to_string(),
                 )
             }

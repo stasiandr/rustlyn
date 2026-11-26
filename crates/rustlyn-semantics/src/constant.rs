@@ -570,10 +570,10 @@ impl Binder<'_> {
                 ConstantValue::Double(f64::from(*value))
             }
             (_, Some(SpecialType::Double)) => {
-                ConstantValue::Double(as_integer(&folded).map_or(0.0, |value| value as f64))
+                ConstantValue::Double(as_exact(&folded).map_or(0.0, |value| value as f64))
             }
             (_, Some(SpecialType::Single)) => {
-                ConstantValue::Single(as_integer(&folded).map_or(0.0, |value| value as f32))
+                ConstantValue::Single(as_exact(&folded).map_or(0.0, |value| value as f32))
             }
             (_, Some(SpecialType::Byte)) => {
                 ConstantValue::Int32(as_bits(&folded).unwrap_or(0) as u8 as i32)
@@ -713,7 +713,44 @@ impl Binder<'_> {
     }
 
     /// Folds an expression to a value, or answers `None` where it is not one.
+    ///
+    /// What an operator, a conversion or a conditional comes to is kept on
+    /// the expression, so that each is worked out once: the binder asks
+    /// about every operand of every operator as it goes, and `1 + 1 + … + 1`
+    /// would otherwise be folded from the left end at each `+`. An answer
+    /// reached while a field's own initializer is being worked out is not
+    /// kept, as a field in a cycle has no value only there.
     fn fold(
+        &self,
+        expression: &BoundExpression,
+        visiting: &mut HashSet<SymbolId>,
+    ) -> Option<ConstantValue> {
+        let keeps = visiting.is_empty()
+            && matches!(
+                expression.kind,
+                BoundExpressionKind::Binary { .. }
+                    | BoundExpressionKind::Unary { .. }
+                    | BoundExpressionKind::Conversion { .. }
+                    | BoundExpressionKind::Conditional { .. }
+            );
+        if !keeps {
+            return self.fold_uncached(expression, visiting);
+        }
+        // The type is part of the answer, and one that is changed after
+        // the expression was bound.
+        if let Some(kept) = expression.folded.get()
+            && kept.0 == expression.ty
+        {
+            return kept.1.clone();
+        }
+        let value = self.fold_uncached(expression, visiting);
+        let _ = expression
+            .folded
+            .set(Box::new((expression.ty.clone(), value.clone())));
+        value
+    }
+
+    fn fold_uncached(
         &self,
         expression: &BoundExpression,
         visiting: &mut HashSet<SymbolId>,
@@ -790,6 +827,26 @@ impl Binder<'_> {
                         return Some(ConstantValue::Double(f64::from(*value)));
                     }
                     _ => {}
+                }
+                // An integer into a floating type is the nearest number the
+                // type has: `(float)16777217` is 16777216, and a `long` read
+                // as a `double` past 2^53 loses its low bits. Left an integer,
+                // it would be taken for the value it was written as, and
+                // `(int)(float)16777217` would come back as 16777217.
+                if matches!(
+                    folded,
+                    ConstantValue::Int32(_)
+                        | ConstantValue::UInt32(_)
+                        | ConstantValue::Int64(_)
+                        | ConstantValue::UInt64(_)
+                        | ConstantValue::Char(_)
+                ) && let Some(width) = self.floating_width(&expression.ty)
+                    && let Some(exact) = as_exact(&folded)
+                {
+                    return Some(match width {
+                        Width::Single => ConstantValue::Single(exact as f32),
+                        Width::Double => ConstantValue::Double(exact as f64),
+                    });
                 }
                 let target = self.special_of(&expression.ty);
                 let narrowed = match folded {
@@ -947,29 +1004,31 @@ impl Binder<'_> {
                 // `0.0 / 0.0` is a NaN and `1.0 / 0.0` an infinity, not
                 // errors: floating point folds in its own width.
                 if let Some(width) = self.floating_width(&expression.ty) {
-                    let (left, right) = (as_float(&left)?, as_float(&right)?);
-                    let value = match (width, operator) {
-                        (Width::Single, BinaryOperator::Add) => {
-                            f64::from(left as f32 + right as f32)
+                    let value = match width {
+                        // An operand that is an integer is rounded to a
+                        // `float` once, not through a `double` first.
+                        Width::Single => {
+                            let (left, right) = (as_single(&left)?, as_single(&right)?);
+                            f64::from(match operator {
+                                BinaryOperator::Add => left + right,
+                                BinaryOperator::Subtract => left - right,
+                                BinaryOperator::Multiply => left * right,
+                                BinaryOperator::Divide => left / right,
+                                BinaryOperator::Modulo => left % right,
+                                _ => return None,
+                            })
                         }
-                        (Width::Single, BinaryOperator::Subtract) => {
-                            f64::from(left as f32 - right as f32)
+                        Width::Double => {
+                            let (left, right) = (as_float(&left)?, as_float(&right)?);
+                            match operator {
+                                BinaryOperator::Add => left + right,
+                                BinaryOperator::Subtract => left - right,
+                                BinaryOperator::Multiply => left * right,
+                                BinaryOperator::Divide => left / right,
+                                BinaryOperator::Modulo => left % right,
+                                _ => return None,
+                            }
                         }
-                        (Width::Single, BinaryOperator::Multiply) => {
-                            f64::from(left as f32 * right as f32)
-                        }
-                        (Width::Single, BinaryOperator::Divide) => {
-                            f64::from(left as f32 / right as f32)
-                        }
-                        (Width::Single, BinaryOperator::Modulo) => {
-                            f64::from(left as f32 % right as f32)
-                        }
-                        (Width::Double, BinaryOperator::Add) => left + right,
-                        (Width::Double, BinaryOperator::Subtract) => left - right,
-                        (Width::Double, BinaryOperator::Multiply) => left * right,
-                        (Width::Double, BinaryOperator::Divide) => left / right,
-                        (Width::Double, BinaryOperator::Modulo) => left % right,
-                        _ => return None,
                     };
                     return Some(floating(width, value));
                 }
@@ -1070,6 +1129,16 @@ fn as_float(value: &ConstantValue) -> Option<f64> {
         ConstantValue::Double(value) => *value,
         ConstantValue::UInt64(value) => *value as f64,
         other => as_integer(other)? as f64,
+    })
+}
+
+/// A number as a `float`, rounded once: an integer straight to the nearest
+/// `float`, not by way of a `double`, which rounds twice.
+fn as_single(value: &ConstantValue) -> Option<f32> {
+    Some(match value {
+        ConstantValue::Single(value) => *value,
+        ConstantValue::Double(value) => *value as f32,
+        other => as_exact(other)? as f32,
     })
 }
 

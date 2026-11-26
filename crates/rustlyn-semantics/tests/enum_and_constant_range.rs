@@ -231,3 +231,101 @@ fn a_constant_that_fits_or_is_explicit_is_quiet() {
         ["CS1503"]
     );
 }
+
+#[test]
+fn a_constant_that_failed_to_fold_is_the_only_error() {
+    // Roslyn gives the division or the overflow and no more: what has no
+    // value is not converted to anything.
+    for body in [
+        "byte a = 3 / 0;",
+        "byte a = 3 % 0;",
+        "byte a = (3 / 0);",
+        "byte a = 1 + 3 / 0;",
+        "short a = 3 / 0 + 1;",
+        "uint a = 3 / 0;",
+        "char a = 3 / 0;",
+        "string a = 3 / 0;",
+        "byte a = unchecked(3 / 0);",
+    ] {
+        assert_eq!(codes(&in_method(body)), ["CS0020"], "for {body}");
+    }
+    for body in [
+        "byte a = 2147483647 + 1;",
+        "byte a = -(-2147483647 - 1);",
+        "byte a = checked(2147483647 + 1);",
+        "sbyte a = (2147483647 * 2);",
+    ] {
+        assert_eq!(codes(&in_method(body)), ["CS0220"], "for {body}");
+    }
+    assert_eq!(
+        codes("class C { static byte R() { return 3 / 0; } byte f = 3 / 0; }"),
+        ["CS0020", "CS0020"]
+    );
+}
+
+#[test]
+fn an_out_of_range_constant_is_reported_inside_its_parentheses_and_checked() {
+    // The error is about the value, which is what is inside the wrappers.
+    assert_eq!(
+        diagnose(&in_method("byte p = unchecked(256);")),
+        ["CS0031 '256': Constant value '256' cannot be converted to a 'byte'"]
+    );
+    for body in [
+        "byte p = checked(256);",
+        "byte p = (256);",
+        "byte p = ((256));",
+        "byte p = unchecked((256));",
+        "byte p = (unchecked(256));",
+        "byte p = checked(unchecked(256));",
+    ] {
+        assert_eq!(
+            diagnose(&in_method(body)),
+            ["CS0031 '256': Constant value '256' cannot be converted to a 'byte'"],
+            "for {body}"
+        );
+    }
+    assert_eq!(
+        diagnose(&in_method("byte p = unchecked(1 + 256);")),
+        ["CS0031 '1 + 256': Constant value '257' cannot be converted to a 'byte'"]
+    );
+    assert_eq!(
+        diagnose(&in_method("byte p = unchecked(2147483647 + 1);")),
+        ["CS0031 '2147483647 + 1': Constant value '-2147483648' cannot be converted to a 'byte'"]
+    );
+    assert_eq!(
+        diagnose(&in_method("int x = 1; byte p = (x);")),
+        [
+            "CS0266 'x': Cannot implicitly convert type 'int' to 'byte'. An explicit conversion exists (are you missing a cast?)"
+        ]
+    );
+    assert_eq!(
+        diagnose("class C { static byte R() { return unchecked(256); } byte f = (257); }"),
+        [
+            "CS0031 '256': Constant value '256' cannot be converted to a 'byte'",
+            "CS0031 '257': Constant value '257' cannot be converted to a 'byte'",
+        ]
+    );
+}
+
+#[test]
+fn a_float_constant_at_the_top_of_a_range_is_out_of_it() {
+    // `9223372036854775807` is no `double`: the one that stands for it is 2^63.
+    for body in [
+        "const long L = (long)(float)9223372036854775807;",
+        "const long L = (long)(double)9223372036854775807;",
+        "const ulong L = (ulong)(float)18446744073709551615;",
+        "const int L = (int)(float)2147483647;",
+        "const uint L = (uint)(float)4294967295;",
+    ] {
+        assert_eq!(codes(&in_method(body)), ["CS0221"], "for {body}");
+    }
+    for body in [
+        "const int L = (int)(double)2147483647;",
+        "const long L = (long)(float)(9223372036854775807 / 2);",
+        "const long L = unchecked((long)(float)9223372036854775807);",
+        "const int L = (int)2147483647.5;",
+        "const long L = (long)-9.223372036854775808E18;",
+    ] {
+        assert!(diagnose(&in_method(body)).is_empty(), "for {body}");
+    }
+}
