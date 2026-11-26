@@ -973,6 +973,15 @@ impl<'a> Loader<'a> {
     ///
     /// This runs before the symbols exist, which is why it works in names.
     fn name_of(&self, index: usize, token: Token) -> Option<String> {
+        // A chain of enclosing types is no longer than there are `TypeRef`
+        // rows; one that is has come round to itself, which only a damaged
+        // assembly's does — a `TypeRef` nested in itself was followed for
+        // ever.
+        let hops = self.assemblies[index].rows(table::TYPE_REF);
+        self.name_within(index, token, hops)
+    }
+
+    fn name_within(&self, index: usize, token: Token, hops: u32) -> Option<String> {
         let assembly = &self.assemblies[index];
         let heaps = assembly.heaps();
         let row = assembly.row(token)?;
@@ -988,7 +997,8 @@ impl<'a> Loader<'a> {
                 // type, and its own namespace column is empty.
                 let scope = row.token(0);
                 if scope.table() == table::TYPE_REF {
-                    Some(format!("{}+{name}", self.name_of(index, scope)?))
+                    let outer = self.name_within(index, scope, hops.checked_sub(1)?)?;
+                    Some(format!("{outer}+{name}"))
                 } else {
                     Some(qualified(namespace, name))
                 }
@@ -2557,7 +2567,11 @@ impl<'a> Loader<'a> {
                     table::TYPE_DEF => self.references[index].clone(),
                     _ => {
                         let mut scope = assembly.row(modifier.token)?.token(0);
+                        // As in `name_of`: a chain longer than the table
+                        // has come round to itself.
+                        let mut hops = assembly.rows(table::TYPE_REF);
                         while scope.table() == table::TYPE_REF {
+                            hops = hops.checked_sub(1)?;
                             scope = assembly.row(scope)?.token(0);
                         }
                         (scope.table() == table::ASSEMBLY_REF)

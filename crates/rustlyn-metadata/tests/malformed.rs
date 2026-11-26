@@ -330,3 +330,59 @@ fn a_signature_counting_more_parameters_than_it_has_is_an_error() {
         Err(Error::Truncated)
     );
 }
+
+/// The same damage, read by the compiler as a reference: what the reader
+/// lets through, the loader has to make sense of or leave. A `TypeRef` whose
+/// enclosing type was itself was followed for ever.
+#[test]
+fn a_damaged_reference_never_crashes_or_hangs_the_compiler() {
+    let library = r#"
+using System;
+public interface IShape { double Area { get; } }
+public struct Point { public int X; public int Y; }
+public enum Colour { Red, Green = 5 }
+public class Base { public virtual int F(int x) => x; protected int P; public const int K = 3; }
+public class Box<T> : Base, IShape where T : struct
+{
+    T _held;
+    public double Area => 1.5;
+    public T Held { get => _held; set => _held = value; }
+    public override int F(int x) => x + 1;
+    public static Box<T> operator +(Box<T> a, Box<T> b) => a;
+    public class Inner { public int[] Items; }
+}
+public static class Program
+{
+    public static int Pick(int n, Colour c = Colour.Green) { return n; }
+    static void Main() { Console.WriteLine(Pick(1)); }
+}
+"#;
+    let user = "class U : Base { void M() { var b = new Box<Point>(); \
+                b.Held = new Point { X = 1 }; var i = new Box<Point>.Inner(); \
+                int k = Program.Pick(b.F(Base.K), Colour.Red) + i.Items.Length; \
+                IShape s = b; double a = s.Area; var c = b + b; } }";
+    let compilation = Compilation::create(vec![parse(SourceText::new("Lib.cs", library))]);
+    let bytes = rustlyn_emit::emit(&compilation, "Lib")
+        .unwrap_or_else(|error| panic!("the library: {error}"))
+        .assembly;
+    within(600, move || {
+        let mut random = Random(0x1234_5678_9ABC_DEF1);
+        let telling = [0x00, 0xFF, 0x80, 0x7F, 0x01, 0x40, 0xFE, 0x20];
+        for _ in 0..3_000 {
+            let mut damaged = bytes.clone();
+            for _ in 0..=random.below(3) {
+                let at = random.below(damaged.len());
+                match random.below(3) {
+                    0 => damaged[at] = telling[random.below(telling.len())],
+                    1 => damaged[at] = random.next() as u8,
+                    _ => damaged[at] ^= 1 << random.below(8),
+                }
+            }
+            let compilation = Compilation::create_with_references(
+                vec![parse(SourceText::new("U.cs", user))],
+                &[&damaged],
+            );
+            let _ = compilation.semantic_diagnostics();
+        }
+    });
+}
