@@ -112,6 +112,7 @@ error_codes! {
     ErrBadUnaryOp = 23, Error, "Operator '{0}' cannot be applied to operand of type '{1}'";
     ErrCannotBeMadeNullable = 8978, Error, "'{0}' cannot be made nullable.";
     ErrNoImplicitConv = 29, Error, "Cannot implicitly convert type '{0}' to '{1}'";
+    ErrNoExplicitConv = 30, Error, "Cannot convert type '{0}' to '{1}'";
     ErrLocalDuplicate = 128, Error, "A local variable or function named '{0}' is already defined in this scope";
     ErrBadArgCount = 1501, Error, "No overload for method '{0}' takes {1} arguments";
     ErrBadArgType = 1503, Error, "Argument {0}: cannot convert from '{1}' to '{2}'";

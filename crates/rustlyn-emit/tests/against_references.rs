@@ -17872,3 +17872,154 @@ class CheckedNative {
         "ovf4\novf5\novf6\novf7\novf8\n-2\novf10\novf11\novf1\novf3\novf12\novf13\novf14\n1\n18446744073709551615\n-1\novf18\n1.8446744073709552E+19\n18446744073709551615\novf21\novf22\n",
     );
 }
+
+/// The errors `source` gets bound against the framework and `library`, as
+/// `CS0000 'underlined'`, in the order of where they are; `None` where there
+/// is no framework to bind against.
+fn errors_with_library(name: &str, library: &str, source: &str) -> Option<Vec<String>> {
+    let mut bytes = references()?;
+    let library_name = format!("{name}Library");
+    let compilation = compiled(&library_name, library, &bytes);
+    let emitted = rustlyn_emit::emit_library(&compilation, &library_name)
+        .unwrap_or_else(|error| panic!("{library_name} could not be emitted: {error}"));
+    bytes.push(emitted.assembly);
+    let images: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
+    let compilation = Compilation::create_with_references(
+        vec![parse(SourceText::new("Program.cs", source))],
+        &images,
+    );
+    let mut found: Vec<_> = compilation
+        .semantic_diagnostics()
+        .into_iter()
+        .map(|entry| entry.diagnostic)
+        .filter(rustlyn_diagnostics::Diagnostic::is_error)
+        .collect();
+    found.sort_by_key(|diagnostic| (diagnostic.span().start(), diagnostic.code()));
+    Some(
+        found
+            .iter()
+            .map(|diagnostic| {
+                let span = diagnostic.span();
+                format!(
+                    "{} '{}'",
+                    diagnostic.code(),
+                    &source[span.start() as usize..span.end() as usize]
+                )
+            })
+            .collect(),
+    )
+}
+
+/// What a library keeps for the types derived from its own.
+const PROTECTED_LIBRARY: &str = r#"
+using System;
+public class Base
+{
+    protected int Prot;
+    protected internal int ProtInt;
+    protected static int SProt;
+    protected Base() { }
+    protected virtual void OnThing() { }
+    protected internal virtual void OnOther() { }
+    protected int Prop { get; set; }
+    public int Mixed { get; protected set; }
+    protected static void Helper() { }
+    public static void Pub() { }
+}
+public class Mid : Base { protected override void OnThing() { } }
+"#;
+
+/// A protected member read out of a reference was accessible from any
+/// class: `stream.Dispose(true)` compiled in one that is no `Stream`, and
+/// the runtime refused it. It is for the types derived from its own, as one
+/// in the same compilation is; `protected internal` from another assembly
+/// is protected and no more. The errors are the ones Roslyn reports.
+#[test]
+fn a_protected_member_of_a_reference_is_for_derived_types_only() {
+    let stranger = r#"
+using System.IO;
+using System.Collections.ObjectModel;
+class Stranger
+{
+    void M(Base b, Mid m, Stream s, TextWriter w, Collection<int> c)
+    {
+        b.Prot = 1;
+        b.ProtInt = 2;
+        m.OnThing();
+        b.OnOther();
+        b.Prop = 1;
+        Base.Helper();
+        var x = Base.SProt;
+        s.Dispose(true);
+        var n = w.CoreNewLine;
+        c.ClearItems();
+        var items = c.Items;
+        Base.Pub();
+        var y = b.Mixed;
+        object o = MemberwiseClone();
+    }
+}
+"#;
+    let Some(found) = errors_with_library("ProtectedAbroad", PROTECTED_LIBRARY, stranger) else {
+        println!("note: skipped; no .NET shared framework was found");
+        return;
+    };
+    assert_eq!(
+        found,
+        [
+            "CS0122 'Prot'",
+            "CS0122 'ProtInt'",
+            "CS0122 'OnThing'",
+            "CS0122 'OnOther'",
+            "CS0122 'Prop'",
+            "CS0122 'Helper'",
+            "CS0122 'SProt'",
+            "CS0122 'Dispose'",
+            "CS0122 'CoreNewLine'",
+            "CS0122 'ClearItems'",
+            "CS0122 'Items'",
+        ]
+    );
+}
+
+#[test]
+fn a_type_derived_from_a_references_reaches_its_protected_members() {
+    let derived = r#"
+using System;
+using System.IO;
+using System.Collections.ObjectModel;
+class Derived : Mid
+{
+    Derived() : base() { }
+    void M(Derived d)
+    {
+        Prot = 1; ProtInt = 2; SProt = 3; OnThing(); OnOther(); Prop = 4; Mixed = 5; Helper();
+        d.Prot = 1;
+        base.OnThing();
+        Action a = () => { Prot++; OnThing(); };
+        a();
+    }
+    protected override void OnThing() { base.OnThing(); }
+    static void S(Derived d) { d.OnThing(); }
+    class Nested { void Q(Derived d) { d.Prot = 1; d.OnThing(); Helper(); } }
+}
+class MyStream : MemoryStream
+{
+    protected override void Dispose(bool disposing) { base.Dispose(disposing); }
+    void N(MyStream other) { other.Dispose(true); Dispose(false); }
+}
+class MyCollection : Collection<string>
+{
+    protected override void InsertItem(int index, string item) { base.InsertItem(index, item); Items.Add(item); }
+    void Clear2() { ClearItems(); var i = Items; }
+}
+class MyWriter : StringWriter { string NL => new string(CoreNewLine); }
+struct Value { object Clone() => MemberwiseClone(); }
+class Elsewhere { int M(Derived d) => d.Mixed; }
+"#;
+    let Some(found) = errors_with_library("ProtectedDerived", PROTECTED_LIBRARY, derived) else {
+        println!("note: skipped; no .NET shared framework was found");
+        return;
+    };
+    assert_eq!(found, Vec::<String>::new());
+}

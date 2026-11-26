@@ -1095,6 +1095,22 @@ impl Compilation {
         self.assembly_sees_symbol(assembly, symbol)
     }
 
+    /// Whether the assembly `symbol` was read from names the one the code
+    /// in `tree` is compiled into its friend (`[InternalsVisibleTo]`).
+    pub(crate) fn befriended_by(&self, symbol: SymbolId, tree: usize) -> bool {
+        let Some(trusted) = self
+            .assembly_of(symbol)
+            .and_then(|reference| self.loaded.trusting.get(&reference.name))
+        else {
+            return false;
+        };
+        match self.tree_assemblies.get(tree) {
+            Some(&assembly) if assembly != u16::MAX => trusted.contains(&assembly),
+            // One assembly is being compiled, and it is the one named.
+            _ => true,
+        }
+    }
+
     fn assembly_sees_symbol(&self, assembly: u16, symbol: SymbolId) -> bool {
         if self.is_from_metadata(symbol) {
             if self.loaded.trusting.is_empty()

@@ -56,10 +56,38 @@ impl BodyBinder<'_> {
         }
         let symbols = compilation.symbols();
         let symbol = symbols.get(member);
+        // A property or an event read from metadata says how far it is seen
+        // by its accessors, the widest of them: `Collection<T>.Items` is as
+        // protected as its `get_Items`.
+        let accessibility = match (&symbol.detail, symbol.accessibility) {
+            (crate::symbol::Detail::Property(detail), Accessibility::NotApplicable) => {
+                [detail.getter, detail.setter]
+                    .into_iter()
+                    .flatten()
+                    .map(|accessor| symbols.get(accessor).accessibility)
+                    .max()
+                    .unwrap_or(Accessibility::NotApplicable)
+            }
+            (crate::symbol::Detail::Event(detail), Accessibility::NotApplicable) => {
+                [detail.adder, detail.remover]
+                    .into_iter()
+                    .flatten()
+                    .map(|accessor| symbols.get(accessor).accessibility)
+                    .max()
+                    .unwrap_or(Accessibility::NotApplicable)
+            }
+            (_, accessibility) => accessibility,
+        };
+        // `protected internal` is public to its own assembly, and to one
+        // the assembly names its friend; to any other it is `protected`.
+        let protected_abroad = accessibility == Accessibility::ProtectedOrInternal
+            && compilation.is_from_metadata(member)
+            && !compilation.befriended_by(member, self.context.tree());
         if !matches!(
-            symbol.accessibility,
+            accessibility,
             Accessibility::Private | Accessibility::Protected | Accessibility::ProtectedAndInternal
-        ) {
+        ) && !protected_abroad
+        {
             return true;
         }
         let Some(owner) = symbol
@@ -105,11 +133,17 @@ impl BodyBinder<'_> {
                 false
             })
         };
-        match symbol.accessibility {
+        match accessibility {
             Accessibility::Private => inside(owner),
-            Accessibility::Protected | Accessibility::ProtectedAndInternal => {
-                compilation.is_from_metadata(member) || inside(owner) || derived(owner)
-            }
+            // A protected member is for the types derived from its own,
+            // whichever assembly it is in: one out of a reference counted
+            // as accessible from anywhere, so `stream.Dispose(true)` in a
+            // class that is no `Stream` compiled, and failed when it ran.
+            // `private protected` is that and internal as well, which is
+            // what `sees` above answered.
+            Accessibility::Protected
+            | Accessibility::ProtectedAndInternal
+            | Accessibility::ProtectedOrInternal => inside(owner) || derived(owner),
             _ => true,
         }
     }
@@ -219,14 +253,10 @@ impl BodyBinder<'_> {
     pub(super) fn check_accessible(&mut self, member: SymbolId, name: &str, span: TextSpan) {
         let compilation = self.binder.compilation();
         let symbols = compilation.symbols();
-        // A reference's member is accessible, but for an internal one of
-        // an assembly that does not name this code's its friend.
-        if (compilation.is_from_metadata(member) && compilation.sees(member, self.context.tree()))
-            || !matches!(
-                symbols.get(member).kind,
-                SymbolKind::Field | SymbolKind::Property | SymbolKind::Method | SymbolKind::Event
-            )
-            || self.accessible(member)
+        if !matches!(
+            symbols.get(member).kind,
+            SymbolKind::Field | SymbolKind::Property | SymbolKind::Method | SymbolKind::Event
+        ) || self.accessible(member)
         {
             return;
         }

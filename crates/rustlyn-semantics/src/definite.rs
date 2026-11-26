@@ -143,6 +143,7 @@ pub(crate) fn check(
         needs: HashMap::new(),
         arriving: HashMap::new(),
         arriving_changed: false,
+        follows_gotos: !shape.gotos.is_empty(),
     };
     // A `goto` may jump over a declaration: `goto L; int x = 1; L: Use(x);`
     // reads an `x` nothing assigned. A local counts as assigned until its
@@ -1061,6 +1062,9 @@ struct Walk<'a, 'b> {
     /// label may have been walked already with more assigned than that, so
     /// the body is walked again.
     arriving_changed: bool,
+    /// Whether the body has a `goto`, and so its declared locals start out
+    /// unassigned rather than becoming so where they are declared.
+    follows_gotos: bool,
 }
 
 impl Walk<'_, '_> {
@@ -1107,7 +1111,13 @@ impl Walk<'_, '_> {
                 }
             }
             BoundStatementKind::LocalDeclaration { local, initializer } => {
-                if !self.state.unreachable {
+                // A declaration is where a local stops counting as assigned
+                // — except in a body with a `goto`, where its locals start
+                // out unassigned and a bare `int x;` changes nothing, as
+                // the language has it (§9.4.4.7): a jump back to before the
+                // declaration, with `x` assigned on the way, reads it
+                // after, which the framework's own vectorised loops do.
+                if !self.state.unreachable && (initializer.is_some() || !self.follows_gotos) {
                     self.state.unassign(*local);
                 }
                 if let Some(value) = initializer {
@@ -1992,6 +2002,20 @@ impl Walk<'_, '_> {
                     // body that starts somewhere: what is around it counts
                     // as assigned, and what it declares starts out not.
                     self.state.unreachable = false;
+                    // Its own locals start out unassigned, as the method's
+                    // do where the body has a `goto`.
+                    if self.follows_gotos {
+                        let mut declared = Vec::new();
+                        each_nested_statement(&lambda.body, &mut |inner| {
+                            if let BoundStatementKind::LocalDeclaration { local, .. } = &inner.kind
+                            {
+                                declared.push(*local);
+                            }
+                        });
+                        for local in declared {
+                            self.state.unassign(local);
+                        }
+                    }
                     self.lambdas += 1;
                     self.statement(&lambda.body);
                     self.lambdas -= 1;

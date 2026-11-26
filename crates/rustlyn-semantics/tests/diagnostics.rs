@@ -2366,6 +2366,11 @@ fn a_local_a_goto_reaches_unassigned_is_cs0165() {
         "void Local() { int z; goto Q; Q: Use(z); } Local();",
         // `goto case` too.
         "int x; switch (Cond() ? 1 : 2) { case 1: goto case 2; case 2: Use(x); break; }",
+        // Round again through a declaration: unassigned the first time.
+        "int n = 0; L: int x; if (n > 0) Use(x); x = 1; n++; if (n < 3) goto L;",
+        "for (int i = 0; i < 3; i++) { int x; if (i > 0) Use(x); x = i; if (i == 2) goto End; } End: ;",
+        "int k = 0; Top: { int y; if (k > 0) Use(y); y = 1; } k++; if (k < 2) goto Top;",
+        "goto Mid; Back: int v; Use(v); return; Mid: if (Cond()) v = 1; goto Back;",
     ] {
         assert_eq!(only(&jumping(body), &["CS0165"]), ["CS0165"], "{body}");
     }
@@ -2402,4 +2407,150 @@ fn a_local_assigned_on_every_way_to_a_label_is_not_cs0165() {
     assert_clean(
         "class C { static bool Cond() => true; void M(out int r) { if (Cond()) goto L; r = 1; return; L: r = 2; } }",
     );
+    // A bare `int x;` assigns nothing and takes nothing away (§9.4.4.7):
+    // a jump back to before it, with `x` assigned on the way, reads it
+    // after — which the framework's vectorised loops are written as.
+    let found = only(
+        &jumping("goto Start; Found: int x; Use(x); return; Start: x = 1; goto Found;"),
+        &["CS0165"],
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+// MARK: - casts nothing can make
+
+/// Types to cast between, and a method whose parameters are one of each.
+fn casting(body: &str) -> String {
+    format!(
+        "enum E {{ A }} enum F {{ B }} struct S {{ }} struct Other {{ }}
+         struct WithOp {{ public static explicit operator long(WithOp w) => 1; public static implicit operator WithOp(string s) => default; }}
+         class A {{ }} class B : A {{ }} class C {{ }} sealed class Sealed {{ }}
+         class Conv {{ public static explicit operator Conv(int x) => null; }} class DerivedConv : Conv {{ }}
+         interface I {{ }} class Impl : I {{ }} class G<T> {{ }} delegate void D1(); delegate void D2();
+         class Tests<T, U> where T : class {{
+             void M(int i, long l, string s, bool b, char c, double d, object o, E e, F f, S st, A a, B bb, C cc, Sealed se,
+                    I it, Impl im, int? ni, bool? nb, WithOp w, Conv cv, DerivedConv dc, G<int> gi, G<long> gl, T t, U u,
+                    int[] ia, object[] oa, string[] sa, D1 d1) {{ {body} }}
+         }}"
+    )
+}
+
+#[test]
+fn a_cast_between_types_nothing_converts_is_cs0030() {
+    // `(string)5` was bound as a boxing and `(int)"x"` as an unboxing, by
+    // the shapes of the two types, and both compiled.
+    assert_eq!(
+        diagnose(&casting("var x = (string)i;")),
+        ["CS0030 '(string)i': Cannot convert type 'int' to 'string'"]
+    );
+    assert_eq!(
+        diagnose(&casting("var x = (int)s;")),
+        ["CS0030 '(int)s': Cannot convert type 'string' to 'int'"]
+    );
+    for cast in [
+        // A `bool` is no number, and a `string` no character.
+        "(bool)i",
+        "(int)b",
+        "(double)b",
+        "(string)b",
+        "(char)s",
+        "(string)c",
+        "(E)b",
+        "(bool)e",
+        "(E)s",
+        "(string)e",
+        // A struct reaches no class but `object`, and no other struct.
+        "(S)i",
+        "(int)st",
+        "(Other)st",
+        "(S)a",
+        "(A)st",
+        "(string)st",
+        // Two classes neither of which derives from the other.
+        "(C)a",
+        "(A)cc",
+        "(Sealed)a",
+        "(string)a",
+        "(A)s",
+        "(G<long>)gi",
+        // A nullable converts as what it holds.
+        "(int)nb",
+        "(bool?)i",
+        // An operator that has nothing to say about these two.
+        "(S)w",
+        "(C)cv",
+        "(bool)w",
+    ] {
+        assert_eq!(
+            only(&casting(&format!("var x = {cast};")), &["CS0030"]),
+            ["CS0030"],
+            "{cast}"
+        );
+    }
+}
+
+#[test]
+fn a_cast_the_language_has_is_not_cs0030() {
+    for cast in [
+        // Numbers, characters and enums among themselves.
+        "(long)i",
+        "(int)l",
+        "(E)i",
+        "(int)e",
+        "(F)e",
+        "(char)i",
+        "(int)c",
+        "(byte)e",
+        "(double)i",
+        "(int)d",
+        "(E)0",
+        // Up, down and across a hierarchy that is one.
+        "(B)a",
+        "(A)bb",
+        "(object)i",
+        "(int)o",
+        "(string)o",
+        "(object)s",
+        "(A)o",
+        // An interface may be implemented by what derives from the class.
+        "(I)a",
+        "(A)it",
+        "(I)im",
+        "(Impl)it",
+        "(I)o",
+        "(I)st",
+        "(Sealed)it",
+        // Nullables.
+        "(int?)i",
+        "(int)ni",
+        "(long?)ni",
+        "(E?)i",
+        // Operators, with a standard conversion before or after.
+        "(long)w",
+        "(int)w",
+        "(WithOp)s",
+        "(Conv)i",
+        "(Conv)d",
+        "(DerivedConv)cv",
+        "(Conv)dc",
+        // Type parameters, arrays and delegates have rules of their own.
+        "(T)o",
+        "(T)(object)u",
+        "(U)(object)i",
+        "(A)(object)t",
+        "(I)t",
+        "(T)it",
+        "(object[])sa",
+        "(string[])oa",
+        "(int[])o",
+        "(object)ia",
+        "(D2)(object)d1",
+        "(D1)null",
+        "(string)null",
+        "(A)null",
+        "(int?)null",
+    ] {
+        let found = only(&casting(&format!("var x = {cast};")), &["CS0030"]);
+        assert!(found.is_empty(), "{cast}: {found:?}");
+    }
 }

@@ -604,6 +604,21 @@ impl BodyBinder<'_> {
             );
             return;
         }
+        // An overload that does take this many, and that this code may not
+        // call, is the one the call names (CS0122): `stream.Dispose(true)`
+        // outside a `Stream` is not a `Dispose()` given one too many.
+        if constructor_of.is_none()
+            && let Some(hidden) = self.inaccessible_overload(receiver, name, arguments.len())
+        {
+            let display = crate::checks::member_display(
+                self.binder.compilation(),
+                hidden,
+                &Default::default(),
+                None,
+            );
+            self.report(ErrorCode::ErrBadAccess, at, &[&display]);
+            return;
+        }
         let count = arguments.len().to_string();
         match constructor_of {
             Some(ty) => {
@@ -612,6 +627,37 @@ impl BodyBinder<'_> {
             }
             None => self.report(ErrorCode::ErrBadArgCount, at, &[name, &count]),
         }
+    }
+
+    /// A method called `name` on `receiver` or a class it derives from that
+    /// takes `count` arguments and that the code here may not call.
+    fn inaccessible_overload(&self, receiver: &Type, name: &str, count: usize) -> Option<SymbolId> {
+        let symbols = self.binder.compilation().symbols();
+        let mut current = receiver.symbol();
+        let mut depth = 0;
+        while let Some(ty) = current {
+            let found = symbols.lookup(ty, name).iter().copied().find(|member| {
+                symbols.get(*member).as_method().is_some_and(|detail| {
+                    let parameters: Vec<_> = detail
+                        .parameters
+                        .iter()
+                        .filter_map(|parameter| symbols.get(*parameter).as_parameter())
+                        .collect();
+                    let required = parameters
+                        .iter()
+                        .filter(|parameter| !parameter.has_default && !parameter.is_params)
+                        .count();
+                    let unbounded = parameters.iter().any(|parameter| parameter.is_params);
+                    count >= required && (unbounded || count <= parameters.len())
+                }) && !self.accessible(*member)
+            });
+            if found.is_some() || depth > 32 {
+                return found;
+            }
+            current = self.binder.base_class_of(ty).and_then(|base| base.symbol());
+            depth += 1;
+        }
+        None
     }
 
     /// The order a candidate's parameters are in as the call's arguments

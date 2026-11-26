@@ -1600,6 +1600,19 @@ impl BodyBinder<'_> {
                 span,
             );
         }
+        // Nothing above took it: where it is certain that nothing can, the
+        // cast is CS0030. It was bound as whatever the two types' shapes
+        // suggested — `(string)5` as a boxing — and compiled.
+        // An interpolated string is a `string` that also becomes a
+        // `FormattableString` or a handler: what converts is the
+        // expression, not its type.
+        if let Some(cast) = self.cast_span
+            && !value.is_interpolated_string()
+            && self.conversion_is_impossible(&value.ty, ty)
+        {
+            let (from, to) = (self.display(&value.ty), self.display(ty));
+            self.report(ErrorCode::ErrNoExplicitConv, cast, &[&from, &to]);
+        }
         let converted = self.convert(value, ty);
         // The source wrote this one, so it is what the expression gives
         // rather than what something asked for: `(string)o` is a `string`,
@@ -1617,6 +1630,159 @@ impl BodyBinder<'_> {
             kind => kind,
         };
         BoundExpression::new(kind, ty.clone(), span)
+    }
+
+    /// Whether it is certain that no conversion, implicit or explicit, takes
+    /// a `from` to a `to` (CS0030).
+    ///
+    /// Certain, not likely: a cast the language has is never called
+    /// impossible here, and one it has not may be let through. So only the
+    /// plain shapes are judged — two classes neither of which derives from
+    /// the other, a struct and a class that is not one every struct boxes
+    /// to, two structs that are not both numbers — and only where no
+    /// conversion operator could be in play: none is declared by either
+    /// type or anything it derives from. Interfaces, delegates, arrays,
+    /// tuples, pointers, type parameters and `dynamic` each have rules of
+    /// their own (§10.3.5), and are left alone.
+    fn conversion_is_impossible(&self, from: &Type, to: &Type) -> bool {
+        let compilation = self.binder.compilation();
+        let symbols = compilation.symbols();
+        // `(int)b` on a `bool?` is as impossible as on a `bool`: a nullable
+        // converts as what it holds does (§10.6.1).
+        let strip = |ty: &Type| {
+            self.binder
+                .nullable_underlying(ty)
+                .unwrap_or_else(|| ty.clone())
+        };
+        let (from, to) = (strip(from), strip(to));
+        // Named types said in full: no type parameter, nothing that did not
+        // bind, no `dynamic` anywhere inside.
+        fn closed(ty: &Type) -> bool {
+            match ty {
+                Type::Named { type_arguments, .. } => type_arguments.iter().all(closed),
+                _ => false,
+            }
+        }
+        if from == to || !closed(&from) || !closed(&to) {
+            return false;
+        }
+        let (Some(from_symbol), Some(to_symbol)) = (from.symbol(), to.symbol()) else {
+            return false;
+        };
+        if self.binder.converts_implicitly(&from, &to)
+            || self.binder.converts_implicitly(&to, &from)
+            || self.binder.inline_array_of(&from).is_some()
+            || self.binder.is_union_type(&from)
+            || self.binder.is_union_type(&to)
+        {
+            return false;
+        }
+        // What every value type boxes to, and the classes arrays and
+        // delegates derive from.
+        let universal = |symbol: SymbolId| {
+            matches!(
+                symbols.qualified_name(symbol).as_str(),
+                "System.Object"
+                    | "System.ValueType"
+                    | "System.Enum"
+                    | "System.Array"
+                    | "System.Delegate"
+                    | "System.MulticastDelegate"
+                    | "System.Void"
+                    | "System.TypedReference"
+            )
+        };
+        if universal(from_symbol) || universal(to_symbol) {
+            return false;
+        }
+        // 0: a class, 1: a struct or an enum; anything else is not judged.
+        let shape = |symbol: SymbolId| {
+            let detail = symbols.get(symbol);
+            if detail
+                .as_named_type()
+                .is_some_and(|named| named.anonymous || named.ref_like)
+            {
+                return None;
+            }
+            match detail.type_kind()? {
+                TypeKind::Class | TypeKind::Record => Some(false),
+                TypeKind::Struct | TypeKind::RecordStruct | TypeKind::Enum => Some(true),
+                _ => None,
+            }
+        };
+        let (Some(from_value), Some(to_value)) = (shape(from_symbol), shape(to_symbol)) else {
+            return false;
+        };
+        // Numbers, characters, enums and native integers convert among
+        // themselves (§10.3.2, §10.3.3).
+        let number = |ty: &Type| {
+            self.binder
+                .special_of(ty)
+                .is_some_and(SpecialType::is_numeric)
+                || self.binder.enum_underlying(ty).is_some()
+                || self.binder.native_int(ty).is_some()
+        };
+        if number(&from) && number(&to) {
+            return false;
+        }
+        // A conversion operator is looked for in both types and in what
+        // they derive from, and reaches further by a standard conversion
+        // before it and after (§10.5.5): one whose parameter is related to
+        // what is cast, and whose result to what it is cast to. `string`
+        // declares one to `ReadOnlySpan<char>`, which has nothing to say
+        // about `(string)5`; where one could have, this does not say what
+        // it reaches.
+        let related = |first: &Type, second: &Type| {
+            first == second
+                || self.binder.converts_implicitly(first, second)
+                || self.binder.converts_implicitly(second, first)
+        };
+        let operator_in_play = |declaring: &Type| {
+            let Some(symbol) = declaring.symbol() else {
+                return true;
+            };
+            ["op_Implicit", "op_Explicit", "op_CheckedExplicit"]
+                .into_iter()
+                .flat_map(|name| self.binder.lookup_member(symbol, name))
+                .any(|operator| {
+                    let Some(parameter) = symbols
+                        .get(operator)
+                        .as_method()
+                        .and_then(|detail| detail.parameters.first().copied())
+                    else {
+                        return true;
+                    };
+                    let takes = self.member_type(parameter, declaring);
+                    let gives = self.member_type(operator, declaring);
+                    !closed(&strip(&takes))
+                        || !closed(&strip(&gives))
+                        || (related(&from, &strip(&takes)) && related(&strip(&gives), &to))
+                })
+        };
+        let declares_conversion = |ty: &Type| {
+            let mut current = Some(ty.clone());
+            let mut depth = 0;
+            while let Some(declaring) = current {
+                // A base said in terms of its heir's type parameters is one
+                // whose operators cannot be read here.
+                if depth > 32 || !closed(&declaring) || operator_in_play(&declaring) {
+                    return true;
+                }
+                current = declaring
+                    .symbol()
+                    .and_then(|symbol| self.binder.base_class_of(symbol));
+                depth += 1;
+            }
+            false
+        };
+        if declares_conversion(&from) || declares_conversion(&to) {
+            return false;
+        }
+        // Two classes are related or not, which the two questions above
+        // answered; a struct reaches no class but the universal ones, and
+        // no other struct at all.
+        let _ = (from_value, to_value);
+        true
     }
 
     pub(super) fn classify(&self, from: &Type, to: &Type) -> Option<ConversionKind> {
