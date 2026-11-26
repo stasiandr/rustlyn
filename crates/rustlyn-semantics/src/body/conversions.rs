@@ -11,7 +11,7 @@ use crate::bound::{
 };
 use crate::conversions::BinaryOperator;
 use crate::corlib::SpecialType;
-use crate::symbol::{RefKind, SymbolId, SymbolKind, TypeKind};
+use crate::symbol::{Modifiers, RefKind, SymbolId, SymbolKind, TypeKind};
 use crate::types::Type;
 
 impl BodyBinder<'_> {
@@ -1451,7 +1451,23 @@ impl BodyBinder<'_> {
                 span,
             );
         }
-        if let Some(converted) = self.convert_tuple_value(value.clone(), ty, true) {
+        // A tuple that no tuple conversion reaches is one error, on the
+        // cast, and not one for each element that fails to convert.
+        let impossible = self.cast_span.is_some() && self.conversion_is_impossible(&value.ty, ty);
+        let reported = if impossible {
+            self.cast_span.take()
+        } else {
+            None
+        };
+        let converted = self.convert_tuple_value(value.clone(), ty, true);
+        if let Some(cast) = reported {
+            self.cast_span = Some(cast);
+            if converted.is_some() {
+                let (from, to) = (self.display(&value.ty), self.display(ty));
+                self.report(ErrorCode::ErrNoExplicitConv, cast, &[&from, &to]);
+            }
+        }
+        if let Some(converted) = converted {
             return converted;
         }
         // A pointer and a native integer convert to each other by a
@@ -1637,13 +1653,32 @@ impl BodyBinder<'_> {
     ///
     /// Certain, not likely: a cast the language has is never called
     /// impossible here, and one it has not may be let through. So only the
-    /// plain shapes are judged — two classes neither of which derives from
-    /// the other, a struct and a class that is not one every struct boxes
-    /// to, two structs that are not both numbers — and only where no
-    /// conversion operator could be in play: none is declared by either
-    /// type or anything it derives from. Interfaces, delegates, arrays,
-    /// tuples, pointers, type parameters and `dynamic` each have rules of
-    /// their own (§10.3.5), and are left alone.
+    /// plain shapes are judged, and only where no conversion operator could
+    /// be in play: none is declared by either type or anything it derives
+    /// from.
+    ///
+    /// - Two classes neither of which derives from the other, a struct and a
+    ///   class that is not one every struct boxes to, two structs that are
+    ///   not both numbers.
+    /// - An interface and a sealed class, a delegate, a struct or an enum
+    ///   that does not implement it. A class that is not sealed may have an
+    ///   heir that does (§10.3.5), and an interface of a generic family the
+    ///   type implements another of may convert by variance, so neither is
+    ///   judged. Nor is a type whose interfaces are not all known: the
+    ///   synthesised core library gives `int` and `Enum` none.
+    /// - Two delegate types of different declarations: only the instances
+    ///   of one generic delegate convert to one another, by variance.
+    /// - Arrays: of different ranks, of elements one of which is a value
+    ///   type and the two are not one type, or of reference types that
+    ///   convert in neither direction; and an array and a class, a delegate,
+    ///   a struct or an enum that is not one an array always converts to.
+    ///   Arrays and interfaces are left alone: a vector is an `IList<T>`,
+    ///   and more.
+    /// - Tuples: of different arities, or with an element pair that nothing
+    ///   converts.
+    ///
+    /// Pointers, type parameters and `dynamic` each have rules of their own,
+    /// and are left alone.
     fn conversion_is_impossible(&self, from: &Type, to: &Type) -> bool {
         let compilation = self.binder.compilation();
         let symbols = compilation.symbols();
@@ -1655,6 +1690,48 @@ impl BodyBinder<'_> {
                 .unwrap_or_else(|| ty.clone())
         };
         let (from, to) = (strip(from), strip(to));
+        if from == to {
+            return false;
+        }
+        // Tuples convert element by element, whatever they are called:
+        // `(int, string)` is a `ValueTuple<int, string>`, written another
+        // way, and nothing else about one differs from a struct but this.
+        let is_value_tuple = |ty: &Type| {
+            ty.symbol().is_some_and(|symbol| {
+                symbols
+                    .qualified_name(symbol)
+                    .starts_with("System.ValueTuple`")
+            })
+        };
+        match (
+            self.binder.tuple_elements(&from),
+            self.binder.tuple_elements(&to),
+        ) {
+            (Some(from), Some(to)) => {
+                return from.len() != to.len()
+                    || from
+                        .iter()
+                        .zip(&to)
+                        .any(|(from, to)| self.conversion_is_impossible(from, to));
+            }
+            // A `ValueTuple` that cannot be read as a tuple is one that is
+            // not understood.
+            (None, _) if is_value_tuple(&from) => return false,
+            (_, None) if is_value_tuple(&to) => return false,
+            _ => {}
+        }
+        let as_struct = |ty: &Type| match ty {
+            Type::Tuple(elements) => self.binder.value_tuple_of(
+                &elements
+                    .iter()
+                    .map(|element| element.ty.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            other => Some(other.clone()),
+        };
+        let (Some(from), Some(to)) = (as_struct(&from), as_struct(&to)) else {
+            return false;
+        };
         // Named types said in full: no type parameter, nothing that did not
         // bind, no `dynamic` anywhere inside.
         fn closed(ty: &Type) -> bool {
@@ -1663,13 +1740,25 @@ impl BodyBinder<'_> {
                 _ => false,
             }
         }
-        if from == to || !closed(&from) || !closed(&to) {
-            return false;
+        // The same, and arrays of them.
+        fn known(ty: &Type) -> bool {
+            match ty {
+                Type::Array { element, .. } => known(element),
+                other => closed(other),
+            }
         }
-        let (Some(from_symbol), Some(to_symbol)) = (from.symbol(), to.symbol()) else {
-            return false;
-        };
-        if self.binder.converts_implicitly(&from, &to)
+        fn mentions_tuple(ty: &Type) -> bool {
+            match ty {
+                Type::Tuple(_) => true,
+                Type::Array { element, .. } => mentions_tuple(element),
+                Type::Named { type_arguments, .. } => type_arguments.iter().any(mentions_tuple),
+                _ => false,
+            }
+        }
+        if from == to
+            || !known(&from)
+            || !known(&to)
+            || self.binder.converts_implicitly(&from, &to)
             || self.binder.converts_implicitly(&to, &from)
             || self.binder.inline_array_of(&from).is_some()
             || self.binder.is_union_type(&from)
@@ -1677,6 +1766,45 @@ impl BodyBinder<'_> {
         {
             return false;
         }
+        // Arrays of one rank convert when what they hold does: an explicit
+        // reference conversion between reference types, and nothing between
+        // value types that are not one type (§10.3.5). No operator is in
+        // play: neither is a type that could declare one.
+        if let (
+            Type::Array {
+                element: from_element,
+                rank: from_rank,
+            },
+            Type::Array {
+                element: to_element,
+                rank: to_rank,
+            },
+        ) = (&from, &to)
+        {
+            if from_rank != to_rank {
+                return true;
+            }
+            if from_element.is_reference_type(symbols) && to_element.is_reference_type(symbols) {
+                return self.conversion_is_impossible(from_element, to_element);
+            }
+            // `(int, int)` and `ValueTuple<int, int>` are one type.
+            return !mentions_tuple(from_element) && !mentions_tuple(to_element);
+        }
+        // For an array and something else, the something else.
+        let (from_symbol, to_symbol) = match (&from, &to) {
+            (Type::Array { .. }, other) | (other, Type::Array { .. }) => {
+                let Some(symbol) = other.symbol() else {
+                    return false;
+                };
+                (symbol, symbol)
+            }
+            _ => {
+                let (Some(from_symbol), Some(to_symbol)) = (from.symbol(), to.symbol()) else {
+                    return false;
+                };
+                (from_symbol, to_symbol)
+            }
+        };
         // What every value type boxes to, and the classes arrays and
         // delegates derive from.
         let universal = |symbol: SymbolId| {
@@ -1695,7 +1823,15 @@ impl BodyBinder<'_> {
         if universal(from_symbol) || universal(to_symbol) {
             return false;
         }
-        // 0: a class, 1: a struct or an enum; anything else is not judged.
+        // What a type is, as far as a cast between two of them cares;
+        // anything else is not judged.
+        #[derive(PartialEq, Clone, Copy)]
+        enum Shape {
+            Class,
+            Value,
+            Delegate,
+            Interface,
+        }
         let shape = |symbol: SymbolId| {
             let detail = symbols.get(symbol);
             if detail
@@ -1705,12 +1841,13 @@ impl BodyBinder<'_> {
                 return None;
             }
             match detail.type_kind()? {
-                TypeKind::Class | TypeKind::Record => Some(false),
-                TypeKind::Struct | TypeKind::RecordStruct | TypeKind::Enum => Some(true),
-                _ => None,
+                TypeKind::Class | TypeKind::Record => Some(Shape::Class),
+                TypeKind::Struct | TypeKind::RecordStruct | TypeKind::Enum => Some(Shape::Value),
+                TypeKind::Delegate => Some(Shape::Delegate),
+                TypeKind::Interface => Some(Shape::Interface),
             }
         };
-        let (Some(from_value), Some(to_value)) = (shape(from_symbol), shape(to_symbol)) else {
+        let (Some(from_shape), Some(to_shape)) = (shape(from_symbol), shape(to_symbol)) else {
             return false;
         };
         // Numbers, characters, enums and native integers convert among
@@ -1775,13 +1912,97 @@ impl BodyBinder<'_> {
             }
             false
         };
+        let from_array = matches!(from, Type::Array { .. });
+        if from_array || matches!(to, Type::Array { .. }) {
+            // An array reaches `object` and `Array`, which are universal
+            // above, and the interfaces a vector implements, which are not
+            // judged; no class, delegate, struct or enum is one.
+            let (other, other_shape) = if from_array {
+                (&to, to_shape)
+            } else {
+                (&from, from_shape)
+            };
+            return other_shape != Shape::Interface && !declares_conversion(other);
+        }
+        // Two interfaces convert, one way or the other, whatever they are.
+        if from_shape == Shape::Interface && to_shape == Shape::Interface {
+            return false;
+        }
+        if from_shape == Shape::Interface || to_shape == Shape::Interface {
+            let (other, other_shape, interface) = if from_shape == Shape::Interface {
+                (&to, to_shape, &from)
+            } else {
+                (&from, from_shape, &to)
+            };
+            // A class that is not sealed may have an heir that implements
+            // it (§10.3.5); a struct, an enum and a delegate have none.
+            let sealed = other_shape != Shape::Class
+                || other.symbol().is_some_and(|symbol| {
+                    symbols.get(symbol).modifiers.contains(Modifiers::SEALED)
+                });
+            return sealed
+                && self.implements_nothing_like(other, interface)
+                && !declares_conversion(&from)
+                && !declares_conversion(&to);
+        }
+        // Delegates convert to one another only where they are one generic
+        // declaration, by variance.
+        if from_shape == Shape::Delegate && to_shape == Shape::Delegate && from_symbol == to_symbol
+        {
+            return false;
+        }
         if declares_conversion(&from) || declares_conversion(&to) {
             return false;
         }
-        // Two classes are related or not, which the two questions above
-        // answered; a struct reaches no class but the universal ones, and
-        // no other struct at all.
-        let _ = (from_value, to_value);
+        // Two classes (or delegates) are related or not, which the two
+        // questions above answered; a struct reaches no class but the
+        // universal ones, and no other struct at all.
+        true
+    }
+
+    /// Whether it is certain that `ty` implements no interface of the
+    /// family `to` is one of: an instance of it converts to `to`, or from
+    /// it, by identity or by variance, and nothing else does.
+    ///
+    /// Certain only where everything `ty` derives from has its interfaces
+    /// listed, which the synthesised core library's types do not: its `int`
+    /// lists none, nor does its `Enum`. `object` and `ValueType` list none
+    /// in the real one either.
+    fn implements_nothing_like(&self, ty: &Type, to: &Type) -> bool {
+        let compilation = self.binder.compilation();
+        let symbols = compilation.symbols();
+        let synthesised = |symbol: SymbolId| {
+            compilation.is_from_corlib(symbol) && !compilation.is_from_metadata(symbol)
+        };
+        let Some(wanted) = to.symbol() else {
+            return false;
+        };
+        if synthesised(wanted) || self.binder.co_class(wanted).is_some() {
+            return false;
+        }
+        let mut pending = vec![ty.clone()];
+        let mut seen = Vec::new();
+        while let Some(next) = pending.pop() {
+            let Some(symbol) = next.symbol() else {
+                return false;
+            };
+            if seen.contains(&symbol) {
+                continue;
+            }
+            seen.push(symbol);
+            if symbol == wanted || seen.len() > 256 {
+                return false;
+            }
+            if synthesised(symbol)
+                && !matches!(
+                    symbols.qualified_name(symbol).as_str(),
+                    "System.Object" | "System.ValueType"
+                )
+            {
+                return false;
+            }
+            pending.extend(self.binder.direct_bases(&next));
+        }
         true
     }
 

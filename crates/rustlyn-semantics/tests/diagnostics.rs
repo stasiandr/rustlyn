@@ -2518,8 +2518,6 @@ fn a_cast_the_language_has_is_not_cs0030() {
         "(I)im",
         "(Impl)it",
         "(I)o",
-        "(I)st",
-        "(Sealed)it",
         // Nullables.
         "(int?)i",
         "(int)ni",
