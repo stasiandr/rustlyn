@@ -777,6 +777,7 @@ impl BodyBinder<'_> {
         }
         // Parentheses, `checked` and `unchecked` bind to what they hold, and
         // the error is about that: `byte b = unchecked(256);` is at the 256.
+        let original = node;
         let node = &inside_wrappers(node);
         // `stackalloc T[n]` reaches a `Span<T>` (§12.8.22).
         if let BoundExpressionKind::StackAlloc { element, .. } = &value.kind
@@ -834,6 +835,49 @@ impl BodyBinder<'_> {
                     node.span(),
                     &[&number.to_string(), &to],
                 );
+                return;
+            }
+            // A negative `long` constant is no `ulong` either, and is the
+            // value's error as well: only that pair of types converts a
+            // constant of a `long` (a `uint` target is CS0266).
+            if self.binder.special_of(from) == Some(SpecialType::Int64)
+                && self.binder.special_of(to) == Some(SpecialType::UInt64)
+                && let Some(number) = self
+                    .binder
+                    .folded(value)
+                    .as_ref()
+                    .and_then(crate::constant::as_exact)
+                && number < 0
+            {
+                let to = self.display(to);
+                self.report(
+                    ErrorCode::ErrConstOutOfRange,
+                    node.span(),
+                    &[&number.to_string(), &to],
+                );
+                return;
+            }
+            // A `double` literal, as written, where a `float` or a `decimal`
+            // is wanted: it wants its suffix.
+            let suffix = match self.binder.special_of(to) {
+                Some(SpecialType::Single) => Some("F"),
+                Some(SpecialType::Decimal) => Some("M"),
+                _ => None,
+            };
+            let mut literal = original.clone();
+            while literal.kind() == SyntaxKind::ParenthesizedExpression
+                && let Some(inner) = literal
+                    .children()
+                    .find(|child| child.kind().is_expression())
+            {
+                literal = inner;
+            }
+            if self.binder.special_of(from) == Some(SpecialType::Double)
+                && literal.kind() == SyntaxKind::NumericLiteralExpression
+                && let Some(suffix) = suffix
+            {
+                let to = self.display(to);
+                self.report(ErrorCode::ErrLiteralDoubleCast, node.span(), &[suffix, &to]);
                 return;
             }
             let code = if self.converts_explicitly(from, to) {

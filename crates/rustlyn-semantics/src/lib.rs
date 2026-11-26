@@ -13,6 +13,7 @@ mod compilation;
 mod constant;
 mod conversions;
 mod corlib;
+mod decimal;
 mod declare;
 mod definite;
 mod delegates;

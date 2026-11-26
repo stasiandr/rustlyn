@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use rustlyn_semantics::{Compilation, SymbolKind, Type};
+use rustlyn_semantics::{Binder, Compilation, SpecialConstant, SymbolId, SymbolKind, Type};
 
 /// The shared framework directory to read assemblies out of, if there is one.
 fn framework() -> Option<PathBuf> {
@@ -1082,4 +1082,256 @@ class Triangulation
 }"
     );
     assert_eq!(error_codes(&compilation), Vec::<String>::new());
+}
+
+/// The constant at `path`, as the debugger would print it.
+fn constant_at(compilation: &Compilation, path: &str) -> Option<String> {
+    Binder::new(compilation)
+        .constant_value(symbol_at(compilation, path))
+        .map(|value| format!("{value:?}"))
+}
+
+fn symbol_at(compilation: &Compilation, path: &str) -> SymbolId {
+    compilation
+        .symbols()
+        .iter()
+        .find(|symbol| compilation.symbols().qualified_name(symbol.id) == path)
+        .unwrap_or_else(|| panic!("no symbol named {path}"))
+        .id
+}
+
+/// The scale, sign and the three words a `decimal` constant is made of, as
+/// `[DecimalConstant]` holds them.
+fn decimal_at(compilation: &Compilation, path: &str) -> Option<(u8, bool, u32, u32, u32)> {
+    match Binder::new(compilation).special_constant(symbol_at(compilation, path))? {
+        SpecialConstant::Decimal {
+            scale,
+            negative,
+            hi,
+            mid,
+            lo,
+        } => Some((scale, negative, hi, mid, lo)),
+        SpecialConstant::DateTime(_) => None,
+    }
+}
+
+/// The codes of the errors of a program, in the order of where they are.
+fn errors_in_order(compilation: &Compilation) -> Vec<String> {
+    let mut found: Vec<_> = compilation
+        .semantic_diagnostics()
+        .into_iter()
+        .map(|entry| entry.diagnostic)
+        .filter(|diagnostic| diagnostic.is_error())
+        .collect();
+    found.sort_by_key(|diagnostic| diagnostic.span().start());
+    found
+        .iter()
+        .map(|diagnostic| diagnostic.code().to_string())
+        .collect()
+}
+
+#[test]
+fn a_decimal_constant_is_what_system_decimal_works_it_out_to() {
+    // The words below are what `decimal.GetBits` gave in the framework for
+    // each of these, which is what Roslyn writes into `[DecimalConstant]`.
+    let source = "enum E : byte { A = 3, B = 200 }
+    class C {
+        const decimal L = (decimal)3.5;
+        const decimal N = 100m / 3;
+        const decimal T = 10 / 4m;
+        const decimal V = (decimal)1.5f;
+        const decimal W = -(decimal)0.25;
+        const decimal Third = 1m / 3;
+        const decimal TwoThirds = 2m / 3;
+        const decimal Trailing = 1.50m;
+        const decimal Product = 1.5m * 2.0m;
+        const decimal NegZero = -0m;
+        const decimal NegZeroProduct = 1m * -0m;
+        const decimal Max = decimal.MaxValue;
+        const decimal Min = decimal.MinValue;
+        const decimal NearMax = decimal.MaxValue - 0.4m;
+        const decimal Tiny = 0.0000000000000000000000000001m * 0.1m;
+        const decimal Sum = 0.1m + 0.20m;
+        const decimal Rem = 5.5m % 2m;
+        const decimal RemNeg = -7m % 3m;
+        const decimal FromFloat = (decimal)0.1f;
+        const decimal FromDouble = (decimal)0.1;
+        const decimal FromBig = (decimal)1.2345678901234567e20;
+        const decimal FromSmall = (decimal)1e-5;
+        const decimal FromLost = (decimal)1e-30;
+        const decimal FromEnum = (decimal)E.B + 1;
+        const decimal FromChar = 'a' + 0.5m;
+        const decimal Nested = ((1.5m + 2) * (3 - 1m)) / 4;
+        const decimal Unary = +(-L);
+    }";
+    let (_, compilation) = against_corlib!(source);
+    let all = u32::MAX;
+    let expected = [
+        ("L", (1, false, 0, 0, 35)),
+        ("N", (27, false, 1_807_003_620, 3_475_376_110, 894_784_853)),
+        ("T", (1, false, 0, 0, 25)),
+        ("V", (1, false, 0, 0, 15)),
+        ("W", (2, true, 0, 0, 25)),
+        ("Third", (28, false, 180_700_362, 347_537_611, 89_478_485)),
+        (
+            "TwoThirds",
+            (28, false, 361_400_724, 695_075_222, 178_956_971),
+        ),
+        ("Trailing", (2, false, 0, 0, 150)),
+        ("Product", (2, false, 0, 0, 300)),
+        ("NegZero", (0, true, 0, 0, 0)),
+        ("NegZeroProduct", (0, true, 0, 0, 0)),
+        ("Max", (0, false, all, all, all)),
+        ("Min", (0, true, all, all, all)),
+        ("NearMax", (0, false, all, all, all)),
+        ("Tiny", (28, false, 0, 0, 0)),
+        ("Sum", (2, false, 0, 0, 30)),
+        ("Rem", (1, false, 0, 0, 15)),
+        ("RemNeg", (0, true, 0, 0, 1)),
+        ("FromFloat", (1, false, 0, 0, 1)),
+        ("FromDouble", (1, false, 0, 0, 1)),
+        ("FromBig", (0, false, 6, 2_974_719_873, 792_416_896)),
+        ("FromSmall", (5, false, 0, 0, 1)),
+        ("FromLost", (0, false, 0, 0, 0)),
+        ("FromEnum", (0, false, 0, 0, 201)),
+        ("FromChar", (1, false, 0, 0, 975)),
+        ("Nested", (2, false, 0, 0, 175)),
+        ("Unary", (1, true, 0, 0, 35)),
+    ];
+    for (name, parts) in expected {
+        assert_eq!(
+            decimal_at(&compilation, &format!("C.{name}")),
+            Some(parts),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_decimal_cast_to_another_type_or_compared_is_a_constant_of_it() {
+    let (_, compilation) = against_corlib!(
+        "class C {
+            const decimal L = 3.5m;
+            const int ToInt = (int)3.7m;
+            const long ToLong = (long)-3.7m;
+            const byte ToByte = (byte)255.9m;
+            const char ToChar = (char)65.5m;
+            const double ToDouble = (double)(1m / 3);
+            const float ToFloat = (float)0.1m;
+            const bool Less = 1m < 2m;
+            const bool Same = 1.0m == 1.00m;
+            const bool Other = L != 2.5m;
+            const int FromField = (int)(L * 2);
+        }"
+    );
+    let found: Vec<Option<String>> = [
+        "ToInt",
+        "ToLong",
+        "ToByte",
+        "ToChar",
+        "ToDouble",
+        "ToFloat",
+        "Less",
+        "Same",
+        "Other",
+        "FromField",
+    ]
+    .iter()
+    .map(|name| constant_at(&compilation, &format!("C.{name}")))
+    .collect();
+    assert_eq!(
+        found,
+        [
+            "Int32(3)",
+            "Int64(-3)",
+            "Int32(255)",
+            "Char('A')",
+            "Double(0.33333333333333337)",
+            "Single(0.1)",
+            "Boolean(true)",
+            "Boolean(true)",
+            "Boolean(true)",
+            "Int32(7)"
+        ]
+        .map(|text| Some(text.to_string()))
+    );
+}
+
+#[test]
+fn a_decimal_default_value_that_is_worked_out_is_a_constant() {
+    // Neither the cast from a `double` nor the division was folded, and both
+    // were taken for something that is not constant (CS1736).
+    let (_, compilation) = against_corlib!(
+        "enum E { A = 3 }
+        class C {
+            const decimal L = (decimal)3.5;
+            static void D(decimal a = (decimal)3.5, decimal b = 100m / 3, decimal c = 10 / 4m,
+                decimal? d = (decimal)1.5f, decimal e = -(decimal)0.25, decimal f = 1m % 3,
+                decimal g = (decimal)E.A, decimal h = L * 2, decimal i = decimal.MaxValue,
+                decimal j = decimal.MinusOne, int k = (int)3.5m, double l = (double)1.5m,
+                bool m = 1m < 2m) { }
+        }"
+    );
+    assert_eq!(errors_in_order(&compilation), Vec::<String>::new());
+    // What is no constant still is none.
+    let (_, compilation) = against_corlib!(
+        "class C { static decimal Four() => 4; static void D(decimal a = Four() / 2) { } }"
+    );
+    assert_eq!(errors_in_order(&compilation), ["CS1736"]);
+}
+
+#[test]
+fn a_decimal_constant_that_cannot_be_held_is_an_error_of_its_own() {
+    let (_, compilation) = against_corlib!(
+        "class C {
+            const decimal A = decimal.MaxValue * 2;
+            const decimal B = 1m / 0;
+            const decimal D = 5m % 0;
+            const decimal E = (decimal)1e40;
+            const decimal F = (decimal)double.NaN;
+            const int G = (int)1e10m;
+            const uint H = (uint)-1m;
+            const decimal I = decimal.MinValue - 1;
+            const int J = unchecked((int)1e10m);
+            const decimal Fine = (decimal)1e-30 + 1m / 3;
+        }"
+    );
+    assert_eq!(
+        errors_in_order(&compilation),
+        [
+            "CS0463", "CS0020", "CS0020", "CS0031", "CS0031", "CS0031", "CS0031", "CS0463",
+            "CS0031"
+        ]
+    );
+    // A default value that fails to work out says that, and no more.
+    let (_, compilation) = against_corlib!(
+        "class C { static void D(decimal a = decimal.MaxValue * 2, decimal b = 1m / 0,
+            decimal c = (decimal)1e40, int d = (int)1e10m) { } }"
+    );
+    assert_eq!(
+        errors_in_order(&compilation),
+        ["CS0463", "CS0020", "CS0031", "CS0031"]
+    );
+}
+
+#[test]
+fn a_const_set_from_a_property_or_a_call_is_cs0133() {
+    let (_, compilation) = against_corlib!(
+        "class C {
+            const nint Max = nint.MaxValue;
+            const nuint UMax = nuint.MaxValue;
+            const nint Min = nint.MinValue;
+            const int Cast = (int)nint.MaxValue;
+            static int Q => 1;
+            static int M() => 1;
+            const int FromProperty = Q;
+            const int FromCall = M();
+            const nint Five = 5;
+            const nint Sum = Five + 1;
+            const nint Zero = default;
+            const int Size = int.MaxValue / 2;
+            const string Text = \"a\" + nameof(Q);
+        }"
+    );
+    assert_eq!(errors_in_order(&compilation), ["CS0133"; 6]);
 }

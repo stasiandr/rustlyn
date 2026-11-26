@@ -285,3 +285,45 @@ fn a_chain_of_thousands_of_constants_binds_in_linear_time() {
         );
     });
 }
+
+/// The codes of the errors a file has, in the order of where they are.
+fn error_codes(source: &str) -> Vec<String> {
+    let compilation = compile(source);
+    let mut found: Vec<_> = compilation
+        .semantic_diagnostics()
+        .into_iter()
+        .map(|entry| entry.diagnostic)
+        .filter(|diagnostic| diagnostic.is_error())
+        .collect();
+    found.sort_by_key(|diagnostic| diagnostic.span().start());
+    found
+        .iter()
+        .map(|diagnostic| diagnostic.code().to_string())
+        .collect()
+}
+
+#[test]
+fn a_constant_out_of_the_range_of_its_type_is_the_values_error() {
+    assert_eq!(
+        error_codes(
+            "class C { void M() {
+                ulong a = -1L;
+                ulong b = (long)-1;
+                const long cl = -5;
+                ulong c = cl;
+                ulong fine = 5L;
+                uint d = -1L;
+                float e = 1e40;
+                float f = (1.5);
+                decimal g = 1.5;
+                decimal h = 5d;
+                float i = -1.5;
+                float j = 1.5 + 1;
+            } }"
+        ),
+        [
+            "CS0031", "CS0031", "CS0031", "CS0266", "CS0664", "CS0664", "CS0664", "CS0664",
+            "CS0266", "CS0266"
+        ]
+    );
+}

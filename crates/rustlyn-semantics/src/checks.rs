@@ -175,6 +175,16 @@ impl Checker<'_> {
                     }
                 }
                 Detail::Namespace => {}
+                Detail::Field(detail)
+                    if detail.has_initializer
+                        && symbol.modifiers.contains(Modifiers::CONST)
+                        && symbol
+                            .locations
+                            .first()
+                            .is_some_and(|location| self.covers(location.tree)) =>
+                {
+                    self.constant_initializer(symbol.id, &mut sink);
+                }
                 Detail::Parameter(detail) => {
                     if symbol
                         .locations
@@ -201,6 +211,86 @@ impl Checker<'_> {
         self.found.extend(sink);
     }
 
+    /// CS0133: a `const` field set from a call or a property, which is
+    /// never a constant: `const nint Max = nint.MaxValue;`. Only a value
+    /// written as a member access or a call, perhaps cast or in parentheses,
+    /// is looked at, and only these two are said not to be constants; what
+    /// else may not be is left to whatever else says so.
+    fn constant_initializer(&self, field: SymbolId, sink: &mut Diagnostics) {
+        let compilation = self.compilation;
+        let Some((tree, span)) = compilation.declaration_nodes(field).first().copied() else {
+            return;
+        };
+        let Some(node) = compilation
+            .trees()
+            .get(tree)
+            .and_then(|tree| tree.root().find_node(span))
+        else {
+            return;
+        };
+        let Some(expression) = node
+            .child_of_kind(SyntaxKind::EqualsValueClause)
+            .and_then(|clause| clause.children().find(|child| child.kind().is_expression()))
+        else {
+            return;
+        };
+        let mut inner = expression.clone();
+        while matches!(
+            inner.kind(),
+            SyntaxKind::ParenthesizedExpression | SyntaxKind::CastExpression
+        ) && let Some(next) = inner
+            .children()
+            .filter(|child| child.kind().is_expression())
+            .last()
+        {
+            inner = next;
+        }
+        if !matches!(
+            inner.kind(),
+            SyntaxKind::SimpleMemberAccessExpression
+                | SyntaxKind::InvocationExpression
+                | SyntaxKind::IdentifierName
+        ) {
+            return;
+        }
+        let body = crate::body::BodyBinder::bind_member(&self.binder, tree, &node);
+        let Some(mut value) = body
+            .statements
+            .iter()
+            .find_map(|statement| match &statement.kind {
+                crate::bound::BoundStatementKind::Return(Some(value)) => Some(value.clone()),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        if !body.diagnostics.is_empty() || has_error_part(&value) {
+            return;
+        }
+        while let BoundExpressionKind::Conversion { operand, .. } = value.kind {
+            value = *operand;
+        }
+        let symbols = compilation.symbols();
+        let not_constant = match &value.kind {
+            BoundExpressionKind::Property { .. } => true,
+            BoundExpressionKind::Call { method, .. } => {
+                !symbols.get(*method).name.starts_with("op_")
+            }
+            _ => false,
+        };
+        if not_constant {
+            let name = symbols.get(field).name.clone();
+            sink.push((
+                tree,
+                Diagnostic::new(
+                    ErrorCode::ErrNotConstantExpression,
+                    expression.span(),
+                    &[&name],
+                ),
+            ));
+        }
+    }
+
     /// CS1736: a parameter's `= value` has to be a constant, a `default`, or
     /// a `new S()` of a struct, which is its default written another way.
     fn default_value(&self, parameter: SymbolId, sink: &mut Diagnostics) {
@@ -217,8 +307,18 @@ impl Checker<'_> {
         if self.binder.special_constant(parameter).is_some() {
             return;
         }
-        let value =
-            crate::body::BodyBinder::bind_lone_expression(&self.binder, tree, &node, &expression);
+        let (value, errors) = crate::body::BodyBinder::bind_lone_expression_with_constant_errors(
+            &self.binder,
+            tree,
+            &node,
+            &expression,
+        );
+        // A `decimal` that overflows, or a cast it does not fit, is that
+        // error and not a second one about a default.
+        if !errors.is_empty() {
+            sink.extend(errors);
+            return;
+        }
         if has_error_part(&value) || self.decimal_constant(&value) || !self.bad_default(&value) {
             return;
         }
@@ -251,8 +351,33 @@ impl Checker<'_> {
                         .iter()
                         .all(|argument| self.binder.folded(argument).is_some())
             }
+            // An operation on `decimal` constants that is left for run time
+            // because .NET's answer is not known here is as much a constant.
+            BoundExpressionKind::Binary { left, right, .. } => {
+                self.binder.special_of(&value.ty) == Some(crate::SpecialType::Decimal)
+                    && self.decimal_operand(left)
+                    && self.decimal_operand(right)
+            }
+            BoundExpressionKind::Call {
+                method, arguments, ..
+            } => {
+                self.binder.special_of(&value.ty) == Some(crate::SpecialType::Decimal)
+                    && self
+                        .compilation
+                        .symbols()
+                        .get(*method)
+                        .name
+                        .starts_with("op_")
+                    && arguments
+                        .iter()
+                        .all(|argument| self.decimal_operand(argument))
+            }
             _ => false,
         }
+    }
+
+    fn decimal_operand(&self, value: &BoundExpression) -> bool {
+        self.decimal_constant(value) || self.binder.decimal_constant(value).is_some()
     }
 
     /// Whether a default value is plainly no constant.

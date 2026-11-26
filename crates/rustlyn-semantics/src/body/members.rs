@@ -250,6 +250,36 @@ impl<'a> BodyBinder<'a> {
         body_binder.bind_expression(expression)
     }
 
+    /// [`Self::bind_lone_expression`], and what a constant in the
+    /// expression got wrong while it was bound: a `decimal` operation that
+    /// overflows or divides by zero, or a cast that does not fit.
+    pub fn bind_lone_expression_with_constant_errors(
+        binder: &'a Binder<'a>,
+        tree: usize,
+        declaration: &SyntaxNode,
+        expression: &SyntaxNode,
+    ) -> (BoundExpression, crate::binder::Diagnostics) {
+        let context = binder.context_at(tree, declaration);
+        let member = binder.declared_symbol_at(tree, declaration);
+        let mut body_binder = Self::new(binder, tree, context, member, false);
+        let value = body_binder.bind_expression(expression);
+        let errors = body_binder
+            .body
+            .diagnostics
+            .iter()
+            .filter(|(_, diagnostic)| {
+                matches!(
+                    diagnostic.code(),
+                    rustlyn_diagnostics::ErrorCode::ErrDecimalConstantFailed
+                        | rustlyn_diagnostics::ErrorCode::ErrIntDivByZero
+                        | rustlyn_diagnostics::ErrorCode::ErrConstOutOfRange
+                )
+            })
+            .cloned()
+            .collect();
+        (value, errors)
+    }
+
     pub fn bind_member(binder: &'a Binder<'a>, tree: usize, declaration: &SyntaxNode) -> BoundBody {
         Self::bind_member_as(binder, tree, declaration, false)
     }

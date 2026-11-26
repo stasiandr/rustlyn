@@ -12,6 +12,7 @@ use crate::bound::{
     ConstantValue, DynamicUnary, IncrementOperator, UnaryOperator,
 };
 use crate::corlib::SpecialType;
+use crate::decimal::{Decimal, DecimalError};
 use crate::symbol::{Modifiers, RefKind, SymbolKind};
 use crate::types::{TupleElement, Type};
 
@@ -367,175 +368,173 @@ impl BodyBinder<'_> {
         self.make(&decimal, parts, span)
     }
 
-    /// A `decimal` operation on constants as the constant it gives, where
-    /// the answer is exact: `1m * -0m` is `-0m`, and `(double)(-0m)` is
-    /// `-0.0`. Roslyn folds both, and the sign of a zero is visible only
-    /// through them — one written out as a `decimal` is `0`.
+    /// A `decimal` operation on constants as the constant it gives, worked
+    /// out the way .NET works it out (see `decimal.rs`), as Roslyn works it
+    /// out: `10 / 4m` is `2.5`, `(decimal)3.5` is `3.5`, `1m * -0m` is
+    /// `-0m`, `(int)3.7m` is `3`, and `(double)(-0m)` is `-0.0`. An answer
+    /// the type cannot hold is an error (CS0463, CS0031) and one divided by
+    /// zero is another (CS0020); where this cannot say what .NET says, the
+    /// operation is left for run time.
     pub(super) fn fold_decimal(&mut self, expression: BoundExpression) -> BoundExpression {
-        let magnitude = |lo: u32, mid: u32, hi: u32| {
-            u128::from(hi) << 64 | u128::from(mid) << 32 | u128::from(lo)
-        };
+        use crate::conversions::BinaryOperator as Op;
+        let span = expression.span;
         // An operator on `decimal`s is bound as one, or as the call of the
         // `op_Multiply` or `op_Addition` `System.Decimal` declares.
-        let arithmetic = decimal_arithmetic(self.binder.compilation().symbols(), &expression)
-            .filter(|_| self.binder.special_of(&expression.ty) == Some(SpecialType::Decimal));
-        match &expression.kind {
-            _ if let Some((crate::conversions::BinaryOperator::Multiply, left, right)) =
-                arithmetic =>
-            {
-                let (
-                    Some(crate::bound::SpecialConstant::Decimal {
-                        scale: left_scale,
-                        negative: left_negative,
-                        hi: left_hi,
-                        mid: left_mid,
-                        lo: left_lo,
-                    }),
-                    Some(crate::bound::SpecialConstant::Decimal {
-                        scale: right_scale,
-                        negative: right_negative,
-                        hi: right_hi,
-                        mid: right_mid,
-                        lo: right_lo,
-                    }),
-                ) = (
-                    self.binder.decimal_constant(left),
-                    self.binder.decimal_constant(right),
-                )
-                else {
-                    return expression;
-                };
-                let Some(product) = magnitude(left_lo, left_mid, left_hi)
-                    .checked_mul(magnitude(right_lo, right_mid, right_hi))
-                else {
-                    return expression;
-                };
-                let scale = left_scale + right_scale;
-                // Anything the runtime would round is left to it.
-                if product >> 96 != 0 || scale > 28 {
-                    return expression;
+        if let Some((operator, left, right)) =
+            decimal_arithmetic(self.binder.compilation().symbols(), &expression)
+            && self.binder.special_of(&left.ty) == Some(SpecialType::Decimal)
+            && self.binder.special_of(&right.ty) == Some(SpecialType::Decimal)
+        {
+            let (Some(b), Some(a)) = (self.decimal_operand(right), self.decimal_operand(left))
+            else {
+                return expression;
+            };
+            let ordering = a.compare(&b);
+            let result = match operator {
+                Op::Add => a.add(b),
+                Op::Subtract => a.sub(b),
+                Op::Multiply => a.mul(b),
+                Op::Divide => a.div(b),
+                Op::Modulo => a.rem(b),
+                Op::Equality
+                | Op::Inequality
+                | Op::LessThan
+                | Op::LessThanOrEqual
+                | Op::GreaterThan
+                | Op::GreaterThanOrEqual => {
+                    let holds = match operator {
+                        Op::Equality => ordering.is_eq(),
+                        Op::Inequality => ordering.is_ne(),
+                        Op::LessThan => ordering.is_lt(),
+                        Op::LessThanOrEqual => ordering.is_le(),
+                        Op::GreaterThan => ordering.is_gt(),
+                        _ => ordering.is_ge(),
+                    };
+                    return BoundExpression::new(
+                        BoundExpressionKind::Literal(ConstantValue::Boolean(holds)),
+                        expression.ty.clone(),
+                        span,
+                    );
                 }
-                let span = expression.span;
-                self.decimal_expression(
-                    product as u32,
-                    (product >> 32) as u32,
-                    (product >> 64) as u32,
-                    left_negative != right_negative,
-                    scale,
-                    span,
-                )
-                .unwrap_or(expression)
-            }
-            // `-0m + 0m` is `-0m`: .NET keeps the left operand's sign where
-            // the right one does not outweigh it, a zero's included, and
-            // Roslyn folds with .NET's arithmetic.
-            _ if let Some((
-                operator @ (crate::conversions::BinaryOperator::Add
-                | crate::conversions::BinaryOperator::Subtract),
-                left,
-                right,
-            )) = arithmetic =>
-            {
-                let parts = |value: Option<crate::bound::SpecialConstant>| match value {
-                    Some(crate::bound::SpecialConstant::Decimal {
-                        scale,
-                        negative,
-                        hi,
-                        mid,
-                        lo,
-                    }) => Some((magnitude(lo, mid, hi), negative, scale)),
-                    _ => None,
-                };
-                let (Some((mut a, a_negative, a_scale)), Some((mut b, b_negative, b_scale))) = (
-                    parts(self.binder.decimal_constant(left)),
-                    parts(self.binder.decimal_constant(right)),
-                ) else {
-                    return expression;
-                };
-                let b_negative =
-                    b_negative != (operator == crate::conversions::BinaryOperator::Subtract);
-                let scale = a_scale.max(b_scale);
-                let widen = |value: u128, by: u8| {
-                    10u128
-                        .checked_pow(u32::from(by))
-                        .and_then(|factor| value.checked_mul(factor))
-                        .filter(|value| value >> 96 == 0)
-                };
-                let (Some(wide_a), Some(wide_b)) =
-                    (widen(a, scale - a_scale), widen(b, scale - b_scale))
-                else {
-                    return expression;
-                };
-                (a, b) = (wide_a, wide_b);
-                let (sum, negative) = if a_negative == b_negative {
-                    (a + b, a_negative)
-                } else if b > a {
-                    (b - a, b_negative)
-                } else {
-                    (a - b, a_negative)
-                };
-                if sum >> 96 != 0 {
-                    return expression;
+                _ => return expression,
+            };
+            return match result {
+                Ok(value) => self.decimal_literal(value, span).unwrap_or(expression),
+                Err(DecimalError::Overflow) => {
+                    self.report(ErrorCode::ErrDecimalConstantFailed, span, &[]);
+                    expression
                 }
-                let span = expression.span;
-                self.decimal_expression(
-                    sum as u32,
-                    (sum >> 32) as u32,
-                    (sum >> 64) as u32,
-                    negative,
-                    scale,
-                    span,
-                )
-                .unwrap_or(expression)
-            }
-            // The conversion may be bound as one, or as the `op_Explicit`
-            // `System.Decimal` declares for it.
-            _ if let Some(operand) =
-                decimal_conversion_operand(self.binder.compilation().symbols(), &expression)
-                && self.binder.special_of(&operand.ty) == Some(SpecialType::Decimal) =>
-            {
-                let target = self.binder.special_of(&expression.ty);
-                if !matches!(target, Some(SpecialType::Double | SpecialType::Single)) {
-                    return expression;
+                Err(DecimalError::DivideByZero) => {
+                    self.report(ErrorCode::ErrIntDivByZero, span, &[]);
+                    expression
                 }
-                let Some(crate::bound::SpecialConstant::Decimal {
-                    scale: 0,
-                    negative,
-                    hi,
-                    mid,
-                    lo,
-                }) = self.binder.decimal_constant(operand)
-                else {
-                    return expression;
-                };
-                // A whole number a `float` or `double` holds exactly.
-                let whole = magnitude(lo, mid, hi);
-                let exact = if target == Some(SpecialType::Single) {
-                    1 << 24
-                } else {
-                    1 << 53
-                };
-                if whole > exact {
-                    return expression;
-                }
-                let value = if negative {
-                    -(whole as f64)
-                } else {
-                    whole as f64
-                };
-                let constant = if target == Some(SpecialType::Single) {
-                    ConstantValue::Single(value as f32)
-                } else {
-                    ConstantValue::Double(value)
-                };
-                BoundExpression::new(
-                    BoundExpressionKind::Literal(constant),
-                    expression.ty.clone(),
-                    expression.span,
-                )
-            }
-            _ => expression,
+                Err(DecimalError::Unsure) => expression,
+            };
         }
+        // The conversion may be bound as one, or as the `op_Explicit`
+        // `System.Decimal` declares for it.
+        let Some(operand) =
+            decimal_conversion_operand(self.binder.compilation().symbols(), &expression)
+        else {
+            return expression;
+        };
+        let from = self.binder.special_of(&operand.ty);
+        let to = self.binder.special_of(&expression.ty);
+        if from == Some(SpecialType::Decimal) && to != Some(SpecialType::Decimal) {
+            let Some(value) = self.decimal_operand(operand) else {
+                return expression;
+            };
+            let constant = match to {
+                Some(SpecialType::Double) => ConstantValue::Double(value.to_f64()),
+                Some(SpecialType::Single) => ConstantValue::Single(value.to_f32()),
+                Some(
+                    special @ (SpecialType::SByte
+                    | SpecialType::Byte
+                    | SpecialType::Int16
+                    | SpecialType::UInt16
+                    | SpecialType::Char
+                    | SpecialType::Int32
+                    | SpecialType::UInt32
+                    | SpecialType::Int64
+                    | SpecialType::UInt64),
+                ) => match integer_constant(special, value.truncated()) {
+                    Some(constant) => constant,
+                    None => {
+                        let text = format!("{}M", value.text());
+                        let ty = self.display(&expression.ty);
+                        self.report(ErrorCode::ErrConstOutOfRange, span, &[&text, &ty]);
+                        return expression;
+                    }
+                },
+                _ => return expression,
+            };
+            return BoundExpression::new(
+                BoundExpressionKind::Literal(constant),
+                expression.ty.clone(),
+                span,
+            );
+        }
+        if to == Some(SpecialType::Decimal) && from != Some(SpecialType::Decimal) {
+            let Some(folded) = self.binder.folded(operand) else {
+                return expression;
+            };
+            let value = match (from, &folded) {
+                (Some(SpecialType::Double), ConstantValue::Double(value)) => {
+                    Decimal::from_f64(*value).ok_or_else(|| value.to_string())
+                }
+                (Some(SpecialType::Double), ConstantValue::Single(value)) => {
+                    Decimal::from_f64(f64::from(*value)).ok_or_else(|| value.to_string())
+                }
+                (Some(SpecialType::Single), ConstantValue::Single(value)) => {
+                    Decimal::from_f32(*value).ok_or_else(|| value.to_string())
+                }
+                (Some(SpecialType::Single), ConstantValue::Double(value)) => {
+                    Decimal::from_f32(*value as f32).ok_or_else(|| value.to_string())
+                }
+                (Some(SpecialType::Single | SpecialType::Double), _) => return expression,
+                // An integer of any width, a character, or an enum: a whole
+                // number a `decimal` holds exactly.
+                _ => match crate::constant::as_exact(&folded).and_then(Decimal::from_integer) {
+                    Some(value) => Ok(value),
+                    None => return expression,
+                },
+            };
+            return match value {
+                Ok(value) => self.decimal_literal(value, span).unwrap_or(expression),
+                Err(text) => {
+                    let ty = self.display(&expression.ty);
+                    self.report(ErrorCode::ErrConstOutOfRange, span, &[&text, &ty]);
+                    expression
+                }
+            };
+        }
+        expression
+    }
+
+    /// The `decimal` a bound expression is, where it is a constant.
+    fn decimal_operand(&self, value: &BoundExpression) -> Option<Decimal> {
+        match self.binder.decimal_constant(value)? {
+            crate::bound::SpecialConstant::Decimal {
+                scale,
+                negative,
+                hi,
+                mid,
+                lo,
+            } => Decimal::from_parts(lo, mid, hi, negative, scale),
+            crate::bound::SpecialConstant::DateTime(_) => None,
+        }
+    }
+
+    /// A `decimal` constant as the expression that makes it.
+    fn decimal_literal(&mut self, value: Decimal, span: TextSpan) -> Option<BoundExpression> {
+        self.decimal_expression(
+            value.lo,
+            value.mid,
+            value.hi,
+            value.negative,
+            value.scale,
+            span,
+        )
     }
 
     /// A `decimal` or `DateTime` constant as the expression that makes it.
@@ -1130,7 +1129,7 @@ impl BodyBinder<'_> {
                         // as Roslyn folds them: the sign flipped, a zero's
                         // too — `(double)(-0m)` is `-0.0`. Only writing one
                         // out as a `decimal` loses it (see the emitter).
-                        if operator == UnaryOperator::Minus
+                        if matches!(operator, UnaryOperator::Minus | UnaryOperator::Plus)
                             && self.binder.special_of(&operand.ty) == Some(SpecialType::Decimal)
                             && let Some(crate::bound::SpecialConstant::Decimal {
                                 scale,
@@ -1139,8 +1138,14 @@ impl BodyBinder<'_> {
                                 mid,
                                 lo,
                             }) = self.binder.decimal_constant(&operand)
-                            && let Some(folded) =
-                                self.decimal_expression(lo, mid, hi, !negative, scale, span)
+                            && let Some(folded) = self.decimal_expression(
+                                lo,
+                                mid,
+                                hi,
+                                negative != (operator == UnaryOperator::Minus),
+                                scale,
+                                span,
+                            )
                         {
                             return folded;
                         }
@@ -2035,6 +2040,27 @@ fn decimal_conversion_operand<'e>(
     }
 }
 
+/// The constant of an integer type a whole number is, where it fits.
+fn integer_constant(special: SpecialType, whole: i128) -> Option<ConstantValue> {
+    Some(match special {
+        SpecialType::SByte => ConstantValue::Int32(i32::from(i8::try_from(whole).ok()?)),
+        SpecialType::Byte => ConstantValue::Int32(i32::from(u8::try_from(whole).ok()?)),
+        SpecialType::Int16 => ConstantValue::Int32(i32::from(i16::try_from(whole).ok()?)),
+        SpecialType::UInt16 => ConstantValue::Int32(i32::from(u16::try_from(whole).ok()?)),
+        SpecialType::Char => {
+            let unit = u16::try_from(whole).ok()?;
+            // A surrogate, which a Rust `char` cannot hold, stays its number.
+            char::from_u32(u32::from(unit))
+                .map_or(ConstantValue::Int32(i32::from(unit)), ConstantValue::Char)
+        }
+        SpecialType::Int32 => ConstantValue::Int32(i32::try_from(whole).ok()?),
+        SpecialType::UInt32 => ConstantValue::UInt32(u32::try_from(whole).ok()?),
+        SpecialType::Int64 => ConstantValue::Int64(i64::try_from(whole).ok()?),
+        SpecialType::UInt64 => ConstantValue::UInt64(u64::try_from(whole).ok()?),
+        _ => return None,
+    })
+}
+
 /// An arithmetic operator on two operands, bound as the operator or as the
 /// call of the method a type declares for it: `op_Addition(a, b)`.
 fn decimal_arithmetic<'e>(
@@ -2059,6 +2085,14 @@ fn decimal_arithmetic<'e>(
                 "op_Addition" => BinaryOperator::Add,
                 "op_Subtraction" => BinaryOperator::Subtract,
                 "op_Multiply" => BinaryOperator::Multiply,
+                "op_Division" => BinaryOperator::Divide,
+                "op_Modulus" => BinaryOperator::Modulo,
+                "op_Equality" => BinaryOperator::Equality,
+                "op_Inequality" => BinaryOperator::Inequality,
+                "op_LessThan" => BinaryOperator::LessThan,
+                "op_LessThanOrEqual" => BinaryOperator::LessThanOrEqual,
+                "op_GreaterThan" => BinaryOperator::GreaterThan,
+                "op_GreaterThanOrEqual" => BinaryOperator::GreaterThanOrEqual,
                 _ => return None,
             };
             match &arguments[..] {

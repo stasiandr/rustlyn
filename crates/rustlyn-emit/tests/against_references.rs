@@ -2407,7 +2407,8 @@ static class Program
         decimal d = 1.00M;
         Console.WriteLine(((decimal)(E)d).ToString(CultureInfo.InvariantCulture));
         Console.WriteLine((E)((decimal)E.One + 1));
-        try { Console.WriteLine((byte)300m); } catch (OverflowException) { Console.WriteLine("overflow"); }
+        decimal big = 300m;
+        try { Console.WriteLine((byte)big); } catch (OverflowException) { Console.WriteLine("overflow"); }
         Console.WriteLine(((decimal)12345.75f).ToString(CultureInfo.InvariantCulture));
         var x = 1.5m;
         var y = x++;
@@ -18288,6 +18289,97 @@ unsafe class P
 }
 "#,
         "more five less mid big less True True True True\nmore five null less nint>5 nuint<=3 int>5 other True False True True\n20 20 30 200 10 20 60 6 20 30 True\n",
+    );
+}
+
+#[test]
+fn a_const_decimal_worked_out_from_constants_has_its_decimal_constant() {
+    // Every one of these is a constant to Roslyn, which writes the
+    // `[DecimalConstant]` another assembly reads it back by: the scale (what
+    // `1.5m * 2.0m` keeps is `3.00`), the sign (of a zero as well), and the
+    // 96 bits rounded as the framework rounds them. Output as Roslyn's own
+    // build of the program printed it.
+    check(
+        "decimal_constants_worked_out",
+        r#"
+using System;
+using System.Linq;
+using System.Reflection;
+enum E : byte { A = 3, B = 200 }
+class P
+{
+    public const decimal L = (decimal)3.5;
+    public const decimal N = 100m / 3;
+    public const decimal T = 10 / 4m;
+    public const decimal V = (decimal)1.5f;
+    public const decimal W = -(decimal)0.25;
+    public const decimal Third = 1m / 3;
+    public const decimal TwoThirds = 2m / 3;
+    public const decimal Trailing = 1.50m;
+    public const decimal Product = 1.5m * 2.0m;
+    public const decimal NegZero = -0m;
+    public const decimal NegZeroProduct = 1m * -0m;
+    public const decimal Max = decimal.MaxValue;
+    public const decimal Min = decimal.MinValue;
+    public const decimal NearMax = decimal.MaxValue - 0.4m;
+    public const decimal Tiny = 0.0000000000000000000000000001m * 0.1m;
+    public const decimal Sum = 0.1m + 0.20m;
+    public const decimal Rem = 5.5m % 2m;
+    public const decimal RemNeg = -7m % 3m;
+    public const decimal FromFloat = (decimal)0.1f;
+    public const decimal FromDouble = (decimal)0.1;
+    public const decimal FromBig = (decimal)1.2345678901234567e20;
+    public const decimal FromSmall = (decimal)1e-5;
+    public const decimal FromLost = (decimal)1e-30;
+    public const decimal FromEnum = (decimal)E.B + 1;
+    public const decimal FromChar = 'a' + 0.5m;
+    public const decimal Nested = ((1.5m + 2) * (3 - 1m)) / 4;
+    public const decimal Unary = +(-L);
+    public const int ToInt = (int)3.7m;
+    public const long ToLong = (long)-3.7m;
+    public const byte ToByte = (byte)255.9m;
+    public const char ToChar = (char)65.5m;
+    public const double ToDouble = (double)(1m / 3);
+    public const float ToFloat = (float)0.1m;
+    public const bool Less = 1m < 2m;
+    public const bool Same = 1.0m == 1.00m;
+    public const bool Other = L != T;
+    public const int FromField = (int)(L * 2);
+    static void D(decimal a = (decimal)3.5, decimal b = 100m / 3, decimal c = 10 / 4m, decimal? d = (decimal)1.5f, decimal e = -(decimal)0.25,
+        decimal f = 1m % 3, decimal g = (decimal)E.A, decimal h = L * 2, int i = (int)3.5m, double j = (double)1.5m, bool k = 1m < 2m)
+    {
+        Console.WriteLine($"{a} {b} {c} {d} {e} {f} {g} {h} {i} {j} {k}");
+    }
+    static string Show(decimal d)
+    {
+        var bits = decimal.GetBits(d);
+        return $"{bits[3] >> 16 & 255}/{(bits[3] < 0 ? 1 : 0)}/{(uint)bits[2]}/{(uint)bits[1]}/{(uint)bits[0]}";
+    }
+    static void Main()
+    {
+        D();
+        foreach (var f in typeof(P).GetFields(BindingFlags.Public | BindingFlags.Static).OrderBy(f => f.Name, StringComparer.Ordinal))
+        {
+            var value = f.GetValue(null);
+            var attribute = f.GetCustomAttributesData().FirstOrDefault(a => a.AttributeType.Name == "DecimalConstantAttribute");
+            string shown = value is decimal d ? Show(d) : value is double x ? BitConverter.DoubleToInt64Bits(x).ToString() : value is float y ? BitConverter.SingleToInt32Bits(y).ToString() : value.ToString();
+            Console.WriteLine(f.Name + " " + shown + (attribute == null ? "" : " [" + string.Join(",", attribute.ConstructorArguments.Select(a => a.Value)) + "]"));
+        }
+        foreach (var p in typeof(P).GetMethod("D", BindingFlags.NonPublic | BindingFlags.Static).GetParameters())
+        {
+            var attribute = p.GetCustomAttributesData().FirstOrDefault(a => a.AttributeType.Name == "DecimalConstantAttribute");
+            Console.WriteLine(p.Name + " " + (p.RawDefaultValue ?? "null") + (attribute == null ? "" : " [" + string.Join(",", attribute.ConstructorArguments.Select(a => a.Value)) + "]"));
+        }
+        const decimal local = 100m / 3 + (decimal)0.5;
+        Console.WriteLine(local);
+        switch (3)
+        {
+            case (int)(1.5m + 1.5m): Console.WriteLine("three"); break;
+        }
+    }
+}
+"#,
+        "3.5 33.333333333333333333333333333 2.5 1.5 -0.25 1 3 7.0 3 1.5 True\nFromBig 0/0/6/2974719873/792416896 [0,0,6,2974719873,792416896]\nFromChar 1/0/0/0/975 [1,0,0,0,975]\nFromDouble 1/0/0/0/1 [1,0,0,0,1]\nFromEnum 0/0/0/0/201 [0,0,0,0,201]\nFromField 7\nFromFloat 1/0/0/0/1 [1,0,0,0,1]\nFromLost 0/0/0/0/0 [0,0,0,0,0]\nFromSmall 5/0/0/0/1 [5,0,0,0,1]\nL 1/0/0/0/35 [1,0,0,0,35]\nLess True\nMax 0/0/4294967295/4294967295/4294967295 [0,0,4294967295,4294967295,4294967295]\nMin 0/1/4294967295/4294967295/4294967295 [0,128,4294967295,4294967295,4294967295]\nN 27/0/1807003620/3475376110/894784853 [27,0,1807003620,3475376110,894784853]\nNearMax 0/0/4294967295/4294967295/4294967295 [0,0,4294967295,4294967295,4294967295]\nNegZero 0/0/0/0/0 [0,128,0,0,0]\nNegZeroProduct 0/0/0/0/0 [0,128,0,0,0]\nNested 2/0/0/0/175 [2,0,0,0,175]\nOther True\nProduct 2/0/0/0/300 [2,0,0,0,300]\nRem 1/0/0/0/15 [1,0,0,0,15]\nRemNeg 0/1/0/0/1 [0,128,0,0,1]\nSame True\nSum 2/0/0/0/30 [2,0,0,0,30]\nT 1/0/0/0/25 [1,0,0,0,25]\nThird 28/0/180700362/347537611/89478485 [28,0,180700362,347537611,89478485]\nTiny 28/0/0/0/0 [28,0,0,0,0]\nToByte 255\nToChar A\nToDouble 4599676419421066582\nToFloat 1036831949\nToInt 3\nToLong -3\nTrailing 2/0/0/0/150 [2,0,0,0,150]\nTwoThirds 28/0/361400724/695075222/178956971 [28,0,361400724,695075222,178956971]\nUnary 1/1/0/0/35 [1,128,0,0,35]\nV 1/0/0/0/15 [1,0,0,0,15]\nW 2/1/0/0/25 [2,128,0,0,25]\na 3.5 [1,0,0,0,35]\nb 33.333333333333333333333333333 [27,0,1807003620,3475376110,894784853]\nc 2.5 [1,0,0,0,25]\nd 1.5 [1,0,0,0,15]\ne -0.25 [2,128,0,0,25]\nf 1 [0,0,0,0,1]\ng 3 [0,0,0,0,3]\nh 7.0 [1,0,0,0,70]\ni 3\nj 1.5\nk True\n33.833333333333333333333333333\nthree\n",
     );
 }
 

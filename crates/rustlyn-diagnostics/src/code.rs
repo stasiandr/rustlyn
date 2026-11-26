@@ -125,6 +125,9 @@ error_codes! {
     ErrNoImplicitConvCast = 266, Error, "Cannot implicitly convert type '{0}' to '{1}'. An explicit conversion exists (are you missing a cast?)";
     ErrCheckedOverflow = 220, Error, "The operation overflows at compile time in checked mode";
     ErrIntDivByZero = 20, Error, "Division by constant zero";
+    ErrDecimalConstantFailed = 463, Error, "Evaluation of the decimal constant expression failed";
+    ErrNotConstantExpression = 133, Error, "The expression being assigned to '{0}' must be constant";
+    ErrLiteralDoubleCast = 664, Error, "Literal of type double cannot be implicitly converted to type '{1}'; use an '{0}' suffix to create a literal of this type";
     ErrCircConstValue = 110, Error, "The evaluation of the constant value for '{0}' involves a circular definition";
     ErrConstOutOfRangeChecked = 221, Error, "Constant value '{0}' cannot be converted to a '{1}' (use 'unchecked' syntax to override)";
     ErrEnumeratorOverflow = 543, Error, "'{0}': the enumerator value is too large to fit in its type";
