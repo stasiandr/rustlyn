@@ -42,6 +42,7 @@ impl Parser {
         };
 
         while self.at(SyntaxKind::DotToken) && self.nth_kind(1) == SyntaxKind::IdentifierToken {
+            self.fits(&left);
             let ends_the_line = self.dot_ends_the_line();
             let dot = self.eat_token();
             let right = if ends_the_line {
@@ -75,6 +76,25 @@ impl Parser {
     /// types *and* what follows the `>` must be something that can only come
     /// after a type argument list — Roslyn applies the same token set.
     fn scans_as_type_argument_list(&mut self, expression_context: bool) -> bool {
+        let key = (
+            self.index,
+            expression_context,
+            self.query_depth,
+            self.pattern_precedence,
+            self.extension_receiver,
+        );
+        if let Some(&known) = self.type_arguments.get(&key) {
+            return known;
+        }
+        let answer = self.type_argument_list_ahead(expression_context);
+        // An answer found while giving up was read off a file cut short.
+        if !self.too_deep {
+            self.type_arguments.insert(key, answer);
+        }
+        answer
+    }
+
+    fn type_argument_list_ahead(&mut self, expression_context: bool) -> bool {
         self.speculate(|p| {
             if p.eat_if(SyntaxKind::LessThanToken).is_none() {
                 return false;
@@ -205,6 +225,13 @@ impl Parser {
     }
 
     pub(crate) fn parse_type_in(&mut self, mode: TypeMode) -> GreenElement {
+        self.enter();
+        let ty = self.parse_type_here(mode);
+        self.leave();
+        ty
+    }
+
+    fn parse_type_here(&mut self, mode: TypeMode) -> GreenElement {
         if self.at(SyntaxKind::RefKeyword) {
             let mut children = vec![self.eat_token()];
             if let Some(readonly) = self.eat_if(SyntaxKind::ReadOnlyKeyword) {
@@ -223,6 +250,8 @@ impl Parser {
         let mut ty = self.parse_type_core();
 
         loop {
+            // `int*****…` and `int?[]?[]…` grow by a level each time round.
+            self.fits(&ty);
             match self.kind() {
                 SyntaxKind::QuestionToken if self.question_makes_nullable(mode) => {
                     let question = self.eat_token();

@@ -107,7 +107,7 @@ fn run() -> Result<i32, String> {
         .map_err(|e| format!("{config_path}: {e}"))
         .and_then(|text| Config::parse(&text).map_err(|e| format!("{config_path}: {e}")))?;
     if let Some(branch) = &merge_base {
-        let found = setup::git(&root, &["merge-base", branch, "HEAD"])?;
+        let found = setup::git(&root, &["merge-base", setup::revision(branch)?, "HEAD"])?;
         base = Some(found.trim().to_owned());
     }
     let mut past = Vec::new();

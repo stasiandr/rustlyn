@@ -1561,3 +1561,230 @@ fn a_dot_at_the_end_of_a_line_before_a_declaration_ends_the_statement() {
     // A chain continued on the next line is still one expression.
     assert!(text.contains("InvocationExpression"), "{text}");
 }
+
+// MARK: - source nested too deep
+
+/// On the stack a main thread has: the tests' own threads have a quarter of
+/// it, and an unoptimized parser's frames are several times a release one's.
+fn on_a_main_thread_stack(test: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(8 << 20)
+        .spawn(test)
+        .expect("a thread to parse on")
+        .join()
+        .expect("the parse");
+}
+
+/// Source that nests without end ran the parser's thread out of stack, which
+/// takes the process with it: a hundred thousand `(` are a fuzzer's file or
+/// a broken generator's, and an editor has to survive both. Past a depth the
+/// parser stops reading: one CS8078 where it stopped, as Roslyn reports when
+/// it runs out of stack, and the rest of the text in the tree unread.
+#[test]
+fn source_nested_too_deep_is_cs8078_and_not_a_stack_overflow() {
+    on_a_main_thread_stack(|| {
+        let n = 100_000;
+        let in_method = |body: &str| format!("class C {{ void M(object x) {{ {body} }} }}");
+        for text in [
+            in_method(&format!("x = {}x{};", "(".repeat(n), ")".repeat(n))),
+            in_method(&format!("x = {}x;", "!".repeat(n))),
+            in_method(&format!("x = {}x{};", "F(".repeat(n), ")".repeat(n))),
+            in_method(&format!("x = {}x{};", "a => F(".repeat(n), ")".repeat(n))),
+            in_method(&format!(
+                "x = {}null{};",
+                "new[] { ".repeat(n),
+                " }".repeat(n)
+            )),
+            in_method(&format!("x = x{};", "?.y".repeat(n))),
+            in_method(&format!("{}{}", "{".repeat(n), "}".repeat(n))),
+            in_method(&format!("{}x = 1;", "if (b) ".repeat(n))),
+            in_method(&format!("{}x = 1;", "if (b) { } else ".repeat(n))),
+            in_method(&format!("{}x = 1;", "label: ".repeat(n))),
+            in_method(&format!(
+                "var b = x is {}null{};",
+                "(".repeat(n),
+                ")".repeat(n)
+            )),
+            in_method(&format!("var b = x is {}null;", "not ".repeat(n))),
+            in_method(&format!("var {}a{} = x;", "(".repeat(n), ")".repeat(n))),
+            format!("class C {{ {}int{} f; }}", "A<".repeat(n), ">".repeat(n)),
+            format!(
+                "class C {{ {}int{} f; }}",
+                "(int, ".repeat(n),
+                ")".repeat(n)
+            ),
+            format!("{}{}", "class A { ".repeat(n), "}".repeat(n)),
+            format!("{}{}", "namespace N { ".repeat(n), "}".repeat(n)),
+            // What is never closed, too.
+            in_method(&format!("x = {}", "(".repeat(n))),
+            in_method(&"{".repeat(n)),
+            format!("class C {{ {} f; }}", "A<".repeat(n)),
+        ] {
+            let started = std::time::Instant::now();
+            let tree = tree_of(&text);
+            assert_eq!(tree.text(), text, "every byte stays in the tree");
+            let codes: Vec<String> = tree
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code().to_string())
+                .collect();
+            assert_eq!(codes, ["CS8078"], "{}…", &text[..60]);
+            assert!(
+                started.elapsed().as_secs() < 10,
+                "{}… took {:?}",
+                &text[..60],
+                started.elapsed()
+            );
+        }
+    });
+}
+
+/// A chain takes no recursion to read and still makes a tree as deep as it
+/// is long, which whatever walks the tree pays for; it is cut at a depth of
+/// its own, well past anything written by hand or by a generator.
+#[test]
+fn a_chain_grown_too_long_is_cs8078() {
+    on_a_main_thread_stack(|| {
+        let in_method = |body: &str| format!("class C {{ void M(string x) {{ {body} }} }}");
+        let chains = |n: usize| {
+            [
+                in_method(&format!("x = {}x;", "x + ".repeat(n))),
+                in_method(&format!("x = x{};", ".Trim()".repeat(n))),
+                in_method(&format!("x = x{};", "[0]".repeat(n))),
+                in_method(&format!("x = x{};", "!".repeat(n))),
+                in_method(&format!("var b = x is {}null;", "null or ".repeat(n))),
+                in_method(&format!("N{} y;", ".N".repeat(n))),
+                in_method(&format!("int{} y;", "[]?".repeat(n))),
+            ]
+        };
+        for text in chains(100_000) {
+            let tree = tree_of(&text);
+            assert_eq!(tree.text(), text);
+            let codes: Vec<String> = tree
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code().to_string())
+                .collect();
+            assert_eq!(codes, ["CS8078"], "{}…", &text[..60]);
+        }
+        // Two thousand terms are a generated file, and parse.
+        for text in chains(1500) {
+            let tree = tree_of(&text);
+            assert_eq!(tree.text(), text);
+            assert!(!tree.has_errors(), "{:?}", tree.diagnostics());
+        }
+    });
+}
+
+/// Chains inside chains do not add up to a tree deeper than either may be:
+/// the limit is on the tree, however it came to be that deep.
+#[test]
+fn chains_nested_in_chains_stay_within_the_depth() {
+    on_a_main_thread_stack(|| {
+        // 300 levels of `(… + x + x + …)`, each a chain of 3000.
+        let mut text = String::from("x");
+        for _ in 0..300 {
+            text = format!("({text}{})", " + x".repeat(3000));
+        }
+        let text = format!("class C {{ void M(int x) {{ x = {text}; }} }}");
+        let tree = tree_of(&text);
+        assert_eq!(tree.text(), text);
+        assert!(tree.has_errors());
+        fn depth(node: &SyntaxNode) -> usize {
+            // Not by recursion: that is the very thing being bounded.
+            let mut deepest = 0;
+            let mut open = vec![(node.clone(), 1)];
+            while let Some((node, at)) = open.pop() {
+                deepest = deepest.max(at);
+                open.extend(node.children().map(|child| (child, at + 1)));
+            }
+            deepest
+        }
+        assert!(depth(&tree.root()) < 8192, "{}", depth(&tree.root()));
+    });
+}
+
+/// Nesting a person or a generator writes is nowhere near the limit.
+#[test]
+fn deep_nesting_within_the_limit_parses() {
+    on_a_main_thread_stack(|| {
+        let n = 400;
+        for text in [
+            format!(
+                "class C {{ void M(int x) {{ x = {}x{}; }} }}",
+                "(".repeat(n),
+                ")".repeat(n)
+            ),
+            format!(
+                "class C {{ void M(int x) {{ x = {}x{}; }} }}",
+                "F(".repeat(n),
+                ")".repeat(n)
+            ),
+            format!(
+                "class C {{ void M() {{ {}{} }} }}",
+                "{".repeat(n),
+                "}".repeat(n)
+            ),
+            format!(
+                "class C {{ void M(bool b, int x) {{ {}x = 1; }} }}",
+                "if (b) { } else ".repeat(n)
+            ),
+            format!("class C {{ {}int{} f; }}", "A<".repeat(n), ">".repeat(n)),
+        ] {
+            let tree = tree_of(&text);
+            assert_eq!(tree.text(), text);
+            assert!(
+                !tree.has_errors(),
+                "{}…: {:?}",
+                &text[..60],
+                tree.diagnostics()
+            );
+        }
+    });
+}
+
+/// Whether a `<` opens type arguments is asked by reading them as types, and
+/// an argument generic itself asked again — once for the look, once for
+/// real: twice per level, so `A<A<A<…>>>` thirty deep never finished.
+#[test]
+fn nested_type_arguments_are_not_read_again_for_each_level() {
+    on_a_main_thread_stack(|| {
+        let n = 300;
+        for text in [
+            format!("class C {{ {}int{} f; }}", "A<".repeat(n), ">".repeat(n)),
+            format!(
+                "class C {{ void M() {{ var x = new {}int{}(); }} }}",
+                "A<".repeat(n),
+                ">".repeat(n)
+            ),
+            format!(
+                "class C {{ void M() {{ F<{}int{}>(); }} }}",
+                "A<".repeat(n),
+                ">".repeat(n)
+            ),
+            format!(
+                "class C {{ void M() {{ var x = ({}int{})y; }} }}",
+                "A<".repeat(n),
+                ">".repeat(n)
+            ),
+            // A comparison after all: no `>` ever closes it.
+            format!("class C {{ bool M() => {}b; }}", "a < ".repeat(n)),
+        ] {
+            let started = std::time::Instant::now();
+            let tree = tree_of(&text);
+            assert_eq!(tree.text(), text);
+            assert!(
+                !tree.has_errors(),
+                "{}…: {:?}",
+                &text[..60],
+                tree.diagnostics()
+            );
+            assert!(
+                started.elapsed().as_secs() < 5,
+                "{}… took {:?}",
+                &text[..60],
+                started.elapsed()
+            );
+        }
+    });
+}

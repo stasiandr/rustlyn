@@ -223,6 +223,7 @@ error_codes! {
     ErrInvalidMemberDecl = 1519, Error, "Invalid token '{0}' in class, record, struct, or interface member declaration";
     ErrInvalidExprTerm = 1525, Error, "Invalid expression term '{0}'";
     ErrExpressionExpected = 1733, Error, "Expected expression";
+    ErrInsufficientStack = 8078, Error, "An expression is too long or complex to compile";
 }
 
 impl fmt::Display for ErrorCode {

@@ -792,6 +792,19 @@ fn emit_assembly(
     library: bool,
     main_type: Option<&str>,
 ) -> Result<Emitted, EmitError> {
+    // Lowering and generating code walk each body as deep as it nests.
+    rustlyn_semantics::parallel::deep(|| {
+        emit_assembly_here(compilation, name, resources, library, main_type)
+    })
+}
+
+fn emit_assembly_here(
+    compilation: &Compilation,
+    name: &str,
+    resources: &[Resource],
+    library: bool,
+    main_type: Option<&str>,
+) -> Result<Emitted, EmitError> {
     let mut emitter = Emitter::new(compilation, name, false);
 
     let planning = rustlyn_semantics::timing::phase("plan");

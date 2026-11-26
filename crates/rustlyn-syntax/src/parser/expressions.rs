@@ -37,9 +37,18 @@ impl Parser {
     /// Parses an expression built from operators that bind at least as tightly
     /// as `min`.
     pub(crate) fn parse_sub_expression(&mut self, min: Precedence) -> GreenElement {
+        self.enter();
+        let expression = self.parse_sub_expression_here(min);
+        self.leave();
+        expression
+    }
+
+    fn parse_sub_expression_here(&mut self, min: Precedence) -> GreenElement {
         let mut left = self.parse_unary_expression(min);
 
         loop {
+            // `a + b + c + …` grows by a level each time round.
+            self.fits(&left);
             let token = self.kind();
 
             // Assignment is the loosest level and groups to the right, so the
@@ -420,6 +429,8 @@ impl Parser {
     /// The suffixes that can follow any primary expression.
     fn parse_postfix(&mut self, mut expression: GreenElement) -> GreenElement {
         loop {
+            // `a.b().c()…` grows by a level each time round.
+            self.fits(&expression);
             match self.kind() {
                 SyntaxKind::DotToken => {
                     let ends_the_line = self.dot_ends_the_line();
@@ -504,6 +515,14 @@ impl Parser {
     /// What follows a `?.` or `?[`, which binds to the same target until the
     /// chain ends.
     fn parse_binding(&mut self) -> GreenElement {
+        // `a?.b?.c?.…` nests to the right, each `?.` inside the one before.
+        self.enter();
+        let binding = self.parse_binding_here();
+        self.leave();
+        binding
+    }
+
+    fn parse_binding_here(&mut self) -> GreenElement {
         let binding = if self.at(SyntaxKind::DotToken) {
             let dot = self.eat_token();
             let name = self.parse_simple_name(true);

@@ -38,6 +38,7 @@ impl Parser {
         if let Some(skipped) = self.skip_tokens(ErrorCode::ErrEofExpected, Self::at_end) {
             children.push(skipped);
         }
+        children.extend(self.cut_off());
         children.push(self.end_of_file());
         GreenNode::new(SyntaxKind::CompilationUnit, children)
     }
@@ -246,6 +247,13 @@ impl Parser {
     }
 
     fn parse_member_declaration(&mut self, context: MemberContext) -> GreenElement {
+        self.enter();
+        let member = self.parse_member_declaration_here(context);
+        self.leave();
+        member
+    }
+
+    fn parse_member_declaration_here(&mut self, context: MemberContext) -> GreenElement {
         // `[DoesNotReturn] static void Fail() => …;` at the top of a file is
         // a local function with attributes, as it would be in a method: the
         // statement, attributes and all, is what follows them.

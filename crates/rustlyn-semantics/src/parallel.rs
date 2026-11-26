@@ -28,6 +28,40 @@ pub fn threads() -> usize {
     })
 }
 
+thread_local! {
+    /// Whether this thread was started with [`STACK`].
+    static DEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `f` run on a stack as deep as a worker's: on this thread if it is one,
+/// on a thread started for it otherwise, while this one waits.
+///
+/// Binding and emitting recurse as deep as the source nests — the parser
+/// lets a tree go a few thousand levels deep — and whoever asks for them
+/// may be on a main thread's eight megabytes, or one. A compile of one
+/// file does all of its work where it was asked for, so it is asked for
+/// here.
+///
+/// # Panics
+///
+/// Panics where `f` does, or where a thread cannot be started.
+pub fn deep<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    if DEEP.get() {
+        return f();
+    }
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn_scoped(scope, || {
+                DEEP.set(true);
+                f()
+            })
+            .expect("a thread with a deep stack should start")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
 /// `f` applied to every item, on as many threads as there are cores, the
 /// results in the order of the items.
 ///
@@ -51,6 +85,7 @@ where
                 std::thread::Builder::new()
                     .stack_size(STACK)
                     .spawn_scoped(scope, || {
+                        DEEP.set(true);
                         let mut done = Vec::new();
                         loop {
                             let index = next.fetch_add(1, Ordering::Relaxed);

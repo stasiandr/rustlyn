@@ -19,7 +19,7 @@ pub fn git_patch(root: &str, base: Option<&str>, staged: bool) -> Result<String,
     if staged {
         args.push("--cached");
     }
-    let base = base.unwrap_or("HEAD");
+    let base = revision(base.unwrap_or("HEAD"))?;
     // A fresh repository without commits: nothing to compare with, all new.
     let has_head = git(root, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok();
     if has_head || base != "HEAD" {
@@ -39,6 +39,23 @@ pub fn git_patch(root: &str, base: Option<&str>, staged: bool) -> Result<String,
         }
     }
     Ok(patch)
+}
+
+/// A revision (or a range of them) as git may be handed one: `base` comes
+/// from whoever calls the tool, an MCP client among them, and git reads an
+/// argument that starts with `-` as an option — `--output=<file>` makes
+/// `git diff` write over any file the process can reach. A revision never
+/// starts with one (`git check-ref-format`), so such a `base` is refused
+/// rather than passed on.
+///
+/// # Errors
+///
+/// When `text` is empty, starts with `-` or holds a control character.
+pub fn revision(text: &str) -> Result<&str, String> {
+    if text.is_empty() || text.starts_with('-') || text.chars().any(char::is_control) {
+        return Err(format!("{text:?} is not a revision"));
+    }
+    Ok(text)
 }
 
 /// The patch of a whole new file.
@@ -157,5 +174,23 @@ mod tests {
             summary,
             vec![("A.cs", Status::Modified), ("B.cs", Status::Added)]
         );
+    }
+
+    /// `base` is the caller's, and an option in its place is not a revision:
+    /// `--output=<file>` would have `git diff` write the file.
+    #[test]
+    fn a_base_that_is_an_option_is_refused() {
+        let project = Project::new("git-option", &[("A.cs", "class A { }\n")]);
+        let root = project.root();
+        git(&root, &["init", "-q"]).expect("git");
+        let target = format!("{root}/written.txt");
+        let base = format!("--output={target}");
+        assert!(git_patch(&root, Some(&base), false).is_err());
+        assert!(!Path::new(&target).exists());
+        assert!(revision("HEAD~2").is_ok());
+        assert!(revision("main..feature").is_ok());
+        assert!(revision("").is_err());
+        assert!(revision("-n").is_err());
+        assert!(revision("HEAD\n--output=x").is_err());
     }
 }

@@ -36,6 +36,13 @@ impl Parser {
     }
 
     pub(crate) fn parse_statement(&mut self) -> GreenElement {
+        self.enter();
+        let statement = self.parse_statement_here();
+        self.leave();
+        statement
+    }
+
+    fn parse_statement_here(&mut self) -> GreenElement {
         match self.kind() {
             SyntaxKind::OpenBraceToken => self.parse_block(),
             SyntaxKind::SemicolonToken => node(SyntaxKind::EmptyStatement, vec![self.eat_token()]),

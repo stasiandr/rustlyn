@@ -207,6 +207,9 @@ impl GreenToken {
 #[derive(Debug)]
 pub struct GreenNode {
     kind: SyntaxKind,
+    /// How many nodes deep the tree under this one goes, itself counted;
+    /// see [`Self::height`].
+    height: u16,
     full_width: u32,
     leading_width: u32,
     trailing_width: u32,
@@ -228,8 +231,15 @@ impl GreenNode {
             .rev()
             .find(|child| child.full_width() > 0)
             .map_or(0, GreenElement::trailing_width);
+        let height = children
+            .iter()
+            .map(GreenElement::height)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         Arc::new(Self {
             kind,
+            height,
             full_width,
             leading_width,
             trailing_width,
@@ -240,6 +250,16 @@ impl GreenNode {
     #[must_use]
     pub const fn kind(&self) -> SyntaxKind {
         self.kind
+    }
+
+    /// How many nodes deep the tree under this one goes, itself counted: 1
+    /// for a node holding only tokens. Everything that walks a tree by
+    /// recursion goes this deep, so the parser keeps it under a limit
+    /// instead of handing out a tree nothing can walk; kept, not found, for
+    /// the same reason the widths are.
+    #[must_use]
+    pub const fn height(&self) -> u16 {
+        self.height
     }
 
     #[must_use]
@@ -290,6 +310,15 @@ impl GreenElement {
         match self {
             Self::Node(node) => node.kind(),
             Self::Token(token) => token.kind(),
+        }
+    }
+
+    /// A node's [`GreenNode::height`]; a token has none.
+    #[must_use]
+    pub fn height(&self) -> u16 {
+        match self {
+            Self::Node(node) => node.height(),
+            Self::Token(_) => 0,
         }
     }
 

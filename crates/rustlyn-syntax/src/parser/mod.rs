@@ -60,7 +60,17 @@ pub fn parse_with(source: SourceText, options: &ParseOptions) -> SyntaxTree {
     // Without the replays, each diagnostic has the one owner to move out of.
     parser.replays.clear();
     let mut diagnostics = DiagnosticBag::new();
+    // Said here and not where the parse stopped: that may have been inside
+    // a look ahead, whose diagnostics are thrown away with it.
+    let too_deep = parser.too_deep.then(|| {
+        Diagnostic::new(
+            ErrorCode::ErrInsufficientStack,
+            parser.tokens[parser.end].span,
+            &[],
+        )
+    });
     diagnostics.extend(parser.diagnostics.into_iter().map(Rc::unwrap_or_clone));
+    diagnostics.extend(too_deep);
     diagnostics.sort();
     SyntaxTree::with_defined(
         source,
@@ -71,6 +81,26 @@ pub fn parse_with(source: SourceText, options: &ParseOptions) -> SyntaxTree {
     .with_definitions(definitions)
     .with_language_version(options.language_version)
 }
+
+/// How deep the parser's own recursion goes before it stops reading the
+/// file: nested parentheses, blocks, type arguments, patterns and types
+/// declared inside types each take a level. The parser recurses as the
+/// source nests, and source that nests without end — a file of a hundred
+/// thousand `(`, which a fuzzer or a broken generator writes and nobody
+/// else — ran the thread out of stack, which no caller can catch. Roslyn
+/// asks the runtime whether stack is left and reports CS8078; a fixed depth
+/// gives the same file the same answer on every machine and in every build,
+/// and stays within a main thread's stack.
+pub(crate) const MAX_NESTING: u32 = 512;
+
+/// How deep a tree the parser hands out ([`GreenNode::height`]). A chain
+/// — `a + b + c + …`, `a.b().c().d()…` — takes no recursion to read and
+/// still makes a tree as deep as it is long, which everything after the
+/// parser walks by recursion: binding, lowering, the emitter, the editor.
+/// Generated code does concatenate a few thousand strings in one
+/// expression, so this is well above [`MAX_NESTING`]; what walks trees
+/// runs on a stack sized for it (`rustlyn_semantics::parallel`).
+pub(crate) const MAX_DEPTH: u32 = 4096;
 
 /// A saved position, so a speculative parse can be undone.
 #[derive(Clone, Copy, Debug)]
@@ -84,6 +114,20 @@ pub(crate) struct Parser {
     source: SourceText,
     tokens: Vec<Token>,
     index: usize,
+    /// Where the file ends as far as the parse is concerned: the index of
+    /// the end-of-file token, or of the token the parse gave up at
+    /// ([`Self::give_up`]), from which on every look sees the end of the
+    /// file. The tokens themselves stay where they are — a look ahead that
+    /// gave up is rewound like any other — and the ones past this point go
+    /// into the tree as skipped text ([`Self::cut_off`]).
+    end: usize,
+    /// How many levels of the parser's recursion are open; see
+    /// [`MAX_NESTING`].
+    depth: u32,
+    /// Whether the parse gave up on source nested too deep (CS8078). Nothing
+    /// else is reported from then on: every level on the way out misses its
+    /// closing token, and none of that is the mistake.
+    too_deep: bool,
     cache: GreenCache,
     /// What has been reported, each shared so that a replay can keep what a
     /// stretch reported without copying it: stretches nest, and each keeping
@@ -114,6 +158,14 @@ pub(crate) struct Parser {
     /// (found by fuzzing, `examples/fuzz.rs` in rustlyn-ide). The tokens do
     /// not move, so an answer stands for the parse.
     conditionals: HashMap<(usize, usize, Precedence), bool>,
+    /// Whether the `<` at a token opens a type argument list, for each `<`
+    /// asked about, with what else decides it: whether an expression is
+    /// being read, and the surroundings a type is read in. Asking reads the
+    /// arguments as types, and an argument that is generic itself asked
+    /// again, once for the look and once for real — twice per level, `2ⁿ`
+    /// for `A<A<A<…>>>` n deep: thirty levels did not finish. As with
+    /// [`Self::conditionals`], an answer stands for the parse.
+    type_arguments: HashMap<(usize, bool, usize, Precedence, bool), bool>,
     /// For each token, the index of the `)` closing it if it is a `(` the
     /// file closes, `u32::MAX` otherwise; built the first time a question
     /// needs it. See [`Self::closing_paren`].
@@ -156,8 +208,11 @@ impl Parser {
         );
         Self {
             source,
+            end: tokens.len() - 1,
             tokens,
             index: 0,
+            depth: 0,
+            too_deep: false,
             cache: GreenCache::new(),
             diagnostics: diagnostics.into_iter().map(Rc::new).collect(),
             splits: Vec::new(),
@@ -165,6 +220,7 @@ impl Parser {
             pattern_precedence: Precedence::Conditional,
             extension_receiver: false,
             conditionals: HashMap::new(),
+            type_arguments: HashMap::new(),
             closing_parens: None,
             replays: HashMap::new(),
             replay_order: VecDeque::new(),
@@ -175,7 +231,18 @@ impl Parser {
     // -- looking -----------------------------------------------------------
 
     fn current(&self) -> &Token {
-        &self.tokens[self.index]
+        &self.tokens[self.slot(0)]
+    }
+
+    /// The index of the token `offset` places after the cursor: the end of
+    /// the file for everything from [`Self::end`] on.
+    fn slot(&self, offset: usize) -> usize {
+        let index = self.index + offset;
+        if index >= self.end {
+            self.tokens.len() - 1
+        } else {
+            index
+        }
     }
 
     fn kind(&self) -> SyntaxKind {
@@ -188,8 +255,7 @@ impl Parser {
     }
 
     fn nth_kind(&self, offset: usize) -> SyntaxKind {
-        let index = (self.index + offset).min(self.tokens.len() - 1);
-        self.tokens[index].kind
+        self.tokens[self.slot(offset)].kind
     }
 
     /// The kind of the token `back` places before the cursor, or
@@ -202,8 +268,7 @@ impl Parser {
     }
 
     fn nth_contextual_kind(&self, offset: usize) -> SyntaxKind {
-        let index = (self.index + offset).min(self.tokens.len() - 1);
-        self.tokens[index].contextual_kind
+        self.tokens[self.slot(offset)].contextual_kind
     }
 
     fn at(&self, kind: SyntaxKind) -> bool {
@@ -283,7 +348,7 @@ impl Parser {
     /// `examples/fuzz.rs` in rustlyn-ide).
     fn eat_token(&mut self) -> GreenElement {
         let index = self.index;
-        if self.tokens[index].kind == SyntaxKind::EndOfFileToken {
+        if self.at_end() {
             return Self::missing(SyntaxKind::EndOfFileToken);
         }
         let green = green_token(&self.tokens[index], &self.source, &mut self.cache);
@@ -296,7 +361,7 @@ impl Parser {
     /// `kind`, as with [`Self::eat_token`].
     fn eat_token_as(&mut self, kind: SyntaxKind) -> GreenElement {
         let index = self.index;
-        if self.tokens[index].kind == SyntaxKind::EndOfFileToken {
+        if self.at_end() {
             return Self::missing(kind);
         }
         let green = green_token_as(&self.tokens[index], kind, &self.source, &mut self.cache);
@@ -309,10 +374,73 @@ impl Parser {
     fn end_of_file(&mut self) -> GreenElement {
         debug_assert!(self.at_end(), "the end of the file is taken at the end");
         GreenElement::Token(green_token(
-            &self.tokens[self.index],
+            &self.tokens[self.tokens.len() - 1],
             &self.source,
             &mut self.cache,
         ))
+    }
+
+    // -- depth -------------------------------------------------------------
+
+    /// One level of recursion deeper; [`Self::leave`] is its other half.
+    /// Past [`MAX_NESTING`] the parse gives up, and what was entered reads
+    /// the end of the file and comes back out.
+    fn enter(&mut self) {
+        self.depth += 1;
+        if self.depth > MAX_NESTING {
+            self.give_up();
+        }
+    }
+
+    fn leave(&mut self) {
+        self.depth -= 1;
+    }
+
+    /// Asked by everything that grows a tree without recursing, before each
+    /// step: whether `built`, where it stands, is still within
+    /// [`MAX_DEPTH`]. Where it is not, the parse gives up.
+    fn fits(&mut self, built: &GreenElement) {
+        if self.depth + u32::from(built.height()) >= MAX_DEPTH {
+            self.give_up();
+        }
+    }
+
+    /// Stops reading the file here: source nested deeper than can be
+    /// compiled (CS8078, which Roslyn reports when it runs out of stack).
+    /// From here on every look sees the end of the file, so each level
+    /// comes back out the way it does when a file is cut short, and the
+    /// rest of the text goes into the tree unread ([`Self::cut_off`]).
+    fn give_up(&mut self) {
+        self.too_deep = true;
+        self.end = self.end.min(self.index);
+        // What was remembered read tokens that are past the end now.
+        self.conditionals.clear();
+        self.type_arguments.clear();
+        self.replays.clear();
+        self.replay_order.clear();
+        self.replay_cover = 0;
+    }
+
+    /// The tokens the parse gave up before reading, as skipped text: they
+    /// are still part of the file.
+    fn cut_off(&mut self) -> Option<GreenElement> {
+        let last = self.tokens.len() - 1;
+        if self.end >= last {
+            return None;
+        }
+        let skipped = (self.end..last)
+            .map(|index| {
+                GreenElement::Token(green_token(
+                    &self.tokens[index],
+                    &self.source,
+                    &mut self.cache,
+                ))
+            })
+            .collect();
+        Some(GreenElement::Node(GreenNode::new(
+            SyntaxKind::SkippedTokensTrivia,
+            skipped,
+        )))
     }
 
     fn eat_if(&mut self, kind: SyntaxKind) -> Option<GreenElement> {
@@ -414,6 +542,9 @@ impl Parser {
     // -- errors ------------------------------------------------------------
 
     fn error_at_current(&mut self, code: ErrorCode, args: &[&str]) {
+        if self.too_deep {
+            return;
+        }
         let span = self.current().span;
         self.diagnostics
             .push(Rc::new(Diagnostic::new(code, span, args)));
@@ -422,6 +553,9 @@ impl Parser {
     /// Reports at the point where something was expected: the end of the
     /// previous token, which is where a user would put the missing text.
     fn error_before_current(&mut self, code: ErrorCode, args: &[&str]) {
+        if self.too_deep {
+            return;
+        }
         let span = if self.index > 0 {
             TextSpan::at(self.tokens[self.index - 1].span.end())
         } else {

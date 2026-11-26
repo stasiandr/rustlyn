@@ -1319,6 +1319,11 @@ impl Compilation {
     /// before it is declared.
     #[must_use]
     pub fn semantic_diagnostics(&self) -> Vec<CompilationDiagnostic> {
+        // Bodies are bound here, as deep as they nest.
+        crate::parallel::deep(|| self.semantic_diagnostics_here())
+    }
+
+    fn semantic_diagnostics_here(&self) -> Vec<CompilationDiagnostic> {
         let mut sink = self.check_declarations(None);
 
         // Then the bodies, where names and expressions are bound.

@@ -32,6 +32,7 @@ pub fn revisions(
     config: &Config,
     progress: &dyn Fn(usize, usize),
 ) -> Result<Vec<Revision>, String> {
+    let range = setup::revision(range)?;
     let log = setup::git(
         root,
         &[
@@ -67,6 +68,7 @@ pub fn revisions(
 /// When git does not know the commit, or it has no parent to be compared
 /// with.
 pub fn revision(root: &str, commit: &str, config: &Config) -> Result<Revision, String> {
+    let commit = setup::revision(commit)?;
     let log = setup::git(root, &["log", "-1", "--format=%H%x09%s", commit])?;
     let (id, title) = log
         .trim_end()

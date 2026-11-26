@@ -37,6 +37,7 @@ impl Parser {
     fn parse_or_pattern(&mut self) -> GreenElement {
         let mut left = self.parse_and_pattern();
         while self.at_contextual(SyntaxKind::OrKeyword) {
+            self.fits(&left);
             let operator = self.eat_token_as(SyntaxKind::OrKeyword);
             let right = self.parse_and_pattern();
             left = node(SyntaxKind::OrPattern, vec![left, operator, right]);
@@ -47,6 +48,7 @@ impl Parser {
     fn parse_and_pattern(&mut self) -> GreenElement {
         let mut left = self.parse_unary_pattern();
         while self.at_contextual(SyntaxKind::AndKeyword) {
+            self.fits(&left);
             let operator = self.eat_token_as(SyntaxKind::AndKeyword);
             let right = self.parse_unary_pattern();
             left = node(SyntaxKind::AndPattern, vec![left, operator, right]);
@@ -55,6 +57,13 @@ impl Parser {
     }
 
     fn parse_unary_pattern(&mut self) -> GreenElement {
+        self.enter();
+        let pattern = self.parse_unary_pattern_here();
+        self.leave();
+        pattern
+    }
+
+    fn parse_unary_pattern_here(&mut self) -> GreenElement {
         if self.at_contextual(SyntaxKind::NotKeyword) {
             let operator = self.eat_token_as(SyntaxKind::NotKeyword);
             let operand = self.parse_unary_pattern();
@@ -407,6 +416,13 @@ impl Parser {
     }
 
     pub(crate) fn parse_variable_designation(&mut self) -> GreenElement {
+        self.enter();
+        let designation = self.parse_variable_designation_here();
+        self.leave();
+        designation
+    }
+
+    fn parse_variable_designation_here(&mut self) -> GreenElement {
         if self.at(SyntaxKind::OpenParenToken) {
             let mut children = vec![self.eat_token()];
             while !self.at(SyntaxKind::CloseParenToken) && !self.at_end() {
