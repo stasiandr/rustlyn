@@ -259,24 +259,30 @@ fn mismatched_returns(
             .first_token()
             .is_some_and(|token| token.kind() == SyntaxKind::VoidKeyword);
     let name = || member_display(compilation, member, &Default::default(), None);
+    // Where each `return` keyword is, found by one walk over the tokens the
+    // first time a `return` is met: looking each up from the root costs the
+    // depth of the tree, which in a long `else if` ladder is its length.
+    let mut keywords: Option<HashMap<u32, TextSpan>> = None;
     let mut visit = |statement: &BoundStatement| {
         let BoundStatementKind::Return(value) = &statement.kind else {
             return;
         };
-        let Some(keyword) = declaration
-            .find_token(statement.span.start())
-            .filter(|token| token.kind() == SyntaxKind::ReturnKeyword)
-        else {
+        let keywords = keywords.get_or_insert_with(|| {
+            declaration
+                .descendant_tokens()
+                .filter(|token| {
+                    token.kind() == SyntaxKind::ReturnKeyword && !token.span().is_empty()
+                })
+                .map(|token| (token.span().start(), token.span()))
+                .collect()
+        });
+        let Some(&keyword) = keywords.get(&statement.span.start()) else {
             return;
         };
         match value {
             Some(_) if void => found.push((
                 tree,
-                Diagnostic::new(
-                    ErrorCode::ErrRetNoObjectRequired,
-                    keyword.span(),
-                    &[&name()],
-                ),
+                Diagnostic::new(ErrorCode::ErrRetNoObjectRequired, keyword, &[&name()]),
             )),
             None if !void => {
                 let returns = binder.type_of(member, &mut Diagnostics::new());
@@ -284,7 +290,7 @@ fn mismatched_returns(
                     let shown = returns.display(compilation.symbols());
                     found.push((
                         tree,
-                        Diagnostic::new(ErrorCode::ErrRetObjectRequired, keyword.span(), &[&shown]),
+                        Diagnostic::new(ErrorCode::ErrRetObjectRequired, keyword, &[&shown]),
                     ));
                 }
             }

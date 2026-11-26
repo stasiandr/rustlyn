@@ -4,7 +4,7 @@ use rustlyn_diagnostics::ErrorCode;
 use rustlyn_syntax::{SyntaxKind, SyntaxNode};
 use rustlyn_text::TextSpan;
 
-use super::{BodyBinder, identifier_text, typeless, written_typeless};
+use super::{BodyBinder, identifier_text, typeless};
 use crate::binder::Diagnostics;
 use crate::bound::{
     BoundCaseLabel, BoundExpression, BoundExpressionKind, BoundListPattern, BoundListSlice,
@@ -1395,21 +1395,23 @@ impl BodyBinder<'_> {
         // type, which a typeless arm has no say in): `1 => new C(), int n =>
         // new() { n = n }` is a `C`, and `0 => (Func<int, int>)(x => x), _ =>
         // y => y * 2` a `Func<int, int>` — as `?:` has it.
-        let typeless_beside_a_type =
-            values
-                .iter()
-                .filter(|value| written_typeless(value))
-                .all(|value| {
-                    value.kind() == SyntaxKind::ImplicitObjectCreationExpression || is_lambda(value)
-                })
-                && values.iter().any(|value| {
-                    !written_typeless(value) && value.kind() != SyntaxKind::ThrowExpression
-                });
+        let typeless_beside_a_type = values
+            .iter()
+            .filter(|value| self.written_typeless(value))
+            .all(|value| {
+                value.kind() == SyntaxKind::ImplicitObjectCreationExpression || is_lambda(value)
+            })
+            && values.iter().any(|value| {
+                !self.written_typeless(value) && value.kind() != SyntaxKind::ThrowExpression
+            });
         // Nothing has said what this is yet, and the arms cannot say it
         // themselves: `attribute switch { A => isPossibleA, _ => throw ... }`
         // is a method group either way round. Wait for whatever it is given
         // to, the way a lambda written on its own waits.
-        if target.is_none() && !typeless_beside_a_type && values.iter().any(written_typeless) {
+        if target.is_none()
+            && !typeless_beside_a_type
+            && values.iter().any(|value| self.written_typeless(value))
+        {
             return BoundExpression::new(
                 BoundExpressionKind::UnboundSwitch(span),
                 Type::Error,

@@ -5,9 +5,7 @@ use rustlyn_diagnostics::ErrorCode;
 use rustlyn_syntax::{SyntaxKind, SyntaxNode, TokenValue};
 use rustlyn_text::TextSpan;
 
-use super::{
-    BodyBinder, binary_operator, compound_operator, identifier_text, typeless, written_typeless,
-};
+use super::{BodyBinder, binary_operator, compound_operator, identifier_text, typeless};
 use crate::binder::Diagnostics;
 use crate::bound::{
     BoundAwaiting, BoundExpression, BoundExpressionKind, BoundPattern, BoundPatternKind,
@@ -34,15 +32,15 @@ impl BodyBinder<'_> {
         // Nothing has said what this is yet, and the branches cannot say it
         // themselves. Wait for whatever it is given to, the way a lambda
         // written on its own waits.
-        if target.is_none() && (written_typeless(&first) || written_typeless(&second)) {
+        if target.is_none() && (self.written_typeless(&first) || self.written_typeless(&second)) {
             // One branch with a type says what the other is: `stores is null
             // ? [] : stores.ToImmutable()` is an `ImmutableArray<T>`, since
             // the `[]` reaches that and the conditional has that as its
             // natural type (§12.18). Two typeless branches wait.
-            if written_typeless(&first) != written_typeless(&second) {
+            if self.written_typeless(&first) != self.written_typeless(&second) {
                 let floor = self.speculation_floor();
                 let condition = self.bind_condition(condition_node.as_ref());
-                let typed_first = !written_typeless(&first);
+                let typed_first = !self.written_typeless(&first);
                 let (typed_node, other_node) = if typed_first {
                     (&first, &second)
                 } else {

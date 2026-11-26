@@ -385,19 +385,25 @@ impl SyntaxNode {
         if !self.full_span().contains(position) {
             return None;
         }
+        // The green children know their widths, so which one holds the
+        // position is arithmetic, and only that one is made red.
         let mut node = self.clone();
         'descend: loop {
-            for child in node.children_with_tokens() {
-                if !child.full_span().contains(position) {
-                    continue;
-                }
-                match child {
-                    SyntaxElement::Token(token) => return Some(token),
-                    SyntaxElement::Node(child) => {
-                        node = child;
-                        continue 'descend;
+            let mut offset = node.0.position;
+            let mut index = 0;
+            while let Some(green) = node.0.green.slot(index) {
+                let width = green.full_width();
+                if TextSpan::new(offset, width).contains(position) {
+                    match node.element_at(green, offset, index as u32) {
+                        SyntaxElement::Token(token) => return Some(token),
+                        SyntaxElement::Node(child) => {
+                            node = child;
+                            continue 'descend;
+                        }
                     }
                 }
+                offset += width;
+                index += 1;
             }
             return None;
         }

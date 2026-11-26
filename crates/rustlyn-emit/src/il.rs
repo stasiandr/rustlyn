@@ -13,6 +13,7 @@
 //! plausible is exactly the kind of thing that fails at a customer rather than
 //! in a test.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 /// A metadata token: the table it points into and the row inside it.
@@ -473,6 +474,40 @@ pub(crate) struct InstructionStream {
     /// instruction, and the entry of every handler and filter, which the
     /// runtime enters with the exception already on the stack.
     entry_points: Vec<(Label, i32)>,
+    /// The labels in the order they were marked, which `end_reachable` reads
+    /// from where it left off.
+    marks: Vec<Label>,
+    /// What `end_reachable` has worked out so far.
+    reach: RefCell<Reach>,
+}
+
+/// How far control gets through the instructions written so far.
+///
+/// More instructions and more marked labels only add ways to get from one
+/// place to another, so what has been reached stays reached, and a question
+/// about the end of the stream only has to follow what was added since the
+/// last one, not start over from the first instruction.
+#[derive(Clone, Debug, Default)]
+struct Reach {
+    /// Per instruction, and one more for the end: whether control gets there.
+    reached: Vec<bool>,
+    /// The instructions and entry points looked at already.
+    seen_entries: usize,
+    seen_entry_points: usize,
+    seen_marks: usize,
+    /// Per label: whether a branch that is reached, or a handler, is waiting
+    /// for the label to be marked.
+    awaited: Vec<bool>,
+    started: bool,
+}
+
+impl Reach {
+    fn reach(&mut self, at: usize, work: &mut Vec<usize>) {
+        if !self.reached[at] {
+            self.reached[at] = true;
+            work.push(at);
+        }
+    }
 }
 
 impl InstructionStream {
@@ -508,7 +543,11 @@ impl InstructionStream {
 
     /// Fixes a label at the current position.
     pub(crate) fn mark(&mut self, label: Label) {
+        // `end_reachable` keeps what it has worked out, which holds only
+        // while a label stays where it was first put.
+        debug_assert!(self.labels[label.0].is_none(), "a label is marked once");
         self.labels[label.0] = Some(self.entries.len());
+        self.marks.push(label);
     }
 
     /// Records a protected region and its handler.
@@ -569,33 +608,52 @@ impl InstructionStream {
     #[must_use]
     pub(crate) fn end_reachable(&self) -> bool {
         let end = self.entries.len();
-        let mut reached = vec![false; end + 1];
-        let mut work: Vec<usize> = vec![0];
+        let mut state = self.reach.borrow_mut();
+        let state = &mut *state;
+        state.reached.resize(end + 1, false);
+        state.awaited.resize(self.labels.len(), false);
+        let mut work: Vec<usize> = Vec::new();
+        if !state.started {
+            state.started = true;
+            state.reach(0, &mut work);
+        }
+        // The old end was only a place to be; now an instruction follows it.
+        if state.seen_entries < end && state.reached[state.seen_entries] {
+            work.push(state.seen_entries);
+        }
         // A handler is entered by the runtime, not by a branch.
-        for (label, _) in &self.entry_points {
-            if let Some(at) = self.labels[label.0] {
-                work.push(at);
+        for (label, _) in &self.entry_points[state.seen_entry_points..] {
+            match self.labels[label.0] {
+                Some(at) => state.reach(at, &mut work),
+                None => state.awaited[label.0] = true,
             }
         }
+        for label in &self.marks[state.seen_marks..] {
+            if state.awaited[label.0] {
+                state.awaited[label.0] = false;
+                let at = self.labels[label.0].expect("a marked label is placed");
+                state.reach(at, &mut work);
+            }
+        }
+        state.seen_entries = end;
+        state.seen_entry_points = self.entry_points.len();
+        state.seen_marks = self.marks.len();
         while let Some(at) = work.pop() {
-            if at > end || reached[at] {
+            if at >= end {
                 continue;
             }
-            reached[at] = true;
-            if at == end {
-                return true;
-            }
             let instruction = self.entries[at].instruction;
-            if let Some(target) = branch_target(instruction)
-                && let Some(to) = self.labels[target.0]
-            {
-                work.push(to);
+            if let Some(target) = branch_target(instruction) {
+                match self.labels[target.0] {
+                    Some(to) => state.reach(to, &mut work),
+                    None => state.awaited[target.0] = true,
+                }
             }
             if instruction.falls_through() {
-                work.push(at + 1);
+                state.reach(at + 1, &mut work);
             }
         }
-        false
+        state.reached[end]
     }
 
     /// Encodes the stream, returning the bytes, the stack depth they need and

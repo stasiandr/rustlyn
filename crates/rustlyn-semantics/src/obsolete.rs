@@ -16,6 +16,7 @@ use crate::binder::{Binder, Diagnostics};
 use crate::bound::{BoundBody, BoundSymbol};
 use crate::checks::member_display;
 use crate::compilation::Compilation;
+use crate::fxhash::FxHashMap;
 use crate::symbol::{SymbolId, SymbolKind};
 use crate::types::Type;
 
@@ -133,6 +134,7 @@ pub(crate) fn check_declarations(binder: &Binder<'_>, tree: usize, found: &mut D
             )
         })
     };
+    let mut signature_memo = FxHashMap::default();
     for node in root.descendants() {
         if matches!(
             node.kind(),
@@ -146,7 +148,7 @@ pub(crate) fn check_declarations(binder: &Binder<'_>, tree: usize, found: &mut D
             | SyntaxKind::GenericName
             | SyntaxKind::QualifiedName
             | SyntaxKind::AliasQualifiedName
-                if in_a_signature(&node) =>
+                if in_a_signature(&node, &mut signature_memo) =>
             {
                 type_named(binder, tree, &node, found);
             }
@@ -268,7 +270,11 @@ fn attribute_used(
 /// A type named outside any body, by the whole of its name: not a part of a
 /// qualified one, a `using`, a namespace's name or an attribute, which are
 /// looked at otherwise or not at all.
-fn in_a_signature(node: &SyntaxNode) -> bool {
+///
+/// `seen` holds what the nodes passed on the way up came to, by where they
+/// are in the tree: a name deep in a long chain climbs the whole chain, and
+/// the next name climbs only as far as the first node already answered for.
+fn in_a_signature(node: &SyntaxNode, seen: &mut FxHashMap<(usize, u32), bool>) -> bool {
     if node.parent().is_some_and(|parent| {
         matches!(
             parent.kind(),
@@ -283,9 +289,20 @@ fn in_a_signature(node: &SyntaxNode) -> bool {
     }
     // Nearest first: a local function's signature is reached before the
     // body around it, its own body before the function.
+    let mut passed = Vec::new();
+    let mut answer = true;
     for ancestor in node.ancestors() {
+        let at = (
+            std::sync::Arc::as_ptr(ancestor.green()) as usize,
+            ancestor.full_span().start(),
+        );
+        if let Some(&known) = seen.get(&at) {
+            answer = known;
+            break;
+        }
         if ancestor.kind() == SyntaxKind::LocalFunctionStatement {
-            return true;
+            answer = true;
+            break;
         }
         if matches!(
             ancestor.kind(),
@@ -298,10 +315,15 @@ fn in_a_signature(node: &SyntaxNode) -> bool {
                 | SyntaxKind::ArgumentList
                 | SyntaxKind::BracketedArgumentList
         ) {
-            return false;
+            answer = false;
+            break;
         }
+        passed.push(at);
     }
-    true
+    for at in passed {
+        seen.insert(at, answer);
+    }
+    answer
 }
 
 /// CS0612, CS0618 or CS0619 for a type named in a signature, where it is

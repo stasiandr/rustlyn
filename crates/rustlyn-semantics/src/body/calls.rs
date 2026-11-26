@@ -553,18 +553,19 @@ impl BodyBinder<'_> {
         // Nor an extension method: an extension block's property (C# 14)
         // holding a delegate is invoked as one.
         // `object.M()` reads a static one through the type.
-        let extension_receiver = receiver.clone().or_else(|| {
-            (names_a_type == Some(true)).then(|| {
-                Box::new(BoundExpression::new(
-                    BoundExpressionKind::TypeExpression(container),
-                    receiver_type.clone(),
-                    span,
-                ))
-            })
-        });
+        // The receiver is copied only when that is asked: it is the whole
+        // chain of calls to the left of this one.
         if resolved.is_none()
             && candidates.is_empty()
-            && let Some(receiver) = extension_receiver
+            && let Some(receiver) = receiver.clone().or_else(|| {
+                (names_a_type == Some(true)).then(|| {
+                    Box::new(BoundExpression::new(
+                        BoundExpressionKind::TypeExpression(container),
+                        receiver_type.clone(),
+                        span,
+                    ))
+                })
+            })
             && let Some((target, _)) = self.extension_member_access(&receiver, &name, span)
             && self.is_invocable(&target.ty)
         {

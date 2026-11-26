@@ -5,7 +5,7 @@ use rustlyn_diagnostics::ErrorCode;
 use rustlyn_syntax::{LanguageVersion, SyntaxKind, SyntaxNode};
 use rustlyn_text::TextSpan;
 
-use super::{BodyBinder, identifier_text, typeless};
+use super::{BodyBinder, identifier_text, node_key, typeless};
 use crate::binder::Diagnostics;
 use crate::bound::{
     BoundCaseLabel, BoundCatch, BoundExpression, BoundExpressionKind, BoundPattern,
@@ -343,7 +343,7 @@ impl BodyBinder<'_> {
                 self.bind_foreach(node)
             }
             SyntaxKind::ReturnStatement => {
-                if Self::in_finally(node) {
+                if self.in_finally(node) {
                     self.report_finally_leave(node);
                 }
                 match node.children().next() {
@@ -1093,10 +1093,32 @@ impl BodyBinder<'_> {
     }
 
     /// Whether a statement sits in a `finally` of the function it is in.
-    fn in_finally(node: &SyntaxNode) -> bool {
-        node.ancestors()
-            .take_while(|ancestor| !crate::flow::is_function_boundary(ancestor.kind()))
-            .any(|ancestor| ancestor.kind() == SyntaxKind::FinallyClause)
+    fn in_finally(&mut self, node: &SyntaxNode) -> bool {
+        // Up to the first `finally`, function boundary or node already
+        // answered for; then every node passed has that answer too.
+        let mut passed = vec![node_key(node)];
+        let mut answer = false;
+        let mut current = node.parent();
+        while let Some(ancestor) = current {
+            let at = node_key(ancestor);
+            if let Some(&known) = self.in_finally_memo.get(&at) {
+                answer = known;
+                break;
+            }
+            if ancestor.kind() == SyntaxKind::FinallyClause {
+                answer = true;
+                break;
+            }
+            if crate::flow::is_function_boundary(ancestor.kind()) {
+                break;
+            }
+            passed.push(at);
+            current = ancestor.parent();
+        }
+        for at in passed {
+            self.in_finally_memo.insert(at, answer);
+        }
+        answer
     }
 
     fn bind_switch_statement(&mut self, node: &SyntaxNode) -> BoundStatementKind {

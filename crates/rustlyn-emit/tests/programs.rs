@@ -6738,3 +6738,59 @@ fn a_five_thousand_term_concatenation_of_strings_compiles_and_runs() {
     );
     check("StringSum", &source, &format!("{}\n", 5001 * 2));
 }
+
+/// What the chains cost has to grow with their length, not with its square:
+/// every pass that walked the tree above a link, or copied what was to its
+/// left, once for each link made twelve thousand of them take minutes. Each
+/// takes a few seconds here even unoptimised; the bound allows for a loaded
+/// machine, and a quadratic cost is far past it.
+#[test]
+fn twelve_thousand_link_chains_compile_in_linear_time() {
+    let n = 12_000;
+    // An `else if` ladder and a chain of calls nest, and the compiler
+    // refuses one past about six thousand.
+    let ladder: String = (1..n / 2)
+        .map(|i| format!("else if (x == {i}) x = {i};\n"))
+        .collect();
+    let ternary: String = (0..n).map(|i| format!("x == {i} ? {i} : ")).collect();
+    let cases = [
+        (
+            "TimedElseIf",
+            flat_program("", &format!("int x = 5; if (x == 0) x = 0;\n{ladder}")),
+        ),
+        (
+            "TimedTernary",
+            flat_program("", &format!("int x = 5; int y = {ternary}-1;")),
+        ),
+        (
+            "TimedCalls",
+            flat_program(
+                "",
+                &format!(
+                    "int x = 5; string s = x.ToString(){};",
+                    ".ToString()".repeat(n / 2)
+                ),
+            ),
+        ),
+        (
+            "TimedSum",
+            flat_program("", &format!("int x = 5; int y = x{};", " + x".repeat(n))),
+        ),
+        (
+            "TimedConcatenation",
+            flat_program(
+                &format!("static string Join(string s) => s{};", " + s".repeat(n)),
+                "",
+            ),
+        ),
+    ];
+    for (name, source) in cases {
+        let started = std::time::Instant::now();
+        build(name, &source);
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(40),
+            "{name} took {took:?} to compile"
+        );
+    }
+}

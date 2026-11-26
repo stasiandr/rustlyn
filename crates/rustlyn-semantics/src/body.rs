@@ -10,7 +10,9 @@
 //! always reach the same answer as the binder did; the diagnostics would then
 //! describe a program other than the one that ran.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rustlyn_diagnostics::{Diagnostic, ErrorCode};
 use rustlyn_syntax::{SyntaxKind, SyntaxNode};
@@ -101,6 +103,16 @@ pub struct BodyBinder<'a> {
     /// The same with what nested collections suggest, which only inference
     /// reads.
     collection_hints: HashMap<TextSpan, Vec<inference::InferenceArgument>>,
+    /// Whether a node sits in a `finally` of its function, for the nodes
+    /// asked about or passed on the way up, by where they are in the tree:
+    /// the statements of a long `else if` ladder are each as deep as the
+    /// ladder is long, and each would walk all of it again.
+    in_finally_memo: HashMap<(usize, u32), bool>,
+    /// What `written_typeless` said of the conditionals it was asked about.
+    typeless_memo: RefCell<HashMap<(usize, u32), bool>>,
+    /// Where each variable's `out var` zone is, by the start of its name,
+    /// or that it has none.
+    out_var_zones: HashMap<u32, Option<(u32, u32)>>,
     /// Whether the body is a field or property initializer, where a record's
     /// positional parameter is itself and not the property made from it.
     in_initializer: bool,
@@ -487,6 +499,9 @@ impl<'a> BodyBinder<'a> {
             branch_types: HashMap::new(),
             collection_types: HashMap::new(),
             collection_hints: HashMap::new(),
+            in_finally_memo: HashMap::new(),
+            typeless_memo: RefCell::new(HashMap::new()),
+            out_var_zones: HashMap::new(),
             in_initializer,
             in_attribute: false,
             in_nameof: false,
@@ -959,34 +974,56 @@ fn generality(ty: &Type, type_parameters: &[SymbolId], depth: u32) -> usize {
     }
 }
 
-fn written_typeless(node: &SyntaxNode) -> bool {
-    match node.kind() {
-        SyntaxKind::SimpleLambdaExpression
-        | SyntaxKind::ParenthesizedLambdaExpression
-        | SyntaxKind::AnonymousMethodExpression
-        | SyntaxKind::CollectionExpression
-        | SyntaxKind::ImplicitObjectCreationExpression => true,
-        // `((string s) => int.Parse(s))` is the lambda it wraps.
-        SyntaxKind::ParenthesizedExpression => node
-            .children()
-            .find(|child| child.kind().is_expression())
-            .is_some_and(|inner| written_typeless(&inner)),
-        SyntaxKind::ConditionalExpression => {
-            let mut branches = node.children().skip(1);
-            let (Some(first), Some(second)) = (branches.next(), branches.next()) else {
-                return false;
-            };
-            written_typeless(&first) || written_typeless(&second)
+/// Where a node is, which is what it is told apart by: the same green node
+/// at the same place is the same node however many handles there are to it.
+fn node_key(node: &SyntaxNode) -> (usize, u32) {
+    (Arc::as_ptr(node.green()) as usize, node.full_span().start())
+}
+
+impl BodyBinder<'_> {
+    /// Whether the expression has no type of its own in the way it is
+    /// written: a lambda, a collection expression, a `new()`.
+    ///
+    /// What a conditional says is kept: the one binding a long `?:` ladder
+    /// asks about the whole of what is left of it at every step, and every
+    /// answer is the answer for the rest of the ladder as well.
+    fn written_typeless(&self, node: &SyntaxNode) -> bool {
+        match node.kind() {
+            SyntaxKind::SimpleLambdaExpression
+            | SyntaxKind::ParenthesizedLambdaExpression
+            | SyntaxKind::AnonymousMethodExpression
+            | SyntaxKind::CollectionExpression
+            | SyntaxKind::ImplicitObjectCreationExpression => true,
+            // `((string s) => int.Parse(s))` is the lambda it wraps.
+            SyntaxKind::ParenthesizedExpression => node
+                .children()
+                .find(|child| child.kind().is_expression())
+                .is_some_and(|inner| self.written_typeless(&inner)),
+            SyntaxKind::ConditionalExpression => {
+                let key = node_key(node);
+                if let Some(&known) = self.typeless_memo.borrow().get(&key) {
+                    return known;
+                }
+                let mut branches = node.children().skip(1);
+                let answer = match (branches.next(), branches.next()) {
+                    (Some(first), Some(second)) => {
+                        self.written_typeless(&first) || self.written_typeless(&second)
+                    }
+                    _ => false,
+                };
+                self.typeless_memo.borrow_mut().insert(key, answer);
+                answer
+            }
+            SyntaxKind::SwitchExpression => node.children().any(|child| {
+                child.kind() == SyntaxKind::SwitchExpressionArm
+                    && child
+                        .children()
+                        .filter(|part| part.kind().is_expression())
+                        .last()
+                        .is_some_and(|value| self.written_typeless(&value))
+            }),
+            _ => false,
         }
-        SyntaxKind::SwitchExpression => node.children().any(|child| {
-            child.kind() == SyntaxKind::SwitchExpressionArm
-                && child
-                    .children()
-                    .filter(|part| part.kind().is_expression())
-                    .last()
-                    .is_some_and(|value| written_typeless(&value))
-        }),
-        _ => false,
     }
 }
 

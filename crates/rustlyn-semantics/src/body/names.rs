@@ -800,12 +800,12 @@ impl BodyBinder<'_> {
             // `M(out var x, x)`: the type of `x` comes from the overload the
             // call picks, which the arguments decide, so none of them may
             // read it (CS8196).
-            if self
+            let declared = self
                 .body
                 .locals
                 .get(local.0 as usize)
-                .is_some_and(|symbol| in_out_var_zone(node, symbol.span))
-            {
+                .map(|symbol| symbol.span);
+            if declared.is_some_and(|declared| self.in_out_var_zone(node, declared)) {
                 self.report(
                     ErrorCode::ErrImplicitlyTypedVariableUsedInForbiddenZone,
                     span,
@@ -2192,42 +2192,47 @@ fn names_a_construction(node: &SyntaxNode) -> bool {
     }
 }
 
-/// Whether `reference` sits in the argument list that declares, with
-/// `out var`, the variable whose name is written at `declared`: the type of
-/// that variable is not known until the call is resolved.
-fn in_out_var_zone(reference: &SyntaxNode, declared: TextSpan) -> bool {
-    let Some(root) = reference.ancestors().last() else {
-        return false;
-    };
-    let Some(token) = root.find_token(declared.start()) else {
-        return false;
-    };
-    let Some(declaration) = token
+impl BodyBinder<'_> {
+    /// Whether `reference` sits in the argument list that declares, with
+    /// `out var`, the variable whose name is written at `declared`: the type
+    /// of that variable is not known until the call is resolved.
+    ///
+    /// Where that zone is depends on the declaration alone, so it is found
+    /// once for each variable; finding it takes a walk up to the root of the
+    /// tree, which for each of thousands of references deep in a long chain
+    /// is the length of the chain.
+    fn in_out_var_zone(&mut self, reference: &SyntaxNode, declared: TextSpan) -> bool {
+        let zone = *self
+            .out_var_zones
+            .entry(declared.start())
+            .or_insert_with(|| out_var_zone(reference, declared));
+        zone.is_some_and(|(from, to)| {
+            reference.span().start() >= from && reference.span().end() <= to
+        })
+    }
+}
+
+/// The part of the source an `out var` declaration at `declared` is not yet
+/// typed in: from the end of the declaration to the end of its argument list.
+fn out_var_zone(reference: &SyntaxNode, declared: TextSpan) -> Option<(u32, u32)> {
+    let root = reference.ancestors().last()?;
+    let token = root.find_token(declared.start())?;
+    let declaration = token
         .parent()
         .ancestors()
-        .find(|node| node.kind() == SyntaxKind::DeclarationExpression)
-    else {
-        return false;
-    };
+        .find(|node| node.kind() == SyntaxKind::DeclarationExpression)?;
     let is_var = declaration
         .children()
         .find(|child| child.kind().is_type_node())
         .is_some_and(|written| super::declares_var(&written));
-    let Some(argument) = declaration.parent().filter(|parent| {
+    let argument = declaration.parent().filter(|parent| {
         parent.kind() == SyntaxKind::Argument
             && parent
                 .child_tokens()
                 .any(|token| token.kind() == SyntaxKind::OutKeyword)
-    }) else {
-        return false;
-    };
-    let Some(list) = argument
+    })?;
+    let list = argument
         .parent()
-        .filter(|list| list.kind() == SyntaxKind::ArgumentList)
-    else {
-        return false;
-    };
-    is_var
-        && reference.span().start() >= declaration.span().end()
-        && reference.span().end() <= list.span().end()
+        .filter(|list| list.kind() == SyntaxKind::ArgumentList)?;
+    is_var.then(|| (declaration.span().end(), list.span().end()))
 }
