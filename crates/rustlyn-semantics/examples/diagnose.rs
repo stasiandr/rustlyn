@@ -16,6 +16,14 @@ use rustlyn_syntax::{LanguageVersion, ParseOptions, parse_with};
 use rustlyn_text::SourceText;
 
 fn main() -> std::process::ExitCode {
+    // Parsing recurses as deep as the source nests, and the files are parsed
+    // here: on a stack as deep as the compiler's own threads have, not the
+    // main thread's, which an unoptimized build outgrows well inside what
+    // the parser allows.
+    rustlyn_semantics::parallel::deep(run)
+}
+
+fn run() -> std::process::ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
         eprintln!(

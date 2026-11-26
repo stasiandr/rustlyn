@@ -2554,3 +2554,95 @@ fn a_cast_the_language_has_is_not_cs0030() {
         assert!(found.is_empty(), "{cast}: {found:?}");
     }
 }
+
+// MARK: - calls that could mean two methods
+
+/// Overloads to call, and a method whose parameters are the arguments.
+fn overloaded(body: &str) -> String {
+    format!(
+        "interface IA {{ }} interface IB {{ }} class AB : IA, IB {{ }}
+         class Animal {{ }} class Dog : Animal {{ }} class Puppy : Dog {{ }}
+         class C {{
+             static void M(int a, long b) {{ }}
+             static void M(long a, int b) {{ }}
+             static void N(Animal a, Dog b) {{ }}
+             static void N(Dog a, Animal b) {{ }}
+             static void O(IA a) {{ }}
+             static void O(IB b) {{ }}
+             static void P(object a, string b) {{ }}
+             static void P(string a, object b) {{ }}
+             static void Q(int a, double b) {{ }}
+             static void Q(double a, int b) {{ }}
+             static void Q(double a, double b) {{ }}
+             static void R(long a, long b) {{ }}
+             static void R(int a, long b) {{ }}
+             static void R(long a, int b) {{ }}
+             static void R(int a, int b) {{ }}
+             static void S(byte a, long b) {{ }}
+             static void S(long a, byte b) {{ }}
+             static void T(int a, long b, int c = 0) {{ }}
+             static void T(long a, int b) {{ }}
+             static void U(params int[] xs) {{ }}
+             static void U(int a, long b) {{ }}
+             static void U(long a, int b) {{ }}
+             static void V<T>(T a, long b) {{ }}
+             static void V(long a, int b) {{ }}
+             static void X(float a, double b) {{ }}
+             static void X(double a, float b) {{ }}
+             void Inst(Animal a, Dog b) {{ }}
+             void Inst(Dog a, Animal b) {{ }}
+             void Test(int i, long l, Dog d, Puppy p, AB ab, string s, byte by, short sh, float f, Animal an) {{ {body} }}
+         }}"
+    )
+}
+
+#[test]
+fn a_call_two_overloads_take_equally_well_is_cs0121() {
+    // The first declared was called, without a word that the other could
+    // have been meant.
+    assert_eq!(
+        diagnose(&overloaded("M(i, i);")),
+        [
+            "CS0121 'M': The call is ambiguous between the following methods or properties: 'C.M(int, long)' and 'C.M(long, int)'"
+        ]
+    );
+    for call in [
+        // One argument is better for this one, the other for that one.
+        "M(1, 1);",
+        "N(d, d);",
+        "N(p, p);",
+        "P(s, s);",
+        "Q(i, i);",
+        "S(by, by);",
+        "S(1, 1);",
+        "X(f, f);",
+        "X(1, 1);",
+        "Inst(d, d);",
+        "this.Inst(p, p);",
+        "new C().Inst(d, d);",
+        // Neither is better, and they are not the same.
+        "O(ab);",
+    ] {
+        assert_eq!(only(&overloaded(call), &["CS0121"]), ["CS0121"], "{call}");
+    }
+}
+
+#[test]
+fn a_call_one_overload_takes_best_is_not_cs0121() {
+    for call in [
+        // One is better at an argument and no worse at any.
+        "M(i, l); M(l, i); M(sh, l);",
+        "N(an, d); N(d, an);",
+        "P(s, 1); P(1, s);",
+        "S(by, l); X(f, 1.0); Inst(an, d);",
+        // A third is better than both.
+        "R(i, i);",
+        // Rules of their own, and Roslyn settles them: a default left
+        // unfilled, an expanded `params`.
+        "T(i, i);",
+        "U(i, i);",
+    ] {
+        let found = only(&overloaded(call), &["CS0121"]);
+        assert!(found.is_empty(), "{call}: {found:?}");
+    }
+}

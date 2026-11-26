@@ -90,8 +90,11 @@ pub fn parse_with(source: SourceText, options: &ParseOptions) -> SyntaxTree {
 /// else — ran the thread out of stack, which no caller can catch. Roslyn
 /// asks the runtime whether stack is left and reports CS8078; a fixed depth
 /// gives the same file the same answer on every machine and in every build,
-/// and stays within a main thread's stack.
-pub(crate) const MAX_NESTING: u32 = 512;
+/// and an optimized parser takes this many levels in under a megabyte of
+/// stack, a main thread's on any system (an unoptimized one, several times
+/// that). A thousand levels is what the editor's own tests nest blocks to;
+/// nothing written by hand comes near.
+pub(crate) const MAX_NESTING: u32 = 1024;
 
 /// How deep a tree the parser hands out ([`GreenNode::height`]). A chain
 /// — `a + b + c + …`, `a.b().c().d()…` — takes no recursion to read and

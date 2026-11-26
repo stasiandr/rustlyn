@@ -1564,11 +1564,13 @@ fn a_dot_at_the_end_of_a_line_before_a_declaration_ends_the_statement() {
 
 // MARK: - source nested too deep
 
-/// On the stack a main thread has: the tests' own threads have a quarter of
-/// it, and an unoptimized parser's frames are several times a release one's.
-fn on_a_main_thread_stack(test: impl FnOnce() + Send + 'static) {
+/// On the stack the editor parses on. An optimized parser takes the
+/// deepest nesting it allows in under a megabyte — a main thread's stack on
+/// any system — and an unoptimized one, as tests are built, several times
+/// that.
+fn on_the_editors_stack(test: impl FnOnce() + Send + 'static) {
     std::thread::Builder::new()
-        .stack_size(8 << 20)
+        .stack_size(64 << 20)
         .spawn(test)
         .expect("a thread to parse on")
         .join()
@@ -1582,7 +1584,7 @@ fn on_a_main_thread_stack(test: impl FnOnce() + Send + 'static) {
 /// it runs out of stack, and the rest of the text in the tree unread.
 #[test]
 fn source_nested_too_deep_is_cs8078_and_not_a_stack_overflow() {
-    on_a_main_thread_stack(|| {
+    on_the_editors_stack(|| {
         let n = 100_000;
         let in_method = |body: &str| format!("class C {{ void M(object x) {{ {body} }} }}");
         for text in [
@@ -1644,7 +1646,7 @@ fn source_nested_too_deep_is_cs8078_and_not_a_stack_overflow() {
 /// its own, well past anything written by hand or by a generator.
 #[test]
 fn a_chain_grown_too_long_is_cs8078() {
-    on_a_main_thread_stack(|| {
+    on_the_editors_stack(|| {
         let in_method = |body: &str| format!("class C {{ void M(string x) {{ {body} }} }}");
         let chains = |n: usize| {
             [
@@ -1680,7 +1682,7 @@ fn a_chain_grown_too_long_is_cs8078() {
 /// the limit is on the tree, however it came to be that deep.
 #[test]
 fn chains_nested_in_chains_stay_within_the_depth() {
-    on_a_main_thread_stack(|| {
+    on_the_editors_stack(|| {
         // 300 levels of `(… + x + x + …)`, each a chain of 3000.
         let mut text = String::from("x");
         for _ in 0..300 {
@@ -1704,11 +1706,12 @@ fn chains_nested_in_chains_stay_within_the_depth() {
     });
 }
 
-/// Nesting a person or a generator writes is nowhere near the limit.
+/// Nesting a person or a generator writes is nowhere near the limit: a
+/// thousand levels still parse.
 #[test]
 fn deep_nesting_within_the_limit_parses() {
-    on_a_main_thread_stack(|| {
-        let n = 400;
+    on_the_editors_stack(|| {
+        let n = 1000;
         for text in [
             format!(
                 "class C {{ void M(int x) {{ x = {}x{}; }} }}",
@@ -1748,7 +1751,7 @@ fn deep_nesting_within_the_limit_parses() {
 /// real: twice per level, so `A<A<A<…>>>` thirty deep never finished.
 #[test]
 fn nested_type_arguments_are_not_read_again_for_each_level() {
-    on_a_main_thread_stack(|| {
+    on_the_editors_stack(|| {
         let n = 300;
         for text in [
             format!("class C {{ {}int{} f; }}", "A<".repeat(n), ">".repeat(n)),

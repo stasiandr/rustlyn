@@ -22,6 +22,13 @@ implements the behaviour.
   takes its number from the text and is correct; in a string the surrogate stays
   `U+FFFD`. This is the one place where C# genuinely requires UTF-16.
 * XML inside documentation comments is not parsed into the tree.
+* Source nested too deep is CS8078 at a fixed depth, not where the stack runs out:
+  1,024 levels of the parser's own recursion (parentheses, blocks, type arguments,
+  patterns, nested types) and a tree 4,096 nodes deep however it got there (a chain of
+  `+` or of calls takes no recursion to read). Roslyn asks the runtime how much stack is
+  left, so its limit moves with the thread and the build; a fixed one gives the same
+  file the same answer everywhere. The rest of the file is kept in the tree as skipped
+  tokens.
 
 ## Binding and emitting
 
@@ -53,6 +60,18 @@ implements the behaviour.
 * Constant folding understands literals, arithmetic on them and references to other
   constants, which is exactly what a C# constant is. Anything else gives `None`, not a
   wrong value.
+* An error that says code is wrong is reported only where that is certain; where the
+  binder cannot tell, it lets the code through rather than refuse code Roslyn accepts.
+  CS0030 (a cast nothing can make) is judged for classes and structs only — not for
+  interfaces, delegates, arrays, tuples or type parameters, whose conversions have rules
+  of their own. CS0121 (an ambiguous call) is judged for methods of one type that are
+  not generic and take exactly the arguments given, by value; an ambiguity that turns on
+  a lambda, a generic method, `params` or an optional parameter still resolves to the
+  first candidate. A protected nested *type* of a referenced assembly can still be named
+  from anywhere (its members cannot).
+* Definite assignment follows `goto`, except out of a `try` with a `finally`: a body
+  that jumps through one gets no CS0165 at all, as does a body the binder did not fully
+  understand.
 
 ## Interpreter
 

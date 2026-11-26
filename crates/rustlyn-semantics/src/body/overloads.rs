@@ -629,6 +629,258 @@ impl BodyBinder<'_> {
         }
     }
 
+    /// The other method a call is certainly ambiguous with (CS0121), where
+    /// `chosen` is the one overload resolution settled on.
+    ///
+    /// Overload resolution keeps the first of two candidates neither of
+    /// which is better, and what it calls better follows Roslyn's rules far
+    /// enough to bind real code but is not all of them; so this does not
+    /// ask it. It judges the plain case by the letter of §12.6.4 — methods
+    /// of one type that are not generic and take exactly the arguments
+    /// given, by value, with no defaults, and arguments that are values
+    /// with a type — and says so only where the rules leave no doubt: one
+    /// argument converts better to this method's parameter and another to
+    /// that one's, or none converts better to either though the parameters
+    /// differ. With anything else in sight it says nothing.
+    pub(super) fn certain_rival(
+        &self,
+        chosen: SymbolId,
+        candidates: &[SymbolId],
+        arguments: &[BoundExpression],
+        receiver: &Type,
+        explicit: &[Type],
+    ) -> Option<SymbolId> {
+        if !explicit.is_empty() || arguments.is_empty() || candidates.len() < 2 {
+            return None;
+        }
+        let compilation = self.binder.compilation();
+        let symbols = compilation.symbols();
+        fn closed(ty: &Type) -> bool {
+            match ty {
+                Type::Named { type_arguments, .. } => type_arguments.iter().all(closed),
+                _ => false,
+            }
+        }
+        // Values with a type, passed by value and by position.
+        let evidence = self.evidence(arguments);
+        let flag = |flags: &[bool], index: usize| flags.get(index).copied().unwrap_or(false);
+        let plain_arguments = arguments.iter().enumerate().all(|(index, argument)| {
+            closed(&argument.ty)
+                && !argument.is_interpolated_string()
+                && evidence
+                    .refs
+                    .get(index)
+                    .is_none_or(|kind| *kind == RefKind::None)
+                && evidence.lambdas.get(index).is_none_or(Option::is_none)
+                && !flag(&evidence.groups, index)
+                && !flag(&evidence.collections, index)
+                && !flag(&evidence.natural, index)
+        });
+        if !plain_arguments || self.parameter_order(chosen, arguments.len()).is_some() {
+            return None;
+        }
+        let types: Vec<Type> = arguments
+            .iter()
+            .map(|argument| argument.ty.clone())
+            .collect();
+        let count = arguments.len();
+        let container = symbols.get(chosen).container;
+        let priority = crate::priority::priority(compilation, chosen);
+        // A method's parameter types where it is one of the plain ones, and
+        // the arguments reach them.
+        let plain = |method: SymbolId| -> Option<Vec<Type>> {
+            let detail = symbols.get(method).as_method()?;
+            if !detail.type_parameters.is_empty()
+                || detail.is_extension
+                || detail.parameters.len() != count
+                || symbols.get(method).container != container
+                || crate::priority::priority(compilation, method) != priority
+                || !self.can_reach(method)
+            {
+                return None;
+            }
+            let by_value = detail.parameters.iter().all(|parameter| {
+                symbols
+                    .get(*parameter)
+                    .as_parameter()
+                    .is_some_and(|detail| {
+                        !detail.has_default && !detail.is_params && detail.ref_kind == RefKind::None
+                    })
+            });
+            if !by_value {
+                return None;
+            }
+            let shape = self.candidate_shape(method, &types, receiver, explicit, &[])?;
+            (shape.parameters.len() == count
+                && shape.parameters.iter().all(closed)
+                && arguments
+                    .iter()
+                    .zip(&shape.parameters)
+                    .all(|(argument, parameter)| {
+                        self.binder.converts_implicitly(&argument.ty, parameter)
+                            || self.constant_fits(argument, parameter)
+                    }))
+            .then_some(shape.parameters)
+        };
+        let chosen_parameters = plain(chosen)?;
+        // Whether a method could take this many arguments at all.
+        let takes_count = |method: SymbolId| {
+            symbols.get(method).as_method().is_some_and(|detail| {
+                let parameters: Vec<_> = detail
+                    .parameters
+                    .iter()
+                    .filter_map(|parameter| symbols.get(*parameter).as_parameter())
+                    .collect();
+                let required = parameters
+                    .iter()
+                    .filter(|parameter| !parameter.has_default && !parameter.is_params)
+                    .count();
+                let unbounded = parameters.iter().any(|parameter| parameter.is_params);
+                // An extension method takes its receiver first.
+                let given = count + usize::from(detail.is_extension);
+                given >= required && (unbounded || given <= parameters.len())
+            })
+        };
+        // Every other overload that could be meant has to be a plain one
+        // too: a generic method, a `params` or an optional parameter each
+        // bring rules that are not judged here.
+        let mut rivals: Vec<(SymbolId, Vec<Type>)> = Vec::new();
+        for candidate in candidates {
+            if *candidate == chosen || !takes_count(*candidate) {
+                continue;
+            }
+            match plain(*candidate) {
+                Some(parameters) => rivals.push((*candidate, parameters)),
+                // Plain in shape but for the arguments not reaching it is
+                // no rival; anything else is out of this check's depth.
+                None => {
+                    let shaped_plain = symbols.get(*candidate).as_method().is_some_and(|detail| {
+                        detail.type_parameters.is_empty()
+                            && !detail.is_extension
+                            && detail.parameters.len() == count
+                            && symbols.get(*candidate).container == container
+                            && crate::priority::priority(compilation, *candidate) == priority
+                            && detail.parameters.iter().all(|parameter| {
+                                symbols
+                                    .get(*parameter)
+                                    .as_parameter()
+                                    .is_some_and(|detail| {
+                                        !detail.has_default
+                                            && !detail.is_params
+                                            && detail.ref_kind == RefKind::None
+                                    })
+                            })
+                    });
+                    if !shaped_plain || !self.can_reach(*candidate) {
+                        return None;
+                    }
+                    let reaches = self
+                        .candidate_shape(*candidate, &types, receiver, explicit, &[])
+                        .is_some_and(|shape| {
+                            shape.parameters.len() == count
+                                && shape.parameters.iter().all(closed)
+                                && arguments.iter().zip(&shape.parameters).all(
+                                    |(argument, parameter)| {
+                                        self.binder.converts_implicitly(&argument.ty, parameter)
+                                            || self.constant_fits(argument, parameter)
+                                    },
+                                )
+                        });
+                    if reaches {
+                        return None;
+                    }
+                }
+            }
+        }
+        // §12.6.4.5–7, the part with no exceptions. A type is `simple`
+        // where the only thing that makes it a better target than another
+        // is a conversion to it: a number, or a class or an interface that
+        // is not generic (a `Task<int>`, a `Func<int>` or a span is better
+        // by what it is made of).
+        let simple = |ty: &Type| {
+            let Some(symbol) = ty.symbol() else {
+                return false;
+            };
+            if self
+                .binder
+                .special_of(ty)
+                .is_some_and(|special| special.is_numeric())
+            {
+                return true;
+            }
+            matches!(ty, Type::Named { type_arguments, .. } if type_arguments.is_empty())
+                && self.binder.special_of(ty).is_none()
+                && matches!(
+                    symbols.get(symbol).type_kind(),
+                    Some(
+                        crate::TypeKind::Class
+                            | crate::TypeKind::Record
+                            | crate::TypeKind::Interface
+                    )
+                )
+        };
+        // The argument converts better to `first` than to `second`: it is
+        // that type and not the other, or it is neither and `first`
+        // converts to `second` and not back.
+        let better = |argument: &Type, first: &Type, second: &Type| {
+            if argument == first {
+                return argument != second;
+            }
+            argument != second
+                && simple(first)
+                && simple(second)
+                && self.binder.converts_implicitly(first, second)
+                && !self.binder.converts_implicitly(second, first)
+        };
+        // Neither is better: two classes or interfaces the argument is
+        // neither of, with no conversion between them.
+        let neither = |argument: &Type, first: &Type, second: &Type| {
+            let reference = |ty: &Type| {
+                simple(ty) && self.binder.special_of(ty).is_none() && ty.is_reference_type(symbols)
+            };
+            argument != first
+                && argument != second
+                && reference(first)
+                && reference(second)
+                && !self.binder.converts_implicitly(first, second)
+                && !self.binder.converts_implicitly(second, first)
+        };
+        // How two methods compare: (the first is better somewhere, the
+        // second is, nothing is in doubt, they differ at all).
+        let compare = |first: &[Type], second: &[Type]| {
+            let (mut ours, mut theirs, mut sure, mut differ) = (false, false, true, false);
+            for ((argument, mine), other) in types.iter().zip(first).zip(second) {
+                if mine == other {
+                    continue;
+                }
+                differ = true;
+                if better(argument, mine, other) {
+                    ours = true;
+                } else if better(argument, other, mine) {
+                    theirs = true;
+                } else if !neither(argument, mine, other) {
+                    sure = false;
+                }
+            }
+            (ours, theirs, sure, differ)
+        };
+        // One that is better than both wherever it differs from them would
+        // be the answer, were it not `chosen`: then nothing is said.
+        let dominates = |first: &[Type], second: &[Type]| {
+            let (ours, theirs, sure, _) = compare(first, second);
+            ours && !theirs && sure
+        };
+        let rival = rivals.iter().find(|(_, parameters)| {
+            let (ours, theirs, sure, differ) = compare(&chosen_parameters, parameters);
+            let ambiguous = (ours && theirs) || (differ && !ours && !theirs && sure);
+            ambiguous
+                && !rivals.iter().any(|(_, third)| {
+                    dominates(third, &chosen_parameters) && dominates(third, parameters)
+                })
+        })?;
+        Some(rival.0)
+    }
+
     /// A method called `name` on `receiver` or a class it derives from that
     /// takes `count` arguments and that the code here may not call.
     fn inaccessible_overload(&self, receiver: &Type, name: &str, count: usize) -> Option<SymbolId> {

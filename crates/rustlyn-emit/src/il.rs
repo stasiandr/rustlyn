@@ -1084,7 +1084,7 @@ impl InstructionStream {
 /// anything past this is a bug in the emitter rather than a program — but
 /// a few hundred is a program: `F(1, F(1, F(1, …)))` holds one argument per
 /// level, an array initializer nested as deep three, and the parser lets
-/// source nest five hundred levels.
+/// source nest a thousand levels.
 const MAX_STACK_DEPTH: i32 = u16::MAX as i32;
 
 const fn branch_target(instruction: Instruction) -> Option<Label> {

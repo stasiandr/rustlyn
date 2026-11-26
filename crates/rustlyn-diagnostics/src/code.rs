@@ -114,6 +114,7 @@ error_codes! {
     ErrNoImplicitConv = 29, Error, "Cannot implicitly convert type '{0}' to '{1}'";
     ErrNoExplicitConv = 30, Error, "Cannot convert type '{0}' to '{1}'";
     ErrLocalDuplicate = 128, Error, "A local variable or function named '{0}' is already defined in this scope";
+    ErrAmbigCall = 121, Error, "The call is ambiguous between the following methods or properties: '{0}' and '{1}'";
     ErrBadArgCount = 1501, Error, "No overload for method '{0}' takes {1} arguments";
     ErrBadArgType = 1503, Error, "Argument {0}: cannot convert from '{1}' to '{2}'";
     ErrNoSuchMemberOrExtension = 1061, Error, "'{0}' does not contain a definition for '{1}' and no accessible extension method '{1}' accepting a first argument of type '{0}' could be found (are you missing a using directive or an assembly reference?)";

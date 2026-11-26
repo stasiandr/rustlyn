@@ -717,6 +717,46 @@ impl BodyBinder<'_> {
                 {
                     self.check_accessible(method, &name, name_node.span());
                 }
+                // CS0121: another overload the arguments reach as well, and
+                // neither the better. The first declared was called, and
+                // nothing said that the other could have been meant.
+                if let Some(rival) = self.certain_rival(
+                    introduced,
+                    &candidates,
+                    &arguments,
+                    &receiver_type,
+                    &explicit,
+                ) {
+                    let compilation = self.binder.compilation();
+                    let symbols = compilation.symbols();
+                    // As Roslyn names them: in the order they are declared.
+                    let place = |method: SymbolId| {
+                        symbols
+                            .get(method)
+                            .locations
+                            .first()
+                            .map(|location| (location.tree, location.span.start()))
+                    };
+                    let (first, second) = if place(rival) < place(introduced) {
+                        (rival, introduced)
+                    } else {
+                        (introduced, rival)
+                    };
+                    let display = |method: SymbolId| {
+                        crate::checks::member_display(
+                            compilation,
+                            method,
+                            &Default::default(),
+                            None,
+                        )
+                    };
+                    let (first, second) = (display(first), display(second));
+                    self.report(
+                        ErrorCode::ErrAmbigCall,
+                        name_node.span(),
+                        &[&first, &second],
+                    );
+                }
                 if receiver.is_none()
                     && matches!(
                         callee.kind(),
