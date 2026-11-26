@@ -346,10 +346,11 @@ impl Compilation {
             // This thread declares, and parses too whenever the file it is
             // up to is not ready, so one core fewer parses throughout.
             for _ in 0..crate::parallel::threads().saturating_sub(1).max(1) {
-                std::thread::Builder::new()
-                    .stack_size(crate::parallel::PARSE_STACK)
-                    .spawn_scoped(scope, || while queue.parse_next() {})
-                    .expect("a parsing thread should start");
+                // A thread that cannot be started is done without: this
+                // one parses whatever no other has.
+                let _ = crate::parallel::spawn_scoped(scope, crate::parallel::PARSE_STACK, || {
+                    || while queue.parse_next() {}
+                });
             }
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut declarer = Declarer::new(TreeSource::Parsing(&queue));

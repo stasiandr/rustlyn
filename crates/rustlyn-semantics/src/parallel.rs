@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// KB): 480 MB for the deepest tree of the worst shape, and twice that is
 /// reserved. An optimized build takes a fraction of it, and a 32-bit
 /// address space has no room for a gigabyte, so only a 64-bit debug build
-/// asks for it. This is only reserved, not touched.
+/// asks for it. This is only reserved, not touched; where even that much
+/// cannot be reserved, a thread takes the largest stack that can be.
 pub const STACK: usize = if cfg!(all(debug_assertions, target_pointer_width = "64")) {
     1 << 30
 } else {
@@ -58,21 +59,84 @@ thread_local! {
 ///
 /// # Panics
 ///
-/// Panics where `f` does, or where a thread cannot be started.
+/// Panics where `f` does.
 pub fn deep<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     if DEEP.get() {
         return f();
     }
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(STACK)
-            .spawn_scoped(scope, || {
+    // The work is handed over once, to whichever thread starts.
+    let work = std::sync::Mutex::new(Some(f));
+    let run = || {
+        let f = work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("the work is taken once");
+        f()
+    };
+    let done = std::thread::scope(|scope| {
+        let started = spawn_scoped(scope, STACK, || {
+            || {
                 DEEP.set(true);
-                f()
-            })
-            .expect("a thread with a deep stack should start")
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                run()
+            }
+        });
+        started.map(|thread| {
+            thread
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    });
+    // No thread at all: the work is done here, as deep as this stack goes.
+    done.unwrap_or_else(run)
+}
+
+/// The stack sizes to try for a thread, from `largest` down: half of it and
+/// half again, to 16 MB. Where memory is limited a gigabyte may not be
+/// there to reserve for each core, and a thread with less still compiles
+/// everything but the deepest trees.
+///
+/// Where the process may only have so much address space (`ulimit -v`),
+/// the stacks of all the workers together start at a quarter of it: taken
+/// whole, they would leave the heap nothing to grow into.
+fn stacks(largest: usize) -> impl Iterator<Item = usize> {
+    let largest = address_space().map_or(largest, |limit| {
+        largest.min(limit / 4 / threads().max(1)).max(16 << 20)
+    });
+    std::iter::successors(Some(largest), |size| Some(size / 2)).take_while(|size| *size >= 16 << 20)
+}
+
+/// How much address space the process may have, where that is limited and
+/// the system says so (`/proc/self/limits`, on Linux).
+fn address_space() -> Option<usize> {
+    static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let limits = std::fs::read_to_string("/proc/self/limits").ok()?;
+        let line = limits
+            .lines()
+            .find_map(|line| line.strip_prefix("Max address space"))?;
+        // The soft limit, in bytes, or `unlimited`.
+        line.split_whitespace().next()?.parse().ok()
+    })
+}
+
+/// A thread in `scope` running what `work` makes, on the largest stack
+/// there is room for from `largest` down, or `None` where none can be
+/// started. `work` is asked again for each size tried.
+pub fn spawn_scoped<'scope, T, F>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    largest: usize,
+    work: impl Fn() -> F,
+) -> Option<std::thread::ScopedJoinHandle<'scope, T>>
+where
+    F: FnOnce() -> T + Send + 'scope,
+    T: Send + 'scope,
+{
+    stacks(largest).find_map(|size| {
+        std::thread::Builder::new()
+            .stack_size(size)
+            .spawn_scoped(scope, work())
+            .ok()
     })
 }
 
@@ -81,7 +145,7 @@ pub fn deep<R: Send>(f: impl FnOnce() -> R + Send) -> R {
 ///
 /// # Panics
 ///
-/// Panics where `f` does, or where a thread cannot be started.
+/// Panics where `f` does.
 pub fn map<T, R, F>(items: &[T], f: F) -> Vec<R>
 where
     T: Sync,
@@ -93,26 +157,34 @@ where
         return items.iter().map(f).collect();
     }
     let next = AtomicUsize::new(0);
+    // What a worker does: the next item, until there is none.
+    let work = || {
+        let mut done = Vec::new();
+        loop {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            let Some(item) = items.get(index) else {
+                break;
+            };
+            done.push((index, f(item)));
+        }
+        done
+    };
     let done: Vec<Vec<(usize, R)>> = std::thread::scope(|scope| {
+        // Each worker takes the largest stack there is room for; one that
+        // cannot be started at all is done without, and the items it would
+        // have taken go to the others.
         let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                std::thread::Builder::new()
-                    .stack_size(STACK)
-                    .spawn_scoped(scope, || {
+            .map_while(|_| {
+                spawn_scoped(scope, STACK, || {
+                    || {
                         DEEP.set(true);
-                        let mut done = Vec::new();
-                        loop {
-                            let index = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(item) = items.get(index) else {
-                                break;
-                            };
-                            done.push((index, f(item)));
-                        }
-                        done
-                    })
-                    .expect("a worker thread should start")
+                        work()
+                    }
+                })
             })
             .collect();
+        // Not one thread: the work is done here, as `deep` would have it.
+        let here = workers.is_empty().then(|| deep(work));
         workers
             .into_iter()
             .map(|worker| {
@@ -120,6 +192,7 @@ where
                     .join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
             })
+            .chain(here)
             .collect()
     });
     let mut slots: Vec<Option<R>> = std::iter::repeat_with(|| None).take(items.len()).collect();

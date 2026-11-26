@@ -32,7 +32,10 @@ implements the behaviour.
   is left, so its limit moves with the thread and the build; a fixed one gives the same
   file the same answer everywhere. Threads that bind and emit get a 1 GB stack in a
   debug build (an unoptimized binder spends up to 40 KB on a level), and 256 MB in an
-  optimized one. The rest of the file is kept in the tree as skipped tokens.
+  optimized one; that is reserved, not used, and where the process is not allowed that
+  much address space (`ulimit -v`) the threads take smaller stacks, a quarter of the
+  limit between them, on which the deepest trees can overflow. The rest of the file is
+  kept in the tree as skipped tokens.
 
 ## Binding and emitting
 

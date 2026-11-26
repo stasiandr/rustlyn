@@ -1316,31 +1316,42 @@ impl Emitter<'_> {
         std::thread::scope(|scope| {
             // Every core binds, in the order the plan will ask; this thread
             // plans, waiting only where it catches up with them.
+            // Each on the largest stack there is room for; the plan waits
+            // on what they bind, so one of them at least has to start.
+            let mut started = 0;
             for _ in 0..rustlyn_semantics::parallel::threads() {
-                let slots = std::sync::Arc::clone(&slots);
                 let (owners, next) = (&owners, &next);
-                std::thread::Builder::new()
-                    .stack_size(rustlyn_semantics::parallel::STACK)
-                    .spawn_scoped(scope, move || {
-                        let binder = Binder::new(compilation);
-                        loop {
-                            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(&owner) = owners.get(index) else {
-                                break;
-                            };
-                            // A body whose binding panics is bound again
-                            // where it is asked for, and panics there.
-                            let bound =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    bind_body_with(compilation, &binder, owner)
-                                        .map(|body| spilled_with(compilation, slimmed(body)))
-                                }));
-                            let _ = slots[index]
-                                .set(bound.ok().map(|body| body.map(std::sync::Arc::new)));
+                let thread = rustlyn_semantics::parallel::spawn_scoped(
+                    scope,
+                    rustlyn_semantics::parallel::STACK,
+                    || {
+                        let slots = std::sync::Arc::clone(&slots);
+                        move || {
+                            let binder = Binder::new(compilation);
+                            loop {
+                                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let Some(&owner) = owners.get(index) else {
+                                    break;
+                                };
+                                // A body whose binding panics is bound again
+                                // where it is asked for, and panics there.
+                                let bound =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        bind_body_with(compilation, &binder, owner)
+                                            .map(|body| spilled_with(compilation, slimmed(body)))
+                                    }));
+                                let _ = slots[index]
+                                    .set(bound.ok().map(|body| body.map(std::sync::Arc::new)));
+                            }
                         }
-                    })
-                    .expect("a binding thread should start");
+                    },
+                );
+                if thread.is_none() {
+                    break;
+                }
+                started += 1;
             }
+            assert!(started > 0, "a binding thread should start");
             self.ahead = Some(Ahead {
                 index: owners
                     .iter()
