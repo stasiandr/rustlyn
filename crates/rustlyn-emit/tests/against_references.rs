@@ -18258,6 +18258,39 @@ class P
     );
 }
 
+/// A relational pattern on a native integer compares native integers, the
+/// constant as one, and a pointer takes a native integer for an offset.
+/// `n switch { > 5 => ... }` asked whether the `nint` was an `int` and so
+/// never matched, and `p + n` was refused.
+#[test]
+fn a_native_integer_is_matched_by_a_relational_pattern_and_offsets_a_pointer() {
+    check(
+        "native_integer_patterns_and_pointers",
+        r#"
+using System;
+unsafe class P
+{
+    static string K(nint n) => n switch { 5 => "five", > 5 => "more", _ => "less" };
+    static string U(nuint n) => n switch { 5 => "five", > 5 and < 100 => "mid", >= 100 => "big", _ => "less" };
+    static string N(nint? n) => n switch { null => "null", 5 => "five", > 5 => "more", _ => "less" };
+    static string O(object o) => o switch { nint and > 5 => "nint>5", nuint and <= 3 => "nuint<=3", int and > 5 => "int>5", _ => "other" };
+    static void Main()
+    {
+        nint a = 9; nuint b = 50; nuint big = nuint.MaxValue; nint? nn = 7; nuint? nu = 2;
+        Console.WriteLine($"{K(9)} {K(5)} {K(-1)} {U(50)} {U(200)} {U(1)} {a is > 5} {a is < 5 or 9} {b is >= 50 and <= 50} {a is not (> 10)}");
+        Console.WriteLine($"{N(9)} {N(5)} {N(null)} {N(-3)} {O((nint)9)} {O((nuint)2)} {O(9)} {O(9L)} {big is > 5} {big is < 5} {nn is > 5} {nu is >= 2 and <= 2}");
+        nint n = 2; nuint u = 3; nint neg = -1;
+        int* p = stackalloc int[8]; for (int i = 0; i < 8; i++) p[i] = i * 10;
+        long* q = stackalloc long[8]; for (int i = 0; i < 8; i++) q[i] = i * 100;
+        int* e = p + 5; e -= n; e += u;
+        Console.WriteLine($"{*(p + n)} {*(n + p)} {*(p + u)} {*(q + n)} {*(p + 4 - u)} {*(p + 3 + neg)} {*e} {e - p} {p[n]} {p[u]} {(p + u) > p}");
+    }
+}
+"#,
+        "more five less mid big less True True True True\nmore five null less nint>5 nuint<=3 int>5 other True False True True\n20 20 30 200 10 20 60 6 20 30 True\n",
+    );
+}
+
 #[test]
 fn nint_and_nuint_reach_static_members_unless_a_name_answers_first() {
     check(
@@ -18295,6 +18328,91 @@ class Other
 }
 "#,
         "9223372036854775807 -9223372036854775808 18446744073709551615 0 8 8 True 1 2\nSystem.IntPtr\n0\n16\nMaxValue\n9223372036854775807\n9\nTrue 77\n9\n5\n",
+    );
+}
+
+#[test]
+fn a_native_integer_meets_the_other_numbers_in_operators() {
+    check(
+        "native_integer_with_longs_and_floats",
+        r#"
+using System;
+class P {
+    static void Main() {
+        ulong u = 5; long l = -3; float f = 1e30f; double d = 2;
+        Console.WriteLine($"{l < nint.MinValue} {l > nint.MaxValue} {u > nuint.MaxValue} {f >= nint.MaxValue} {f <= nint.MinValue} {f >= nuint.MaxValue} {d < nint.MaxValue}");
+        nint a = (f >= nint.MaxValue) ? nint.MaxValue : (nint)1;
+        Console.WriteLine($"{a} {nint.MaxValue - 1} {nuint.MaxValue / 2} {nint.MaxValue == IntPtr.MaxValue} {IntPtr.MaxValue > l} {l + nint.Size} {IntPtr.Size * 2}");
+    }
+}
+"#,
+        "False False False True False True True\n9223372036854775807 9223372036854775806 9223372036854775807 True True 5 16\n",
+    );
+}
+
+#[test]
+fn native_integer_arithmetic_comparison_and_compound_assignment_match_roslyn() {
+    check(
+        "native_integer_operator_table",
+        r#"
+using System;
+class P {
+  static nint Ret() => nint.MaxValue;
+  static void Main() {
+    nint n = -3; nuint u = 7; long l = long.MinValue; ulong ul = ulong.MaxValue; int i = -2; uint ui = uint.MaxValue; float f = 1e30f; double d = 2.5; decimal m = 2.5m;
+    nint nmax = nint.MaxValue, nmin = nint.MinValue; nuint umax = nuint.MaxValue; short sh = -1; char c = 'A'; byte b = 200; ushort us = 65535; sbyte sb = -128;
+    Console.WriteLine($"{n + l} {n * l} {n - ui} {n + ui} {n * ui} {u + ul} {u - ul} {u * ul} {u + ui} {u + b} {u + us} {u + c}");
+    Console.WriteLine($"{n + f} {n * d} {n / m} {u + f} {u * d} {u / m} {nmax + f} {nmax + d} {nmax + m} {umax + f} {umax + d} {umax + m}");
+    Console.WriteLine($"{nmin < l} {nmax > l} {nmax == l} {nmin == l} {umax == ul} {umax > ul} {umax >= ul} {umax < ul} {nmax >= f} {nmax >= d} {umax <= f} {umax <= d}");
+    Console.WriteLine($"{n < ui} {n > ui} {n == ui} {nmax > ui} {nmin < ui} {i < n} {sh < n} {c > n} {b > n} {us == n} {sb < n}");
+    Console.WriteLine($"{u > ui} {u > b} {u == c} {u < us} {umax > ui}");
+    Console.WriteLine($"{n & l} {n | ui} {n ^ ui} {u & ul} {u | ui} {u ^ b} {n & sb} {nmin & us} {n | c}");
+    Console.WriteLine($"{n << 1} {n >> 1} {n >>> 1} {nmin >> 63} {nmin >>> 63} {u << 1} {u >> 1} {umax >>> 60} {n << sb} {n << c} {l << (int)n}");
+    Console.WriteLine($"{n + 1} {n - 1} {n * 2} {n / 2} {n % 2} {u + 1} {u - 1} {u * 2} {u / 2} {u % 2} {n < 5L} {n > 5L} {u > 0} {u < 3000000000} {u + 1L} {u == 7L} {u + 4000000000L}");
+    Console.WriteLine($"{1 + n} {1 - n} {2L * n} {1L < n} {0 < u} {7 == u} {7L == u} {5L - n}");
+    nint? nn = 5; nint? nnull = null; nuint? un = 6;
+    Console.WriteLine($"{nn + l} {nn + 1} {nnull + 1} {nn < l} {nnull < l} {nn == l} {nnull == l} {l == nnull} {nn > ui} {un + ul} {un > 0} {un + 1} {un == 6UL} {un == ui} {nn + f} {nn + m} {m + nn} {nnull + m} {nnull == m}");
+    nint x = n; x += 1; x += i; x += sh; x -= b; x *= 2; x /= 3; x %= 5; x <<= 3; x >>= 1; x >>>= 1; x &= 0xFF; x |= 0x100; x ^= 3;
+    Console.WriteLine(x);
+    nuint y = u; y += 1; y += ui; y += b; y -= 1; y *= 2; y /= 3; y %= 5; y <<= 3; y >>= 1; y >>>= 1; y &= ui; y |= 0x100; y ^= 3;
+    Console.WriteLine(y);
+    long ll = 10; ll += n; ll -= n; ll *= n; ulong uu = 10; uu += u; uu *= u; uu -= u; uu |= u;
+    float ff = 1; ff += n; ff *= u; double dd = 1; dd += n; dd *= u; decimal mm = 1; mm += n; mm *= u; mm -= n;
+    Console.WriteLine($"{ll} {uu} {ff} {dd} {mm}");
+    x = nmax; x++; Console.WriteLine(x); y = umax; y++; Console.WriteLine(y); y--; Console.WriteLine(y); --y; ++x; Console.WriteLine($"{x} {y}");
+    nn++; un--; nnull++; Console.WriteLine($"{nn} {un} {nnull}");
+    Console.WriteLine($"{-n} {+n} {~n} {~u} {-nmin} {n} {-nnull} {~nn}");
+    try { checked { Console.WriteLine(nmax + 1); } } catch (OverflowException) { Console.WriteLine("ovf1"); }
+    try { checked { Console.WriteLine(nmax + 1L); } } catch (OverflowException) { Console.WriteLine("ovf2"); }
+    try { checked { Console.WriteLine(umax + 1); } } catch (OverflowException) { Console.WriteLine("ovf3"); }
+    try { checked { Console.WriteLine(umax + ul); } } catch (OverflowException) { Console.WriteLine("ovf4"); }
+    try { checked { Console.WriteLine(nmax * 2); } } catch (OverflowException) { Console.WriteLine("ovf5"); }
+    try { checked { Console.WriteLine(nmax * l); } } catch (OverflowException) { Console.WriteLine("ovf6"); }
+    try { checked { Console.WriteLine(u - 8); } } catch (OverflowException) { Console.WriteLine("ovf7"); }
+    try { checked { Console.WriteLine(u - ui); } } catch (OverflowException) { Console.WriteLine("ovf8"); }
+    try { checked { Console.WriteLine(nmin - 1); } } catch (OverflowException) { Console.WriteLine("ovf9"); }
+    try { checked { x = nmax; x += 1; Console.WriteLine(x); } } catch (OverflowException) { Console.WriteLine("ovf10"); }
+    try { checked { y = 0; y -= 1; Console.WriteLine(y); } } catch (OverflowException) { Console.WriteLine("ovf11"); }
+    try { checked { x = nmax; x++; Console.WriteLine(x); } } catch (OverflowException) { Console.WriteLine("ovf12"); }
+    try { checked { Console.WriteLine(nmax + ui); } } catch (OverflowException) { Console.WriteLine("ovf13"); }
+    try { checked { Console.WriteLine(nmin - ui); } } catch (OverflowException) { Console.WriteLine("ovf14"); }
+    unchecked { Console.WriteLine($"{nmax + 1} {umax + 1} {nmax * 2} {nmax + ui} {u - 8} {umax + ul}"); }
+    Console.WriteLine($"{(float)nmax} {(double)nmax} {(decimal)nmax} {(float)nmin} {(float)umax} {(double)umax} {(decimal)umax} {(decimal)nmin} {(long)n} {(ulong)umax}");
+    float fx = nmax; double dx = umax; decimal mx = umax; long lx = nmin; ulong ux = umax; float fy = umax; Console.WriteLine($"{fx} {dx} {mx} {lx} {ux} {fy}");
+    float? fn = nn; double? dn = un; decimal? mn = nn; long? ln = nn; ulong? uln = un; Console.WriteLine($"{fn} {dn} {mn} {ln} {uln}");
+    Console.WriteLine($"{(nmax > 5 ? nmax : 1)} {(f >= nint.MaxValue ? nint.MaxValue : (nint)1)} {Ret() - 1} {nuint.MaxValue / 2}");
+    Console.WriteLine($"{n == IntPtr.Zero} {IntPtr.MaxValue > l} {l + nint.Size} {IntPtr.Size * 2} {UIntPtr.MaxValue == ul}");
+    ulong cu = 5; long cl = -3; float cf = 1e30f; double cd = 2;
+    Console.WriteLine($"{cl < nint.MinValue} {cl > nint.MaxValue} {cu > nuint.MaxValue} {cf >= nint.MaxValue} {cf <= nint.MinValue} {cf >= nuint.MaxValue} {cd < nint.MaxValue}");
+    Console.WriteLine($"{nint.MaxValue - 1} {nint.MaxValue == IntPtr.MaxValue} {IntPtr.MaxValue > cl}");
+    Console.WriteLine($"{(n > 0 ? n : l)} {(u > 0 ? u : ul)} {(n < 0 ? 1.5f : n)}");
+    nint[] arr = { 1, 2, 3 }; arr[1] += 5; arr[2] <<= 2; long[] la = { 1 }; la[0] += arr[1]; Console.WriteLine($"{arr[1]} {arr[2]} {la[0]}");
+    int iv = 3; iv += (int)n; Console.WriteLine(iv);
+    Console.WriteLine($"{n.CompareTo(1)} {nint.Abs(n)} {nint.Max(n, 5)} {(n + 1).ToString()} {(u + 1).ToString()} {(n * 2L).GetType()} {(u * 2UL).GetType()} {(n + 1.5f).GetType()}");
+  }
+}
+"#,
+        "9223372036854775805 -9223372036854775808 -4294967298 4294967292 -12884901885 6 8 18446744073709551609 4294967302 207 65542 72\n1E+30 -7.5 -1.2 1E+30 17.5 2.8 1E+30 9.223372036854776E+18 9223372036854775809.5 1E+30 1.8446744073709552E+19 18446744073709551617.5\nFalse True False True True False True False False True True False\nTrue False False True True False False True True False True\nFalse False False True True\n-9223372036854775808 -1 -4294967294 7 4294967295 207 -128 0 -3\n-6 -2 9223372036854775806 -1 1 14 3 15 -3 -6 0\n-2 -4 -6 -1 -1 8 6 14 3 1 True False True True 8 True 4000000007\n-2 4 -6 False True True True 8\n-9223372036854775803 6  False False False False False False 5 True 7 True False 1E+30 7.5 7.5  False\n509\n261\n-30 119 -14 -14 -11\n-9223372036854775808\n0\n18446744073709551615\n-9223372036854775807 18446744073709551614\n6 5 \n3 -3 2 18446744073709551608 -9223372036854775808 -3  -7\novf1\novf2\novf3\novf4\novf5\novf6\novf7\novf8\novf9\novf10\novf11\novf12\novf13\novf14\n-9223372036854775808 0 -2 -9223372032559808514 18446744073709551615 18446744073709551614\n9.223372E+18 9.223372036854776E+18 9223372036854775807 -9.223372E+18 1.8446744E+19 1.8446744073709552E+19 18446744073709551615 -9223372036854775808 -3 18446744073709551615\n9.223372E+18 1.8446744073709552E+19 18446744073709551615 -9223372036854775808 18446744073709551615 1.8446744E+19\n6 5 6 6 5\n9223372036854775807 9223372036854775807 9223372036854775806 9223372036854775807\nFalse True -9223372036854775800 16 True\nFalse False False True False True True\n9223372036854775806 True True\n-9223372036854775808 7 1.5\n7 12 8\n0\n-1 3 5 -2 8 System.Int64 System.UInt64 System.Single\n",
     );
 }
 

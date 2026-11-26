@@ -429,12 +429,26 @@ impl BodyBinder<'_> {
                 .unwrap_or_else(|| ty.clone());
             self.binder.native_int(&ty)
         };
+        let number = |ty: &Type| {
+            let ty = self
+                .binder
+                .nullable_underlying(ty)
+                .unwrap_or_else(|| ty.clone());
+            self.binder.native_int(&ty).is_some()
+                || self
+                    .binder
+                    .special_of(&ty)
+                    .is_some_and(SpecialType::is_numeric)
+        };
         if let (left_native, right_native) = (native(&left.ty), native(&right.ty))
             && (left_native.is_some() || right_native.is_some())
             && (self
                 .binder
                 .binary_result(operator, &left.ty, &right.ty)
                 .is_some()
+                // Two numbers the language's operators do not take, `nuint`
+                // and `long`, are an error rather than the older `op_` call.
+                || (number(&left.ty) && number(&right.ty))
                 // A non-negative `int` constant is an `nuint` (§10.2.11).
                 || (left_native == Some(true)
                     && right_native.is_none()
@@ -1664,6 +1678,8 @@ impl BodyBinder<'_> {
             (left, right)
         };
 
+        let (left, right) = self.native_constant_operands(operator, left, right);
+
         // A type can say what an operator means on it, and when it does that
         // wins: `p == q` on a record compares what the records hold rather
         // than which objects they are.
@@ -1687,44 +1703,9 @@ impl BodyBinder<'_> {
         if let Some(lifted) = self.lift_binary(operator, &left, &right, span) {
             return lifted;
         }
-        // `u > 0` on an `nuint`: a non-negative `int` constant is an `nuint`
-        // (§10.2.11), and no other `int` is one.
-        let unsigned_native = |this: &Self, ty: &Type| {
-            ty.symbol().is_some_and(|symbol| {
-                this.binder
-                    .compilation()
-                    .type_by_metadata_name("System.UIntPtr")
-                    == Some(symbol)
-            })
-        };
         if let Some(lifted) = self.lift_user_defined_operands(operator, &left, &right, span) {
             return lifted;
         }
-        let (left, right) = if self
-            .binder
-            .binary_result(operator, &left.ty, &right.ty)
-            .is_none()
-        {
-            if unsigned_native(self, &left.ty)
-                && !unsigned_native(self, &right.ty)
-                && self.constant_fits(&right, &left.ty)
-            {
-                let ty = left.ty.clone();
-                let right = self.convert(right, &ty);
-                (left, right)
-            } else if unsigned_native(self, &right.ty)
-                && !unsigned_native(self, &left.ty)
-                && self.constant_fits(&left, &right.ty)
-            {
-                let ty = right.ty.clone();
-                let left = self.convert(left, &ty);
-                (left, right)
-            } else {
-                (left, right)
-            }
-        } else {
-            (left, right)
-        };
         // `==` says `bool` of any two operands, since references compare by
         // identity; a struct has no such `==` of the language's, only what
         // its conversions reach (§12.12.1): `mask == other` on Unity's
@@ -1768,13 +1749,16 @@ impl BodyBinder<'_> {
                     | BinaryOperator::LessThan
                     | BinaryOperator::GreaterThan
                     | BinaryOperator::LessThanOrEqual
-                    | BinaryOperator::GreaterThanOrEqual => {
-                        Some(if self.binder.converts_implicitly(&left.ty, &right.ty) {
+                    | BinaryOperator::GreaterThanOrEqual => Some(
+                        if let Some(native) = self.binder.native_result(&left.ty, &right.ty, false)
+                        {
+                            native
+                        } else if self.binder.converts_implicitly(&left.ty, &right.ty) {
                             right.ty.clone()
                         } else {
                             left.ty.clone()
-                        })
-                    }
+                        },
+                    ),
                     // `a ?? b` keeps its operands as they are, and so does
                     // string concatenation: `"n = " + 1` does not convert the
                     // `1` to a string, it hands it to `String.Concat` as it is.
@@ -1825,8 +1809,44 @@ impl BodyBinder<'_> {
             }
             None => {
                 let text = operator_token_text(operator).to_string();
-                let (left, right) = (self.display(&left.ty), self.display(&right.ty));
-                self.report(ErrorCode::ErrBadBinaryOps, span, &[&text, &left, &right]);
+                // An `nint` or an `nuint` with a number it has no operator
+                // with: the operators left are the `float`, `double` and
+                // `decimal` ones, and none of those is the best, which Roslyn
+                // calls ambiguous. Bitwise operators and shifts have no
+                // such candidates and are plain mismatches.
+                let number = |ty: &Type| {
+                    self.binder.native_int(ty).is_some()
+                        || self
+                            .binder
+                            .special_of(ty)
+                            .is_some_and(SpecialType::is_numeric)
+                };
+                let ambiguous = (self.binder.native_int(&left.ty).is_some()
+                    || self.binder.native_int(&right.ty).is_some())
+                    && number(&left.ty)
+                    && number(&right.ty)
+                    && !matches!(
+                        operator,
+                        BinaryOperator::BitwiseAnd
+                            | BinaryOperator::BitwiseOr
+                            | BinaryOperator::ExclusiveOr
+                            | BinaryOperator::LeftShift
+                            | BinaryOperator::RightShift
+                            | BinaryOperator::UnsignedRightShift
+                    );
+                // Roslyn names them as they are written.
+                let shown = |this: &Self, ty: &Type| match this.binder.native_int(ty) {
+                    Some(false) => "nint".to_string(),
+                    Some(true) => "nuint".to_string(),
+                    None => this.display(ty),
+                };
+                let (left, right) = (shown(self, &left.ty), shown(self, &right.ty));
+                let code = if ambiguous {
+                    ErrorCode::ErrAmbigBinaryOps
+                } else {
+                    ErrorCode::ErrBadBinaryOps
+                };
+                self.report(code, span, &[&text, &left, &right]);
                 BoundExpression::error(span)
             }
         }
@@ -2304,6 +2324,69 @@ impl BodyBinder<'_> {
         ))
     }
 
+    /// `u > 0` and `u + 1L` on an `nuint`: a non-negative `int` constant is
+    /// an `nuint` (§10.2.11) and a non-negative `long` one is a `ulong`,
+    /// where the operator would otherwise have nothing to take. No other
+    /// `int` is an `nuint`.
+    fn native_constant_operands(
+        &mut self,
+        operator: BinaryOperator,
+        left: BoundExpression,
+        right: BoundExpression,
+    ) -> (BoundExpression, BoundExpression) {
+        if matches!(
+            operator,
+            BinaryOperator::LeftShift
+                | BinaryOperator::RightShift
+                | BinaryOperator::UnsignedRightShift
+                | BinaryOperator::LogicalAnd
+                | BinaryOperator::LogicalOr
+                | BinaryOperator::Coalesce
+        ) {
+            return (left, right);
+        }
+        let unsigned_native = |this: &Self, ty: &Type| {
+            let ty = this
+                .binder
+                .nullable_underlying(ty)
+                .unwrap_or_else(|| ty.clone());
+            this.binder.native_int(&ty) == Some(true)
+        };
+        let ulong = self.special(SpecialType::UInt64);
+        let adjust = |this: &mut Self, constant: BoundExpression, native: &Type| {
+            let native = this
+                .binder
+                .nullable_underlying(native)
+                .unwrap_or_else(|| native.clone());
+            if this.binder.nullable_underlying(&constant.ty).is_some()
+                || this.binder.native_int(&constant.ty).is_some()
+                || !this.binder.special_of(&constant.ty).is_some_and(|special| {
+                    matches!(special, SpecialType::Int32 | SpecialType::Int64)
+                })
+            {
+                return constant;
+            }
+            if this.constant_fits(&constant, &native) {
+                return this.convert(constant, &native);
+            }
+            if this.binder.special_of(&constant.ty) == Some(SpecialType::Int64)
+                && this.constant_fits(&constant, &ulong)
+            {
+                return this.convert(constant, &ulong);
+            }
+            constant
+        };
+        if unsigned_native(self, &left.ty) && !unsigned_native(self, &right.ty) {
+            let right = adjust(self, right, &left.ty);
+            (left, right)
+        } else if unsigned_native(self, &right.ty) && !unsigned_native(self, &left.ty) {
+            let left = adjust(self, left, &right.ty);
+            (left, right)
+        } else {
+            (left, right)
+        }
+    }
+
     fn lift_binary(
         &mut self,
         operator: BinaryOperator,
@@ -2398,7 +2481,9 @@ impl BodyBinder<'_> {
         let operand = if shift {
             left_base.clone()
         } else if comparison {
-            if self.binder.converts_implicitly(&left_base, &right_base) {
+            if let Some(native) = self.binder.native_result(&left_base, &right_base, false) {
+                native
+            } else if self.binder.converts_implicitly(&left_base, &right_base) {
                 right_base.clone()
             } else {
                 left_base.clone()

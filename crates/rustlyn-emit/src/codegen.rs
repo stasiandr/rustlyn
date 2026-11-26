@@ -3235,7 +3235,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 // `case 1:` on a `long?` asks whether there is a value, and
                 // then compares it: the constant is one of the `long` inside.
                 if let Some(inner) = self.emitter.nullable_underlying(input)
-                    && self.numeric_kind(&inner).is_some()
+                    && (self.numeric_kind(&inner).is_some() || self.is_native_integer(&inner))
                     && self.numeric_kind(&value.ty).is_some()
                 {
                     self.emit_type_test(slot, input, &inner, on_fail)?;
@@ -3261,10 +3261,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 }
                 // `case 6:` on an `nint` is the constant as a native integer.
                 if input != &value.ty
-                    && input
-                        .symbol()
-                        .and_then(|symbol| self.emitter.primitive_of(symbol))
-                        .is_some_and(|element| matches!(element, ElementType::I | ElementType::U))
+                    && self.is_native_integer(input)
                     && let Some(constant) = self.emitter.binder.folded(value)
                     && self.numeric_kind(&value.ty).is_some()
                 {
@@ -3325,7 +3322,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 // As for a constant: `> 0` on an `int?` compares the `int`
                 // inside, where there is one.
                 if let Some(inner) = self.emitter.nullable_underlying(input)
-                    && self.numeric_kind(&inner).is_some()
+                    && (self.numeric_kind(&inner).is_some() || self.is_native_integer(&inner))
                     && self.numeric_kind(&value.ty).is_some()
                 {
                     self.emit_type_test(slot, input, &inner, on_fail)?;
@@ -3342,6 +3339,23 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                         self.stream.emit(Instruction::LoadLocal(slot));
                         self.emit_expression(value, true)?;
                         self.widen_to(input_kind);
+                        input.clone()
+                    }
+                    // `> 6` on an `nint` compares native integers, the
+                    // constant as one: asked whether it is an `int`, an
+                    // `nint` never matched.
+                    _ if input != &value.ty
+                        && self.is_native_integer(input)
+                        && self.numeric_kind(&value.ty).is_some()
+                        && self.emitter.binder.folded(value).is_some() =>
+                    {
+                        let constant = self
+                            .emitter
+                            .binder
+                            .folded(value)
+                            .expect("checked just above");
+                        self.stream.emit(Instruction::LoadLocal(slot));
+                        self.emit_constant(&constant, input)?;
                         input.clone()
                     }
                     _ => {
@@ -7778,7 +7792,13 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                     .emitter
                     .nullable_underlying(target)
                     .unwrap_or_else(|| target.clone());
-                self.convert_number(&inner);
+                // Read off the source's own type: a `decimal` or an `nint`
+                // on either side is more than a primitive conversion.
+                let from = self
+                    .emitter
+                    .nullable_underlying(&operand.ty)
+                    .unwrap_or_else(|| operand.ty.clone());
+                self.convert_number_from(&from, &inner)?;
                 let token = self.emitter.nullable_constructor(target)?;
                 self.stream.call_effect(Instruction::NewObject(token), 1, 1);
                 self.stream.emit(Instruction::Branch(end));
@@ -9061,7 +9081,11 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             self.stream.emit(Instruction::BranchIfFalse(missing));
             present(self, left_slot, left_value);
             present(self, right_slot, right_value);
-            self.stream.emit(Instruction::CompareEqual);
+            if self.is_decimal(&inner) {
+                self.emit_decimal_operator(BinaryOperator::Equality)?;
+            } else {
+                self.stream.emit(Instruction::CompareEqual);
+            }
             self.stream.emit(Instruction::Branch(end));
             self.stream.mark(neither);
             present(self, right_slot, right_has);
@@ -9135,7 +9159,11 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         if Self::is_shift(operator) {
             self.emit_shift_mask(&inner)?;
         }
-        self.emit_operator(operator, unsigned, floating);
+        if self.is_decimal(&inner) {
+            self.emit_decimal_operator(operator)?;
+        } else {
+            self.emit_operator(operator, unsigned, floating);
+        }
         if let Some(inner_result) = self.emitter.nullable_underlying(result) {
             self.narrow_enum_result(operator, &inner_result, false);
         }
@@ -9266,9 +9294,25 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         if ty.is_reference_type(symbols) || matches!(ty, Type::Array { .. } | Type::Null) {
             return true;
         }
+        // `nint` and `nuint` are numbers to the language.
+        if ty.symbol().is_some_and(|symbol| {
+            matches!(
+                symbols.qualified_name(symbol).as_str(),
+                "System.IntPtr" | "System.UIntPtr"
+            )
+        }) {
+            return true;
+        }
         ty.symbol().is_some_and(|symbol| {
             symbols.get(symbol).type_kind() == Some(rustlyn_semantics::TypeKind::Enum)
         })
+    }
+
+    /// Whether a type is `nint` or `nuint`.
+    fn is_native_integer(&self, ty: &Type) -> bool {
+        ty.symbol()
+            .and_then(|symbol| self.emitter.primitive_of(symbol))
+            .is_some_and(|element| matches!(element, ElementType::I | ElementType::U))
     }
 
     /// The primitive a number is compared as: its own special type, or an
@@ -10733,12 +10777,28 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         // `position += count` on a `long` and an `int`: the operation is a
         // `long` one, and the narrower operand is widened first (§12.4.7.3).
         // A shift keeps its count as the `int` it is.
-        if !matches!(
+        let shift = matches!(
             operator,
             BinaryOperator::LeftShift
                 | BinaryOperator::RightShift
                 | BinaryOperator::UnsignedRightShift
-        ) && let (Some(wanted), Some(given)) = (self.numeric_kind(ty), self.numeric_kind(right))
+        );
+        // An `nint` or an `nuint` on either side: the value is brought to the
+        // variable's type the way an assignment would bring it, which is also
+        // how `f += n` and `m += n` reach the float and the `decimal`.
+        let native = |codegen: &Self, ty: &Type| {
+            ty.symbol()
+                .and_then(|symbol| codegen.emitter.primitive_of(symbol))
+                .is_some_and(|element| matches!(element, ElementType::I | ElementType::U))
+        };
+        if !shift && ty != right && (native(self, ty) || native(self, right)) {
+            self.convert_number_from(right, ty)?;
+            self.emit_binary_instruction(operator, ty, right)?;
+            self.narrow_small_result(ty);
+            return Ok(());
+        }
+        if !shift
+            && let (Some(wanted), Some(given)) = (self.numeric_kind(ty), self.numeric_kind(right))
             && wanted != given
         {
             // `sum += u` on a `long` and a `uint` zero-extends: the value

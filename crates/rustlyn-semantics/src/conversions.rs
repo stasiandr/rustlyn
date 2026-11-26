@@ -1045,15 +1045,51 @@ impl Binder<'_> {
         }
     }
 
-    /// The native integer an operator on one works in, where the other
-    /// operand is the same type or reaches it.
-    fn native_result(&self, left: &Type, right: &Type) -> Option<Type> {
-        match (self.native_int(left), self.native_int(right)) {
-            (Some(_), Some(_)) if left == right => Some(left.clone()),
-            (Some(_), None) if self.converts_implicitly(right, left) => Some(left.clone()),
-            (None, Some(_)) if self.converts_implicitly(left, right) => Some(right.clone()),
-            _ => None,
+    /// The type an operator works in where one operand is an `nint` or an
+    /// `nuint`, found as the language does (§12.4.5): of the predefined
+    /// operators, the ones both operands reach, and among those the one
+    /// whose type reaches all the others. With nothing in the set that does,
+    /// as for `nuint + long`, whose only candidates are `float`, `double` and
+    /// `decimal`, there is no operator (an error, whether it is called
+    /// ambiguous or not applicable).
+    pub(crate) fn native_result(
+        &self,
+        left: &Type,
+        right: &Type,
+        integral_only: bool,
+    ) -> Option<Type> {
+        if self.native_int(left).is_none() && self.native_int(right).is_none() {
+            return None;
         }
+        let compilation = self.compilation();
+        let named = |name: &str| compilation.type_by_metadata_name(name).map(Type::named);
+        let special = |special| compilation.special_type(special).map(Type::named);
+        let mut candidates = vec![
+            named("System.IntPtr")?,
+            named("System.UIntPtr")?,
+            special(SpecialType::Int64)?,
+            special(SpecialType::UInt64)?,
+        ];
+        if !integral_only {
+            candidates.push(special(SpecialType::Single)?);
+            candidates.push(special(SpecialType::Double)?);
+            candidates.push(special(SpecialType::Decimal)?);
+        }
+        let applicable: Vec<&Type> = candidates
+            .iter()
+            .filter(|candidate| {
+                self.converts_implicitly(left, candidate)
+                    && self.converts_implicitly(right, candidate)
+            })
+            .collect();
+        applicable
+            .iter()
+            .find(|best| {
+                applicable
+                    .iter()
+                    .all(|other| ***best == **other || self.converts_implicitly(best, other))
+            })
+            .map(|best| (*best).clone())
     }
 
     /// Whether both sides are the same enum.
@@ -1298,12 +1334,27 @@ impl Binder<'_> {
 
         match operator {
             BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr => Some(boolean()),
-            BinaryOperator::Equality | BinaryOperator::Inequality => Some(boolean()),
+            BinaryOperator::Equality | BinaryOperator::Inequality => {
+                // Two numbers meet in a predefined `==`, which for an `nint`
+                // or an `nuint` there is not always one of: `n == 1UL`.
+                let number = |ty: &Type| {
+                    self.native_int(ty).is_some()
+                        || self.special_of(ty).is_some_and(SpecialType::is_numeric)
+                };
+                if (self.native_int(left).is_some() || self.native_int(right).is_some())
+                    && number(left)
+                    && number(right)
+                    && self.native_result(left, right, false).is_none()
+                {
+                    return None;
+                }
+                Some(boolean())
+            }
             BinaryOperator::LessThan
             | BinaryOperator::GreaterThan
             | BinaryOperator::LessThanOrEqual
             | BinaryOperator::GreaterThanOrEqual => {
-                if self.same_enum(left, right) || self.native_result(left, right).is_some() {
+                if self.same_enum(left, right) || self.native_result(left, right, false).is_some() {
                     return Some(boolean());
                 }
                 // Two pointers compare as the addresses they are (§23.6.8),
@@ -1351,7 +1402,7 @@ impl Binder<'_> {
                 if let Some(result) = self.delegate_combination(left, right) {
                     return Some(result);
                 }
-                self.numeric_result(left, right)
+                self.numeric_result(left, right, false)
             }
             BinaryOperator::Subtract => {
                 // `d1 - d2` takes one delegate's invocations out of another's.
@@ -1376,10 +1427,10 @@ impl Binder<'_> {
                 if let Some(result) = self.enum_arithmetic(left, right) {
                     return Some(result);
                 }
-                self.numeric_result(left, right)
+                self.numeric_result(left, right, false)
             }
             BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Modulo => {
-                self.numeric_result(left, right)
+                self.numeric_result(left, right, false)
             }
             BinaryOperator::BitwiseAnd
             | BinaryOperator::BitwiseOr
@@ -1394,17 +1445,21 @@ impl Binder<'_> {
                 if self.same_enum(left, right) {
                     return Some(left.clone());
                 }
-                self.numeric_result(left, right)
+                self.numeric_result(left, right, true)
             }
             BinaryOperator::LeftShift
             | BinaryOperator::RightShift
             | BinaryOperator::UnsignedRightShift => {
-                // `n << 1` on an `nint` stays an `nint`.
-                if self.native_int(left).is_some()
-                    && (self.special_of(right).is_some_and(SpecialType::is_numeric)
-                        || self.native_int(right).is_some())
-                {
-                    return Some(left.clone());
+                // `n << 1` on an `nint` stays an `nint`; the count is what
+                // reaches an `int`, so `n << 1u` and `n << m` are errors.
+                if self.native_int(left).is_some() {
+                    let int = self.compilation().special_type(SpecialType::Int32)?;
+                    return self
+                        .converts_implicitly(right, &Type::named(int))
+                        .then(|| left.clone());
+                }
+                if self.native_int(right).is_some() {
+                    return None;
                 }
                 let left_special = self.special_of(left)?;
                 left_special
@@ -1538,6 +1593,11 @@ impl Binder<'_> {
             (other, Type::Pointer(_)) => (right, other),
             _ => return None,
         };
+        // A native integer is an offset as a `long` or a `ulong` is, which
+        // it converts to.
+        if self.native_int(other).is_some() {
+            return Some(pointer.clone());
+        }
         self.special_of(other)?
             .is_numeric()
             .then(|| pointer.clone())
@@ -1557,9 +1617,12 @@ impl Binder<'_> {
 
     /// The type an arithmetic operator produces, following the promotions in
     /// §12.4.7: both operands move up to the wider type.
-    fn numeric_result(&self, left: &Type, right: &Type) -> Option<Type> {
-        if let Some(native) = self.native_result(left, right) {
+    fn numeric_result(&self, left: &Type, right: &Type, integral_only: bool) -> Option<Type> {
+        if let Some(native) = self.native_result(left, right, integral_only) {
             return Some(native);
+        }
+        if self.native_int(left).is_some() || self.native_int(right).is_some() {
+            return None;
         }
         let (left, right) = (self.special_of(left)?, self.special_of(right)?);
         if !left.is_numeric() || !right.is_numeric() {

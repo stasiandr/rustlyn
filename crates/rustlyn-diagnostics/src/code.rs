@@ -88,6 +88,7 @@ error_codes! {
 
     // Binding.
     ErrBadBinaryOps = 19, Error, "Operator '{0}' cannot be applied to operands of type '{1}' and '{2}'";
+    ErrAmbigBinaryOps = 34, Error, "Operator '{0}' is ambiguous on operands of type '{1}' and '{2}'";
     ErrBadIndexLHS = 21, Error, "Cannot apply indexing with [] to an expression of type '{0}'";
     ErrPtrExpected = 193, Error, "The * or -> operator must be applied to a pointer";
     ErrIllegalStatement = 201, Error, "Only assignment, call, increment, decrement, await, and new object expressions can be used as a statement";
