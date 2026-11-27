@@ -23,7 +23,8 @@ use crate::bound::{ConstantValue, SpecialConstant};
 use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::symbol::{
     Accessibility, CallerInfo, Detail, Event, Field, Method, MethodKind, Modifiers, NamedType,
-    Parameter, Property, RefKind, Symbol, SymbolId, SymbolKind, Symbols, TypeKind, Variance,
+    Parameter, Property, RefKind, Symbol, SymbolId, SymbolKind, Symbols, TypeKind, TypeSyntaxRef,
+    Variance,
 };
 use crate::types::Type;
 
@@ -85,6 +86,10 @@ pub(crate) struct Loaded {
     /// written. A reference to the member repeats them, and an override
     /// copies them: the runtime tells signatures apart by them.
     pub(crate) custom_modifiers: FxHashMap<SymbolId, Vec<SignatureModifier>>,
+    /// The type an extension block (C# 14) extends, for each member of one
+    /// read from an assembly: the block is not a type in metadata, and what
+    /// it extends is what its marker type's `<Extension>$` method takes.
+    pub(crate) extended: FxHashMap<SymbolId, Type>,
     /// The `decimal` and `DateTime` constants written as attributes: on a
     /// parameter, its default; on a field, its value.
     pub(crate) special_constants: FxHashMap<SymbolId, SpecialConstant>,
@@ -462,6 +467,13 @@ fn relocate_symbol(symbol: &mut Symbol, base: u32) {
         Detail::Method(detail) => {
             relocate_all(&mut detail.parameters, base);
             relocate_all(&mut detail.type_parameters, base);
+            // What a member of an extension block read from metadata
+            // extends is kept under the member's number.
+            if let Some(reference) = &mut detail.extended
+                && let Some(symbol) = reference.loaded_symbol()
+            {
+                *reference = TypeSyntaxRef::loaded(relocated(symbol, base));
+            }
         }
         Detail::Property(detail) => {
             relocate_all(&mut detail.parameters, base);
@@ -560,6 +572,10 @@ impl Loaded {
         for (id, modifiers) in staged.custom_modifiers {
             self.custom_modifiers.insert(relocated(id, base), modifiers);
         }
+        for (id, mut ty) in staged.extended {
+            relocate_type(&mut ty, base);
+            self.extended.insert(relocated(id, base), ty);
+        }
         for (id, value) in staged.special_constants {
             self.special_constants.insert(relocated(id, base), value);
         }
@@ -579,6 +595,8 @@ impl Loaded {
 struct Index {
     /// A nested type's enclosing type, by `TypeDef` row.
     enclosing: FxHashMap<u32, u32>,
+    /// The types nested in a type, by its `TypeDef` row, in row order.
+    inside: FxHashMap<u32, Vec<u32>>,
     /// A type's or a method's type parameters, in position order, each with
     /// the `GenericParam` row it came from — which is what its constraints
     /// are keyed by.
@@ -1473,6 +1491,7 @@ impl<'a> Loader<'a> {
     fn fill_methods(&mut self, symbols: &mut impl Table, index: usize, row: u32, id: SymbolId) {
         let assembly = &self.assemblies[index];
         let scope = Scope::new(symbols, id, &[]);
+        let mut added = Vec::new();
         for method in list_range(assembly, table::TYPE_DEF, row, 5, table::METHOD_DEF) {
             // An accessor is already under its property or event, where C#
             // can find it and nothing can call it by name. An event's taken
@@ -1484,7 +1503,183 @@ impl<'a> Loader<'a> {
             {
                 continue;
             }
-            self.add_method(symbols, index, method, id, &scope);
+            if let Some(symbol) = self.add_method(symbols, index, method, id, &scope) {
+                added.push((method, symbol));
+            }
+        }
+        self.fill_extension_blocks(symbols, index, row, id, &added);
+    }
+
+    /// Finds, among the methods of a static class, those that are members of
+    /// its extension blocks (C# 14), and says what each extends.
+    ///
+    /// A block is not a type in metadata. The class holds a method for each
+    /// member, taking the block's receiver first where the member is an
+    /// instance one and the block's type parameters before its own; beside
+    /// them stand grouping types (`<G>$…`, sealed, `[Extension]`) that hold
+    /// a marker method per member, with the signature the block gave it,
+    /// and a marker type (`<M>$…`) per block whose `<Extension>$` method
+    /// takes the receiver. The marker method's `[ExtensionMarker]` names the
+    /// marker type, and the method it stands for is the one of the class
+    /// that has the same name and signature once the block's type parameters
+    /// are the method's own.
+    fn fill_extension_blocks(
+        &mut self,
+        symbols: &mut impl Table,
+        index: usize,
+        row: u32,
+        class: SymbolId,
+        methods: &[(u32, SymbolId)],
+    ) {
+        const EXTENSION: &str = "System.Runtime.CompilerServices.ExtensionAttribute";
+        const MARKER: &str = "System.Runtime.CompilerServices.ExtensionMarkerAttribute";
+        let Some(groups) = self.indexes[index].inside.get(&row).cloned() else {
+            return;
+        };
+        if methods.is_empty() || !self.has_attribute(index, table::TYPE_DEF, row, EXTENSION) {
+            return;
+        }
+        let assembly = &self.assemblies[index];
+        let heaps = assembly.heaps();
+        let method_sig = |method: u32| {
+            let entry = assembly.table(table::METHOD_DEF).row(method)?;
+            heaps
+                .blob(entry.number(4))
+                .ok()
+                .and_then(|bytes| Blob::new(bytes).method_sig().ok())
+        };
+        let method_name = |method: u32| {
+            assembly
+                .table(table::METHOD_DEF)
+                .row(method)
+                .map(|entry| heaps.string(entry.number(3)))
+        };
+        for group in groups {
+            let Some(entry) = assembly.table(table::TYPE_DEF).row(group) else {
+                continue;
+            };
+            let flags = entry.number(0);
+            if flags & 0x07 != NESTED_PUBLIC
+                || flags & 0x100 == 0
+                || flags & 0x400 == 0
+                || !self.has_attribute(index, table::TYPE_DEF, group, EXTENSION)
+            {
+                continue;
+            }
+            let block_arity = self.indexes[index]
+                .type_parameters
+                .get(&group)
+                .map_or(0, Vec::len) as u32;
+            for marker in self.indexes[index]
+                .inside
+                .get(&group)
+                .cloned()
+                .unwrap_or_default()
+            {
+                let Some(entry) = assembly.table(table::TYPE_DEF).row(marker) else {
+                    continue;
+                };
+                let marker_name = heaps.string(entry.number(1));
+                let Some(receiver) =
+                    list_range(assembly, table::TYPE_DEF, marker, 5, table::METHOD_DEF)
+                        .find(|method| method_name(*method) == Some("<Extension>$"))
+                        .and_then(method_sig)
+                        .and_then(|sig| sig.parameters.first().cloned())
+                else {
+                    continue;
+                };
+                let receiver_type = match &receiver {
+                    TypeSig::ByRef(inner) => inner.as_ref().clone(),
+                    other => other.clone(),
+                };
+                for member in list_range(assembly, table::TYPE_DEF, group, 5, table::METHOD_DEF) {
+                    let named =
+                        self.every_attribute_string(index, table::METHOD_DEF, member, MARKER);
+                    if !named.iter().any(|name| name == marker_name) {
+                        continue;
+                    }
+                    let (Some(written), Some(name), Some(flags)) = (
+                        method_sig(member),
+                        method_name(member),
+                        assembly
+                            .table(table::METHOD_DEF)
+                            .row(member)
+                            .map(|entry| entry.number(2)),
+                    ) else {
+                        continue;
+                    };
+                    let is_static = flags & 0x0010 != 0;
+                    let leading = u32::from(!is_static);
+                    let Some((method, implementation)) = methods.iter().copied().find(|(at, _)| {
+                        method_name(*at) == Some(name)
+                            && method_sig(*at).is_some_and(|sig| {
+                                sig.arity == block_arity + written.arity
+                                    && sig.parameters.len() as u32
+                                        == written.parameters.len() as u32 + leading
+                                    && sig.returns == in_class_terms(&written.returns, block_arity)
+                                    && (is_static
+                                        || sig.parameters[0]
+                                            == in_class_terms(&receiver, block_arity))
+                                    && sig.parameters[leading as usize..]
+                                        .iter()
+                                        .zip(&written.parameters)
+                                        .all(|(ours, theirs)| {
+                                            *ours == in_class_terms(theirs, block_arity)
+                                        })
+                            })
+                    }) else {
+                        continue;
+                    };
+                    let _ = method;
+                    let type_parameters = symbols
+                        .get(implementation)
+                        .as_method()
+                        .map(|detail| detail.type_parameters.clone())
+                        .unwrap_or_default();
+                    let scope = Scope::new(symbols, class, &type_parameters);
+                    let Some(extended) = self.type_of_sig(
+                        symbols,
+                        index,
+                        &in_class_terms(&receiver_type, block_arity),
+                        &scope,
+                    ) else {
+                        continue;
+                    };
+                    // The block's type parameters are the first of the
+                    // method's, and belong to a holder no type lists, as a
+                    // source block's do.
+                    let block = block_arity as usize;
+                    if block > 0 && block <= type_parameters.len() {
+                        let holder = symbols.add(
+                            SymbolKind::Method,
+                            "<extension>",
+                            None,
+                            Detail::Method(Method {
+                                type_parameters: type_parameters[..block].to_vec(),
+                                arity: block,
+                                ..Method::default()
+                            }),
+                        );
+                        for parameter in &type_parameters[..block] {
+                            symbols.get_mut(*parameter).container = Some(holder);
+                        }
+                    }
+                    if let Detail::Method(detail) = &mut symbols.get_mut(implementation).detail {
+                        detail.extended = Some(TypeSyntaxRef::loaded(implementation));
+                        detail.takes_receiver = !is_static;
+                        // The language's name for what an operator is,
+                        // which the class's method (no special name) lacks.
+                        if name.starts_with("op_") {
+                            detail.method_kind = if matches!(name, "op_Implicit" | "op_Explicit") {
+                                MethodKind::Conversion
+                            } else {
+                                MethodKind::Operator
+                            };
+                        }
+                    }
+                    self.loaded.extended.insert(implementation, extended);
+                }
+            }
         }
     }
 
@@ -2742,8 +2937,13 @@ impl Scope {
 fn index_of(assembly: &Assembly<'_>) -> Index {
     let heaps = assembly.heaps();
     let mut enclosing = FxHashMap::default();
+    let mut inside: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     for row in assembly.table(table::NESTED_CLASS).iter() {
         enclosing.insert(row.number(0), row.number(1));
+        inside.entry(row.number(1)).or_default().push(row.number(0));
+    }
+    for list in inside.values_mut() {
+        list.sort_unstable();
     }
 
     let mut type_parameters: FxHashMap<u32, Vec<(u32, String, u32, u32)>> = FxHashMap::default();
@@ -2920,6 +3120,7 @@ fn index_of(assembly: &Assembly<'_>) -> Index {
 
     Index {
         enclosing,
+        inside,
         type_parameters: ordered(type_parameters),
         method_parameters: ordered(method_parameters),
         interfaces,
@@ -2935,6 +3136,36 @@ fn index_of(assembly: &Assembly<'_>) -> Index {
         method_owner,
         attributes,
         constraints,
+    }
+}
+
+/// A signature a grouping type of an extension block wrote, said the way the
+/// static class's method says it: the block's type parameters, which the
+/// grouping type declares, are the method's first, and the member's own
+/// follow them.
+fn in_class_terms(sig: &TypeSig, block: u32) -> TypeSig {
+    let again = |inner: &TypeSig| Box::new(in_class_terms(inner, block));
+    match sig {
+        TypeSig::Var(position) => TypeSig::MVar(*position),
+        TypeSig::MVar(position) => TypeSig::MVar(block + position),
+        TypeSig::Vector(element) => TypeSig::Vector(again(element)),
+        TypeSig::Array { element, rank } => TypeSig::Array {
+            element: again(element),
+            rank: *rank,
+        },
+        TypeSig::Pointer(inner) => TypeSig::Pointer(again(inner)),
+        TypeSig::ByRef(inner) => TypeSig::ByRef(again(inner)),
+        TypeSig::Generic {
+            definition,
+            arguments,
+        } => TypeSig::Generic {
+            definition: again(definition),
+            arguments: arguments
+                .iter()
+                .map(|argument| in_class_terms(argument, block))
+                .collect(),
+        },
+        other => other.clone(),
     }
 }
 

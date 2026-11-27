@@ -67,6 +67,8 @@ pub(crate) mod type_attributes {
     pub(crate) const NESTED_FAM_AND_ASSEM: u32 = 0x0000_0006;
     pub(crate) const NESTED_FAM_OR_ASSEM: u32 = 0x0000_0007;
     pub(crate) const SEALED: u32 = 0x0000_0100;
+    /// What the language names by `<` and `$`, and no source can write.
+    pub(crate) const SPECIAL_NAME: u32 = 0x0000_0400;
     pub(crate) const INTERFACE: u32 = 0x0000_0020;
     pub(crate) const SEQUENTIAL_LAYOUT: u32 = 0x0000_0008;
     pub(crate) const EXPLICIT_LAYOUT: u32 = 0x0000_0010;

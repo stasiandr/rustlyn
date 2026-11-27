@@ -327,6 +327,7 @@ fn write_symbol(out: &mut Writer, symbol: &Symbol) {
             out.bool(detail.is_extension);
             out.bool(detail.returns_readonly);
             out.option_type_ref(detail.extended);
+            out.bool(detail.takes_receiver);
             out.bool(detail.is_vararg);
         }
         Detail::Field(detail) => {
@@ -452,6 +453,7 @@ fn read_symbol(input: &mut Reader<'_>) -> Option<Symbol> {
             is_extension: input.bool()?,
             returns_readonly: input.bool()?,
             extended: input.option_type_ref()?,
+            takes_receiver: input.bool()?,
             is_vararg: input.bool()?,
         }),
         3 => Detail::Field(Field {
@@ -547,6 +549,13 @@ fn write_loaded(out: &mut Writer, loaded: &Loaded) {
     types.sort_by_key(|(id, _)| id.0);
     out.usize(types.len());
     for (id, ty) in types {
+        out.id(*id);
+        out.ty(ty);
+    }
+    let mut extended: Vec<_> = loaded.extended.iter().collect();
+    extended.sort_by_key(|(id, _)| id.0);
+    out.usize(extended.len());
+    for (id, ty) in extended {
         out.id(*id);
         out.ty(ty);
     }
@@ -736,6 +745,10 @@ fn read_loaded(input: &mut Reader<'_>) -> Option<Loaded> {
     for _ in 0..input.usize()? {
         let id = input.id()?;
         loaded.types.insert(id, input.ty()?);
+    }
+    for _ in 0..input.usize()? {
+        let id = input.id()?;
+        loaded.extended.insert(id, input.ty()?);
     }
     for _ in 0..input.usize()? {
         let id = input.id()?;

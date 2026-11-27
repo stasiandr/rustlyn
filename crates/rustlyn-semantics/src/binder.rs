@@ -1784,6 +1784,15 @@ impl<'a> Binder<'a> {
         reference: TypeSyntaxRef,
         diagnostics: &mut Diagnostics,
     ) -> Type {
+        // A member read from metadata has the type its assembly gave it, and
+        // no syntax to resolve.
+        if let Some(symbol) = reference.loaded_symbol() {
+            return self
+                .compilation
+                .loaded_extended(symbol)
+                .cloned()
+                .unwrap_or(Type::Error);
+        }
         let location = reference.0;
         let Some(node) = self.node_at(location.tree, location.span) else {
             return Type::Error;

@@ -544,24 +544,20 @@ impl BodyBinder<'_> {
         // types, where the types declare none of their own.
         let predefined_first = self.predefined_conversions_of(&left.ty).is_empty()
             && self.predefined_conversions_of(&right.ty).is_empty();
-        if !any && predefined_first {
-            let mut candidates: Vec<(SymbolId, Type)> = Vec::new();
-            for candidate in self.binder.extension_members_in_scope(&self.context, name) {
-                let Some(extended) = symbols
-                    .get(candidate)
-                    .as_method()
-                    .and_then(|detail| detail.extended)
-                else {
-                    continue;
-                };
-                let extended = self.resolve_extended(extended);
-                if let Some(ty) = operands.iter().find(|ty| ty.symbol() == extended.symbol())
-                    && !candidates.iter().any(|(found, _)| *found == candidate)
-                {
-                    candidates.push((candidate, ty.clone()));
-                }
+        // The language's own operators come first: where one takes the
+        // operands, no block's is asked.
+        if !any
+            && (predefined_first
+                || self
+                    .binary_through_conversions(operator, left, right, span)
+                    .is_none())
+        {
+            if self.predefined_binary_applies(operator, &left.ty, &right.ty) {
+                return None;
             }
-            resolved = self.resolve_operator(&candidates, &operands, &arguments, &evidence);
+            let (resolved, _, given) =
+                self.resolve_extension_operator(name, &[left.clone(), right.clone()], span)?;
+            return Some(self.extension_operator_call(resolved, given, span));
         }
         let (method, receiver) = resolved?;
         let ty = self.member_type(method, &receiver);
@@ -596,6 +592,61 @@ impl BodyBinder<'_> {
             ty,
             span,
         ))
+    }
+
+    /// Whether the language has an operator of its own for the two types: an
+    /// extension block's is asked only where it has none. Equality is the
+    /// language's only for the built-in types and for two references, one of
+    /// which converts to the other.
+    fn predefined_binary_applies(
+        &self,
+        operator: BinaryOperator,
+        left: &Type,
+        right: &Type,
+    ) -> bool {
+        // An operand with no type of its own, a lambda, is no operand of the
+        // language's operators.
+        if left.is_error() || right.is_error() {
+            return false;
+        }
+        if !matches!(
+            operator,
+            BinaryOperator::Equality | BinaryOperator::Inequality
+        ) {
+            return self.binder.binary_result(operator, left, right).is_some();
+        }
+        let symbols = self.binder.compilation().symbols();
+        let builtin = |ty: &Type| {
+            let ty = self
+                .binder
+                .nullable_underlying(ty)
+                .unwrap_or_else(|| ty.clone());
+            self.binder.special_of(&ty).is_some()
+                || self.binder.enum_underlying(&ty).is_some()
+                || matches!(ty, Type::Pointer(_))
+        };
+        // `x == null` is the language's on a reference or a nullable.
+        let nullable_or_reference = |ty: &Type| {
+            ty.is_reference_type(symbols) || self.binder.nullable_underlying(ty).is_some()
+        };
+        if (matches!(left, Type::Null) && nullable_or_reference(right))
+            || (matches!(right, Type::Null) && nullable_or_reference(left))
+        {
+            return true;
+        }
+        let value_builtin = |ty: &Type| builtin(ty) && !ty.is_reference_type(symbols);
+        if builtin(left) && builtin(right) {
+            return self.binder.binary_result(operator, left, right).is_some();
+        }
+        // A number or a pointer is equal only to what converts to one.
+        if value_builtin(left) || value_builtin(right) {
+            return false;
+        }
+        let reference = |ty: &Type| matches!(ty, Type::Null) || ty.is_reference_type(symbols);
+        reference(left)
+            && reference(right)
+            && (self.binder.converts_implicitly(left, right)
+                || self.binder.converts_implicitly(right, left))
     }
 
     /// The operator overload resolution picks among `candidates`, each found
@@ -686,34 +737,48 @@ impl BodyBinder<'_> {
         let underlying = self.binder.nullable_underlying(&ty);
         let declaring = underlying.clone().unwrap_or_else(|| ty.clone());
         let symbol = declaring.symbol()?;
-        // The built-in types have their operators built in.
-        if self.binder.special_of(&declaring).is_some()
+        // The built-in types have their operators built in, bar the ones
+        // that have none of this kind: `+o` on an `object` is for an
+        // extension block's.
+        if (self.binder.special_of(&declaring).is_some()
+            && !matches!(
+                self.binder.special_of(&declaring),
+                Some(SpecialType::Object | SpecialType::String)
+            ))
             || self.binder.enum_underlying(&declaring).is_some()
         {
             return None;
         }
-        let mut candidates = self.operator_candidates(symbol, name, span);
+        let candidates = self.operator_candidates(symbol, name, span);
         // An operator an extension block (C# 14) gave the operand's type,
-        // where the type declares none of its own.
-        // The language's own operators, reached through a conversion of the
-        // operand, come before an extension block's.
-        if candidates.is_empty() && self.predefined_conversions_of(&ty).is_empty() {
-            let symbols = self.binder.compilation().symbols();
-            for candidate in self.binder.extension_members_in_scope(&self.context, name) {
-                let Some(extended) = symbols
-                    .get(candidate)
-                    .as_method()
-                    .and_then(|detail| detail.extended)
-                else {
-                    continue;
-                };
-                if self.resolve_extended(extended).symbol() == Some(symbol) {
-                    candidates.push(candidate);
-                }
-            }
-        }
+        // where the type declares none of its own. The language's own
+        // operators, reached through a conversion of the operand, come
+        // before an extension block's.
         if candidates.is_empty() {
-            return None;
+            if !self.predefined_conversions_of(&ty).is_empty() {
+                return None;
+            }
+            if let Some((resolved, _, given)) =
+                self.resolve_extension_operator(name, std::slice::from_ref(operand), span)
+            {
+                return Some(self.extension_operator_call(resolved, given, span));
+            }
+            // On a `T?` it is `T`'s operator, lifted.
+            let inner = underlying?;
+            let probe =
+                BoundExpression::new(BoundExpressionKind::Default(inner.clone()), inner, span);
+            let (resolved, _, _) = self.resolve_extension_operator(name, &[probe], span)?;
+            let result = self
+                .member_type(resolved.method, &Type::Void)
+                .substitute(&resolved.substitution);
+            let lifted = if self.wraps_in_nullable(&result) {
+                self.nullable_of(result)
+            } else {
+                result
+            };
+            return self.lift_conversion(operand.clone(), &lifted, |this, value| {
+                this.extension_operator_call(resolved, vec![value], span)
+            });
         }
         let direct = self.resolve_overload(
             &candidates,
@@ -1033,7 +1098,9 @@ impl BodyBinder<'_> {
             || self
                 .binder
                 .special_of(underlying.as_ref().unwrap_or(&left.ty))
-                .is_some()
+                .is_some_and(|special| {
+                    !matches!(special, SpecialType::Object | SpecialType::String)
+                })
         {
             return None;
         }
@@ -1049,9 +1116,27 @@ impl BodyBinder<'_> {
         let combined = self
             .user_defined_operator(bitwise, &probe, right, span)
             .or_else(|| self.lift_user_defined_binary(bitwise, &probe, right, span))?;
-        if combined.ty != left.ty {
+        // The operator's operands and result are one type, and the operand
+        // is tested as that type: `d && d` on a `D` derived from the `C`
+        // that declares `&(C, C)` asks `C`'s `false` of `(C)d`.
+        let left = &if combined.ty == left.ty {
+            left.clone()
+        } else if self.binder.converts_implicitly(&left.ty, &combined.ty)
+            && matches!(
+                &combined.kind,
+                BoundExpressionKind::Call { arguments, .. }
+                    if arguments.iter().all(|argument| argument.ty == combined.ty)
+            )
+        {
+            self.convert(left.clone(), &combined.ty)
+        } else {
             return None;
-        }
+        };
+        let probe = BoundExpression::new(
+            BoundExpressionKind::Default(left.ty.clone()),
+            left.ty.clone(),
+            span,
+        );
         self.user_defined_unary(test, &probe, span)?;
         let simple = matches!(
             left.kind,

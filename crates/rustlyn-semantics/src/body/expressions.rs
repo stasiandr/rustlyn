@@ -262,7 +262,12 @@ impl BodyBinder<'_> {
         if !bound.ty.is_error()
             && !self.binder.is_boolean(&bound.ty)
             && bound.ty.symbol().is_some()
-            && self.binder.special_of(&bound.ty).is_none()
+            // An `object` or a `string` has no `true` of its own, and an
+            // extension block (C# 14) may give it one.
+            && self
+                .binder
+                .special_of(&bound.ty)
+                .is_none_or(|special| matches!(special, SpecialType::Object | SpecialType::String))
             // `if (s)` on an `S1?` asks `S1`'s `true(S1?)`; a `bool?` is no
             // condition at all.
             && self
@@ -1277,6 +1282,11 @@ impl BodyBinder<'_> {
                         {
                             return call;
                         }
+                        if let Some(bound) =
+                            self.extension_instance_increment(operator, &target, prefix, span)
+                        {
+                            return bound;
+                        }
                         // A type can say what `++` means on it, and then that
                         // is what it means.
                         let name = match operator {
@@ -1298,6 +1308,22 @@ impl BodyBinder<'_> {
                                 BoundExpressionKind::Call { method, .. } => Some(method),
                                 _ => None,
                             });
+                        // An operator an extension block (C# 14) gave the
+                        // type is called, as `x = op(x)`, with whatever its
+                        // type arguments and its receiver need.
+                        if let Some(method) = method
+                            && self
+                                .binder
+                                .compilation()
+                                .symbols()
+                                .get(method)
+                                .as_method()
+                                .is_some_and(|detail| detail.extended.is_some())
+                            && let Some(lowered) =
+                                self.extension_static_increment(name, &target, prefix, span)
+                        {
+                            return lowered;
+                        }
                         if method.is_none()
                             && let Some(lowered) =
                                 self.increment_through_conversion(&target, operator, prefix, span)

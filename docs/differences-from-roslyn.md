@@ -92,9 +92,18 @@ implements the behaviour.
 * An instance operator (C# 14: `void operator +=(int x)`, `void operator ++()`, each with its
   `checked` form) is called in place on a variable of the type that declares it, as Roslyn
   does, but only for the types it finds the operator on: one an extension block declares for a
-  type is not called, and what is wrong with a use or a declaration (an operator that is not
+  type is called from the extension-operator lookup instead (below), and what is wrong with a use or a declaration (an operator that is not
   `void`, a regular and a checked operator that do not pair, an instance and a static `++`
   that clash, an ambiguity between two operators) is not reported.
+* The operators an extension block (C# 14) declares are found by scope, nearest first, after
+  the language's own operators and the type's: the instance ones (`+=`, `++`) before the
+  static ones of the same place. A block's members are read back from an assembly through the
+  grouping and marker types Roslyn writes (and Rustlyn writes the same), operators and methods
+  only: an extension property of a referenced assembly is not found. Left out: a block that
+  extends a tuple for `&&` and `||`, a lifted extension operator inside an expression tree,
+  and the tie-breaking of generic against non-generic blocks (`extension<T>(S<T>)` against
+  `extension(S<int>)`) that Roslyn does beyond overload resolution; where two blocks would be
+  told apart by it, one is chosen.
 * A `decimal` constant is folded as `System.Decimal` works it out, except for one corner
   of `%` that .NET sometimes refuses with an overflow and whose rule is not known: that
   expression is left unfolded, so a `const` made of it is not a compile-time constant to

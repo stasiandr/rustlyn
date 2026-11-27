@@ -227,6 +227,23 @@ impl Location {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TypeSyntaxRef(pub Location);
 
+impl TypeSyntaxRef {
+    /// The reference of a symbol read from metadata, which has no syntax:
+    /// the type it stands for was worked out while the assembly was read
+    /// and is kept under the symbol (`Compilation::loaded_extended`). The
+    /// location names no tree, and its span starts at the symbol's number.
+    #[must_use]
+    pub const fn loaded(symbol: SymbolId) -> Self {
+        Self(Location::new(usize::MAX, TextSpan::new(symbol.0, 0)))
+    }
+
+    /// The symbol whose loaded type this refers to, where it is one.
+    #[must_use]
+    pub fn loaded_symbol(self) -> Option<SymbolId> {
+        (self.0.tree == usize::MAX).then(|| SymbolId(self.0.span.start()))
+    }
+}
+
 /// The part of a symbol that depends on what kind it is.
 #[derive(Clone, Debug)]
 pub enum Detail {
@@ -323,6 +340,9 @@ pub struct Method {
     /// what `C.M()` names a static member of, and what an instance member's
     /// receiver is.
     pub extended: Option<TypeSyntaxRef>,
+    /// Whether the method of an extension block is an instance member of it:
+    /// the block's receiver is its first parameter, as in metadata.
+    pub takes_receiver: bool,
     /// Whether it ends in `__arglist`: a varargs method, called with the
     /// types of what it is given past its parameters written at the call.
     pub is_vararg: bool,

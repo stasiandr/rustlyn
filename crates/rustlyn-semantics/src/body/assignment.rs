@@ -391,7 +391,7 @@ impl BodyBinder<'_> {
     /// an array and its indices — kept in temporaries: the assignments that
     /// fill them, and the place reading them. `None` where the place is on
     /// a struct that is not a variable, whose copy would take the write.
-    fn kept_place(
+    pub(super) fn kept_place(
         &mut self,
         target: &BoundExpression,
     ) -> Option<(Vec<BoundExpression>, BoundExpression)> {
@@ -938,6 +938,13 @@ impl BodyBinder<'_> {
             && let Some(call) = self.bind_in_place_compound(node, operator, &target, &value, span)
         {
             return call;
+        }
+        // An instance operator an extension block (C# 14) gave the type
+        // changes the variable in place.
+        if operator != BinaryOperator::Coalesce
+            && let Some(bound) = self.extension_compound_assignment(operator, &target, &value, span)
+        {
+            return bound;
         }
         // `a += b` on predefined types is `a = (T)(a + b)` only where the
         // cast is one the language writes for the programmer (§12.21.4).

@@ -2351,8 +2351,19 @@ impl<'a> Declarer<'a> {
                     else {
                         continue;
                     };
+                    // An instance operator (`operator +=`) takes the block's
+                    // receiver first, as an instance method does, without
+                    // being an extension method that a call could reach.
+                    self.take_receiver(id, receiver.as_ref());
                     if let Detail::Method(detail) = &mut self.symbols.get_mut(id).detail {
+                        detail.is_extension = false;
                         detail.extended = extended;
+                        // The block's type parameters are the operator's
+                        // own, as they are a method's.
+                        if !generics.is_empty() {
+                            detail.arity = generics.len();
+                            detail.type_parameters = generics.clone();
+                        }
                     }
                 }
                 SyntaxKind::PropertyDeclaration | SyntaxKind::IndexerDeclaration => {
@@ -2440,6 +2451,7 @@ impl<'a> Declarer<'a> {
             receiver.extend(own);
             detail.parameters = receiver;
             detail.is_extension = true;
+            detail.takes_receiver = true;
         }
         self.symbols
             .get_mut(method)

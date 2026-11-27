@@ -35,6 +35,7 @@ mod disposal;
 mod dynamic;
 mod elements;
 mod expressions;
+mod extension_operators;
 mod foreach;
 mod inference;
 mod instance_operators;

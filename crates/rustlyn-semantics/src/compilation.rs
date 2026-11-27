@@ -705,6 +705,13 @@ impl Compilation {
         self.loaded.types.get(&symbol)
     }
 
+    /// The type an extension block read from a referenced assembly extends,
+    /// for the member that block declared.
+    #[must_use]
+    pub fn loaded_extended(&self, symbol: SymbolId) -> Option<&Type> {
+        self.loaded.extended.get(&symbol)
+    }
+
     /// The value of a `const` field read out of a referenced assembly.
     ///
     /// A literal field has no storage: `char.MaxValue` is the value, and

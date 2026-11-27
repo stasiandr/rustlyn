@@ -573,6 +573,9 @@ pub(crate) struct Emitter<'a> {
     pub(crate) singleton_lambdas: HashMap<(SymbolId, usize), crate::singleton::SingletonLambda>,
     /// Every `<>c`, by its `TypeDef` token.
     pub(crate) singleton_types: HashMap<Token, crate::singleton::Singleton>,
+    /// Where the bodies the marker methods of extension blocks share are in
+    /// the code: the one that throws and the one that returns.
+    pub(crate) extension_bodies: Option<(u32, u32)>,
     /// The lambdas of the type being planned that go to its `<>c`.
     pub(crate) singleton_candidates: Vec<(SymbolId, usize)>,
     /// The parameters of `Invoke` each of a delegate's `BeginInvoke` and
@@ -819,7 +822,8 @@ fn emit_assembly_here(
     let plans = emitter.plan()?;
     drop(planning);
     let generating = rustlyn_semantics::timing::phase("generate");
-    let (il, mut bodies) = emitter.generate(&plans)?;
+    let (mut il, mut bodies) = emitter.generate(&plans)?;
+    emitter.add_extension_bodies(&mut il);
     drop(generating);
     let _writing = rustlyn_semantics::timing::phase("write");
     let mut plans = plans;
@@ -904,7 +908,8 @@ pub fn survey_with_resources(
     let plans = emitter.plan()?;
     drop(planning);
     let generating = rustlyn_semantics::timing::phase("generate");
-    let (il, mut bodies) = emitter.generate(&plans)?;
+    let (mut il, mut bodies) = emitter.generate(&plans)?;
+    emitter.add_extension_bodies(&mut il);
     drop(generating);
     let _writing = rustlyn_semantics::timing::phase("write");
     let mut plans = plans;
@@ -1020,7 +1025,8 @@ pub fn incremental_with<'a>(
     let plans = emitter.plan()?;
     drop(planning);
     let generating = rustlyn_semantics::timing::phase("generate");
-    let (il, mut bodies) = emitter.generate(&plans)?;
+    let (mut il, mut bodies) = emitter.generate(&plans)?;
+    emitter.add_extension_bodies(&mut il);
     drop(generating);
     let _writing = rustlyn_semantics::timing::phase("write");
     let mut plans = plans;
@@ -1257,6 +1263,7 @@ impl<'a> Emitter<'a> {
             lambda_names: HashMap::new(),
             singleton_lambdas: HashMap::new(),
             singleton_types: HashMap::new(),
+            extension_bodies: None,
             singleton_candidates: Vec::new(),
             cloned_parameters: HashMap::new(),
             nullable_contexts: crate::nullable::contexts_of(compilation),
@@ -2817,7 +2824,7 @@ impl Emitter<'_> {
                 .source
                 .written_member()
                 .is_some_and(|symbol| self.is_extension_method(symbol))
-        });
+        }) || self.holds_extension_blocks(ty);
         if has_extensions {
             self.mark_extension(parent);
         }
@@ -3181,7 +3188,9 @@ impl Emitter<'_> {
             self.mark_compiler_feature_required(parent, "RequiredMembers");
         }
         if let Some(symbol) = written {
-            if self.is_extension_method(symbol) {
+            // An operator of an extension block takes its receiver first
+            // without being an extension method.
+            if self.is_extension_method(symbol) && !self.is_extension_operator(symbol) {
                 self.mark_extension(parent);
             }
             self.write_custom_attributes(parent, symbol, AttributeTarget::Method)?;
@@ -7550,7 +7559,7 @@ impl Emitter<'_> {
         );
     }
 
-    fn mark_extension(&mut self, parent: u32) {
+    pub(crate) fn mark_extension(&mut self, parent: u32) {
         self.mark_with(parent, "System.Runtime.CompilerServices.ExtensionAttribute");
     }
 
@@ -7725,7 +7734,7 @@ impl Emitter<'_> {
             .add_custom_attribute(parent, ((constructor.0 & 0x00FF_FFFF) << 3) | 3, &blob);
     }
 
-    fn mark_with(&mut self, parent: u32, qualified_type: &str) {
+    pub(crate) fn mark_with(&mut self, parent: u32, qualified_type: &str) {
         let constructor = self.references.member_ref(
             &mut self.metadata,
             qualified_type,
@@ -7852,8 +7861,13 @@ impl Emitter<'_> {
                 } else {
                     symbol.modifiers
                 };
-            let mut flags =
-                method_flags(accessibility, instance, modifiers) | method_attributes::SPECIAL_NAME;
+            let mut flags = method_flags(accessibility, instance, modifiers);
+            // The class holding an extension block's property keeps the
+            // accessors under the plain name; the special ones are the
+            // grouping type's markers.
+            if detail.extended.is_none() {
+                flags |= method_attributes::SPECIAL_NAME;
+            }
             if detail.synthesized == Some(rustlyn_semantics::SynthesizedType::SystemType) {
                 flags |= method_attributes::HIDE_BY_SIG;
             }
@@ -8140,10 +8154,13 @@ impl Emitter<'_> {
         }
         // An operator is a method with a special name: `op_Addition` is how
         // `+` is found, and the flag is what says the name means that.
+        // The class holding an extension block's operator keeps it under the
+        // plain name; the special one is the grouping type's marker.
         if matches!(
             detail.method_kind,
             rustlyn_semantics::MethodKind::Operator | rustlyn_semantics::MethodKind::Conversion
-        ) {
+        ) && detail.extended.is_none()
+        {
             flags |= method_attributes::SPECIAL_NAME;
         }
         // A method that implements an interface member has to sit in a slot
@@ -8613,7 +8630,7 @@ impl Emitter<'_> {
                     .source
                     .written_member()
                     .is_some_and(|symbol| self.is_extension_method(symbol))
-            })
+            }) || self.holds_extension_blocks(plan.symbol)
         });
         if has_extensions {
             self.mark_extension((1 << 5) | 14);
@@ -9025,7 +9042,7 @@ impl Emitter<'_> {
 
             self.write_members(plan, type_offsets)?;
         }
-        Ok(())
+        self.write_extension_groups()
     }
 
     /// The fields, properties and methods of one planned type.
@@ -9169,9 +9186,26 @@ impl Emitter<'_> {
 
             // A property's rows say that two methods belong together; the
             // methods themselves are added below like any other.
-            if !plan.properties.is_empty() {
+            // An extension block's property is the grouping type's, and the
+            // class has only its accessors.
+            let written_properties: Vec<PropertyPlan> = plan
+                .properties
+                .iter()
+                .filter(|property| {
+                    property.symbol.is_none_or(|symbol| {
+                        !self
+                            .compilation
+                            .symbols()
+                            .get(symbol)
+                            .as_property()
+                            .is_some_and(|detail| detail.extended.is_some())
+                    })
+                })
+                .cloned()
+                .collect();
+            if !written_properties.is_empty() {
                 self.metadata.add_property_map(token);
-                for property in &plan.properties.clone() {
+                for property in &written_properties {
                     let mut ty = self.sig_type(&property.ty)?;
                     if let Some(symbol) = property.symbol {
                         ty = self.returned_sig(symbol, ty);
@@ -13832,7 +13866,7 @@ fn method_def_or_ref(token: Token) -> u32 {
     ((token.0 & 0x00FF_FFFF) << 1) | tag
 }
 
-fn method_flags(
+pub(crate) fn method_flags(
     accessibility: rustlyn_semantics::Accessibility,
     instance: bool,
     modifiers: Modifiers,

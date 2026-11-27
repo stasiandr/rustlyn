@@ -14,7 +14,7 @@ use crate::types::Type;
 
 /// The name an instance operator has in metadata for the compound
 /// assignment that calls it.
-const fn compound_name(operator: BinaryOperator) -> Option<&'static str> {
+pub(super) const fn compound_name(operator: BinaryOperator) -> Option<&'static str> {
     Some(match operator {
         BinaryOperator::Add => "op_AdditionAssignment",
         BinaryOperator::Subtract => "op_SubtractionAssignment",

@@ -26086,3 +26086,76 @@ fn the_lambdas_and_local_functions_of_one_method_are_emitted_in_time_proportiona
         );
     }
 }
+
+#[test]
+fn extension_block_operators_work_across_assemblies() {
+    // The operators an extension block (C# 14) declares, read back from the assembly that has
+    // them: static and checked ones, `true` and `false` for `&&`, lifted ones, the in-place
+    // `+=` and `--` of a `ref` receiver, and a generic block. The grouping types and marker
+    // methods in the library are what say which methods are the block's.
+    check_with_library(
+        "extension_operators_across_assemblies",
+        r#"public struct V {
+  public int F;
+  public V(int f) { F = f; }
+}
+public class Box<T> {
+  public T Value;
+}
+public static class Ops {
+  extension(V) {
+    public static V operator +(V a, V b) { System.Console.Write("[+]"); return new V(a.F + b.F); }
+    public static V operator checked +(V a, V b) { System.Console.Write("[checked +]"); return new V(checked(a.F + b.F)); }
+    public static V operator -(V a) { System.Console.Write("[-]"); return new V(-a.F); }
+    public static V operator ++(V a) { System.Console.Write("[++]"); return new V(a.F + 1); }
+    public static V operator &(V a, V b) { System.Console.Write("[&]"); return new V(a.F & b.F); }
+    public static bool operator true(V a) { System.Console.Write("[true]"); return a.F != 0; }
+    public static bool operator false(V a) { System.Console.Write("[false]"); return a.F == 0; }
+    public static bool operator ==(V a, V b) { System.Console.Write("[==]"); return a.F == b.F; }
+    public static bool operator !=(V a, V b) { System.Console.Write("[!=]"); return a.F != b.F; }
+  }
+  extension(ref V v) {
+    public void operator +=(int x) { System.Console.Write("[+=]"); v = new V(v.F + x * 10); }
+    public void operator --() { System.Console.Write("[--]"); v = new V(v.F - 5); }
+  }
+  extension<T>(Box<T>) {
+    public static Box<T> operator +(Box<T> a, Box<T> b) {
+      System.Console.Write("[Box+" + typeof(T).Name + "]");
+      var r = new Box<T>();
+      r.Value = a.Value;
+      return r;
+    }
+  }
+}
+"#,
+        r#"class P {
+  static void Main() {
+    var a = new V(1);
+    var b = new V(2);
+    System.Console.WriteLine((a + b).F);
+    System.Console.WriteLine((-a).F);
+    checked { System.Console.WriteLine((a + b).F); }
+    a += 3;
+    System.Console.WriteLine(a.F);
+    --a;
+    System.Console.WriteLine(a.F);
+    a++;
+    System.Console.WriteLine(a.F);
+    var c = a++;
+    System.Console.WriteLine(c.F + " " + a.F);
+    System.Console.WriteLine(a == b);
+    System.Console.WriteLine(a != b);
+    if (a) System.Console.WriteLine("true");
+    System.Console.WriteLine((a && b).F);
+    System.Console.WriteLine((new V(0) && b).F);
+    V? n = a;
+    System.Console.WriteLine((n + b).Value.F);
+    var x = new Box<string>();
+    x.Value = "s";
+    System.Console.WriteLine((x + x).Value);
+  }
+}
+"#,
+        "[+]3\n[-]-1\n[checked +]3\n[+=]31\n[--]26\n[++]27\n[++]27 28\n[==]False\n[!=]True\n[true]true\n[false][&]0\n[false]0\n[+]30\n[Box+String]s\n",
+    );
+}

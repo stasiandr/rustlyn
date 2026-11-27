@@ -2487,7 +2487,7 @@ fn operator_factory(name: &str, arity: usize) -> Option<(&'static str, bool)> {
         ("op_CheckedUnaryNegation", 1) => ("NegateChecked", true),
         ("op_UnaryPlus", 1) => ("UnaryPlus", true),
         ("op_LogicalNot", 1) => ("Not", true),
-        ("op_OnesComplement", 1) => ("OnesComplement", true),
+        ("op_OnesComplement", 1) => ("Not", true),
         ("op_Addition", 2) => ("Add", false),
         ("op_CheckedAddition", 2) => ("AddChecked", false),
         ("op_Subtraction", 2) => ("Subtract", false),

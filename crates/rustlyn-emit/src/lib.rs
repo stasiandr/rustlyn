@@ -15,6 +15,7 @@ mod codegen;
 mod dynamic;
 mod emitter;
 mod expression_trees;
+mod extensions;
 mod hoisting;
 pub mod hot;
 mod il;
