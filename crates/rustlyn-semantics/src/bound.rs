@@ -237,6 +237,10 @@ pub enum BoundExpressionKind {
     Parameter(SymbolId),
     This,
     Base,
+    /// A value already on the evaluation stack, which what is bound over it
+    /// converts: the element a `foreach` has just read, on its way into the
+    /// iteration variable. It makes no instructions of its own.
+    StackValue,
     /// A type used where a value would go, which only a member access can do
     /// anything with: the `Console` of `Console.WriteLine`.
     TypeExpression(SymbolId),
@@ -1024,6 +1028,11 @@ pub enum BoundStatementKind {
         /// nested loops Roslyn writes, not through `IEnumerable`, which
         /// would box every element (and cannot box a pointer at all).
         dimensions: Vec<(LocalId, LocalId)>,
+        /// How an element becomes the iteration variable when the types
+        /// differ (§13.9.5): the explicit conversion a cast would be, bound
+        /// over a [`BoundExpressionKind::StackValue`] of the element's type.
+        /// `None` where the element is the variable's type already.
+        conversion: Option<Box<BoundExpression>>,
     },
     /// `: base(...)` or `: this(...)`, which a constructor runs before its
     /// own body. It is a statement of its own rather than a call, because a

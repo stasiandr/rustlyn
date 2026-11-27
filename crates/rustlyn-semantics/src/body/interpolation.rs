@@ -1203,6 +1203,7 @@ impl BodyBinder<'_> {
             | BoundExpressionKind::Parameter(_)
             | BoundExpressionKind::This
             | BoundExpressionKind::Base
+            | BoundExpressionKind::StackValue
             | BoundExpressionKind::TypeExpression(_)
             | BoundExpressionKind::NamespaceExpression(_)
             | BoundExpressionKind::UnboundLambda(_)

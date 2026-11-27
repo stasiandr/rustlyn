@@ -182,6 +182,7 @@ pub(super) fn expression_children(expression: &BoundExpression) -> Vec<&BoundExp
         | E::Parameter(_)
         | E::This
         | E::Base
+        | E::StackValue
         | E::TypeExpression(_)
         | E::NamespaceExpression(_)
         | E::UnboundLambda(_)

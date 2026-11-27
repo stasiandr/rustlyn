@@ -1207,7 +1207,11 @@ impl BodyBinder<'_> {
                         // The operand is promoted first (§12.9.2–4): `-b` on a
                         // `byte` is an `int`, and `-u` on a `uint` a `long`,
                         // since no `uint` holds the answer.
-                        let promoted = match self.binder.special_of(&operand.ty) {
+                        // The same on a `T?`, whose operator is the lifted one
+                        // (§12.4.8) and gives a `U?`.
+                        let lifted = self.binder.nullable_underlying(&operand.ty);
+                        let held = lifted.clone().unwrap_or_else(|| operand.ty.clone());
+                        let promoted = match self.binder.special_of(&held) {
                             Some(
                                 SpecialType::SByte
                                 | SpecialType::Byte
@@ -1223,6 +1227,11 @@ impl BodyBinder<'_> {
                         let operand = match promoted {
                             Some(special) => {
                                 let target = self.special(special);
+                                let target = if lifted.is_some() {
+                                    self.nullable_of(target)
+                                } else {
+                                    target
+                                };
                                 self.convert(operand, &target)
                             }
                             None => self.predefined_unary_operand(operator, operand),
@@ -1382,10 +1391,11 @@ impl BodyBinder<'_> {
                     let pattern =
                         match self.union_constant_test(&operand.ty.clone(), value, written.span()) {
                             Ok(pattern) => pattern,
-                            Err(value) => BoundPattern::new(
-                                BoundPatternKind::Constant(*value),
-                                written.span(),
-                            ),
+                            Err(value) => {
+                                let operand_type = operand.ty.clone();
+                                let value = self.constant_as_decimal(*value, &operand_type);
+                                BoundPattern::new(BoundPatternKind::Constant(value), written.span())
+                            }
                         };
                     return at(
                         BoundExpressionKind::IsPattern {

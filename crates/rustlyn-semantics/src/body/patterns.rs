@@ -92,6 +92,33 @@ impl BodyBinder<'_> {
             .filter(|members| members.value.is_some())
     }
 
+    /// The constant of a pattern on a `decimal` (or a `decimal?`), as a
+    /// `decimal`: `m is 1` compares the input with `1m`, the constant having
+    /// the input's type (§11.2.3), where the other numeric types are
+    /// compared as the machine's numbers. A constant that is not implicitly
+    /// a `decimal` is left as written, for the check that it is a constant
+    /// of the input's type to say so.
+    pub(super) fn constant_as_decimal(
+        &mut self,
+        value: BoundExpression,
+        input: &Type,
+    ) -> BoundExpression {
+        let target = self
+            .binder
+            .nullable_underlying(input)
+            .unwrap_or_else(|| input.clone());
+        if self.binder.special_of(&target) != Some(SpecialType::Decimal)
+            || value.ty == target
+            || value.ty.is_error()
+            || self.binder.folded(&value).is_none()
+            || self.binder.special_of(&value.ty).is_none()
+            || !self.binder.converts_implicitly(&value.ty, &target)
+        {
+            return value;
+        }
+        self.convert(value, &target)
+    }
+
     pub(super) fn bind_pattern(&mut self, node: &SyntaxNode, input: &Type) -> BoundPattern {
         // A union — or a `U?` of one — is matched by what it holds (C# 15).
         let (union, nullable) = match self.binder.nullable_underlying(input) {
@@ -479,6 +506,7 @@ impl BodyBinder<'_> {
                         value
                     };
                     self.require_constant(&value, input);
+                    let value = self.constant_as_decimal(value, input);
                     match self.span_string_test(&value, input, span) {
                         Some(test) => at(test),
                         None => at(BoundPatternKind::Constant(value)),
@@ -498,6 +526,7 @@ impl BodyBinder<'_> {
                 match (operator, value) {
                     (Some(operator), Some(value)) => {
                         self.require_constant(&value, input);
+                        let value = self.constant_as_decimal(value, input);
                         at(BoundPatternKind::Relational { operator, value })
                     }
                     _ => at(BoundPatternKind::Unsupported(node.kind())),
@@ -514,6 +543,7 @@ impl BodyBinder<'_> {
                 if !self.names_a_type(&written) {
                     let value = self.bind_expression(&written);
                     self.require_constant(&value, input);
+                    let value = self.constant_as_decimal(value, input);
                     return at(BoundPatternKind::Constant(value));
                 }
                 let ty = self.resolve(&written);

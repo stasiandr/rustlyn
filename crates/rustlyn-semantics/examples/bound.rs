@@ -167,6 +167,7 @@ fn print_statement(
             enumeration,
             walk: _,
             dimensions: _,
+            conversion: _,
         } => {
             let how = if enumeration.is_some() {
                 " (enumerator)"

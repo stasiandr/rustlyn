@@ -1140,6 +1140,26 @@ impl<'a> Loader<'a> {
             if flags & 0x40 != 0 {
                 symbol.modifiers.insert(Modifiers::CONST);
             }
+            // `modreq(IsVolatile)` is how a field says it is `volatile`, and
+            // a read or a write of one is done under `volatile.`.
+            let volatile = assembly
+                .heaps()
+                .blob(entry.number(2))
+                .ok()
+                .and_then(|bytes| Blob::new(bytes).field_modifiers().ok())
+                .is_some_and(|modifiers| {
+                    modifiers.iter().any(|modifier| {
+                        modifier.required
+                            && self.name_of(index, modifier.token).as_deref()
+                                == Some("System.Runtime.CompilerServices.IsVolatile")
+                    })
+                });
+            if volatile {
+                symbols
+                    .get_mut(member)
+                    .modifiers
+                    .insert(Modifiers::VOLATILE);
+            }
             // `required` is `[RequiredMember]` (C# 11).
             if self.has_attribute(
                 index,

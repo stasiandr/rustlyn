@@ -500,6 +500,9 @@ impl Interpreter<'_> {
                 };
                 Err(Signal::Thrown(value))
             }
+            BoundExpressionKind::StackValue => Err(Signal::fault(
+                "a value on the stack is not one to evaluate".to_string(),
+            )),
             BoundExpressionKind::ArgList(_) | BoundExpressionKind::ArgListHandle => {
                 Err(Signal::fault("`__arglist` is not interpreted".to_string()))
             }

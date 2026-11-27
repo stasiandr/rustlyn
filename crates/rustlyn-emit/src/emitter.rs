@@ -592,6 +592,10 @@ pub(crate) struct Emitter<'a> {
     /// The `Field` token of each field it defines, and of the backing field of
     /// each automatic property.
     pub(crate) fields: HashMap<SymbolId, Token>,
+    /// The tokens of the `volatile` fields — defined here, referenced from
+    /// another assembly or reached through a construction — that bodies read
+    /// and write under `volatile.`.
+    pub(crate) volatile_fields: std::collections::HashSet<u32>,
     /// `get_X` and `set_X` for each property.
     pub(crate) getters: HashMap<SymbolId, Token>,
     pub(crate) setters: HashMap<SymbolId, Token>,
@@ -1261,6 +1265,7 @@ impl<'a> Emitter<'a> {
             nullable_type_contexts: HashMap::new(),
             pending_singletons: Vec::new(),
             fields: HashMap::new(),
+            volatile_fields: std::collections::HashSet::new(),
             getters: HashMap::new(),
             setters: HashMap::new(),
             constructors: HashMap::new(),
@@ -1673,6 +1678,9 @@ impl Emitter<'_> {
                         let token = Token::new(table::FIELD, next_field);
                         next_field += 1;
                         self.fields.insert(member, token);
+                        if self.is_volatile_field(member) {
+                            self.volatile_fields.insert(token.0);
+                        }
                         let is_static = detail.modifiers.contains(Modifiers::STATIC)
                             || detail.modifiers.contains(Modifiers::CONST);
                         // A `decimal` has no literal form in metadata,
@@ -7094,6 +7102,9 @@ impl Emitter<'_> {
                 signature: None,
             });
         }
+        if !instance && !self.declared_in_interface(event) {
+            self.note_static_event_implementations(event, &tokens);
+        }
         if let Some(container) = container {
             self.events_of
                 .entry(container)
@@ -7107,6 +7118,67 @@ impl Emitter<'_> {
                 });
         }
         plans
+    }
+
+    /// Remembers that a static event implements a `static abstract` (or
+    /// `static virtual`) event of an interface its type has: `Sq.Changed`
+    /// answers for `I<Sq>.Changed`, its `add_Changed` and `remove_Changed`
+    /// each for the interface's own, by `MethodImpl` rows as for the methods
+    /// and properties that do.
+    fn note_static_event_implementations(&mut self, event: SymbolId, accessors: &[Token]) {
+        let symbols = self.compilation.symbols();
+        let Some(container) = symbols.get(event).container else {
+            return;
+        };
+        let Some(class) = self.types.get(&container).copied() else {
+            return;
+        };
+        let name = symbols.get(event).name.clone();
+        let own = self.type_of(event);
+        let interfaces = self.answering.get(&container).cloned().unwrap_or_default();
+        for interface in interfaces {
+            let Some(declared) = interface.symbol() else {
+                continue;
+            };
+            let Some(found) = symbols
+                .lookup(declared, &name)
+                .iter()
+                .copied()
+                .find(|candidate| {
+                    symbols.get(*candidate).kind == SymbolKind::Event
+                        && self.member_type(*candidate, &interface) == own
+                })
+            else {
+                continue;
+            };
+            let Some(detail) = symbols.get(found).as_event() else {
+                continue;
+            };
+            // An event read from metadata says `static abstract` on its
+            // accessors, not on itself.
+            let has = |flag: Modifiers| {
+                symbols.get(found).modifiers.contains(flag)
+                    || [detail.adder, detail.remover]
+                        .into_iter()
+                        .flatten()
+                        .any(|accessor| symbols.get(accessor).modifiers.contains(flag))
+            };
+            if !has(Modifiers::STATIC) || !(has(Modifiers::ABSTRACT) || has(Modifiers::VIRTUAL)) {
+                continue;
+            }
+            for (answered, body) in [(detail.adder, accessors[0]), (detail.remover, accessors[1])] {
+                if let Some(answered) = answered {
+                    self.explicit_impls.push(ExplicitImpl {
+                        class,
+                        body,
+                        declaration: Declaration::Method {
+                            member: answered,
+                            interface: interface.clone(),
+                        },
+                    });
+                }
+            }
+        }
     }
 
     /// The `add_E` or `remove_E` synthesized for a field-like event.
@@ -7157,13 +7229,10 @@ impl Emitter<'_> {
         // `event EventHandler I.E { add { } remove { } }` implements the
         // interface's accessors explicitly: private, sealed, named
         // `I.add_E`, and tied to them by `MethodImpl` rows.
-        let explicit = instance
-            .then(|| self.explicit_interface(event))
-            .flatten()
-            .and_then(|interface| {
-                let declared = self.interface_event(event, &interface)?;
-                Some((interface, declared))
-            });
+        let explicit = self.explicit_interface(event).and_then(|interface| {
+            let declared = self.interface_event(event, &interface)?;
+            Some((interface, declared))
+        });
         let (prefix, bare) = match &explicit {
             Some((interface, _)) => (
                 format!("{}.", self.explicit_prefix(interface)),
@@ -7174,6 +7243,12 @@ impl Emitter<'_> {
         let name = format!("{prefix}{bare}");
         if explicit.is_some() && self.declared_in_interface(event) {
             flags = self.interface_member_flags(event, symbol.accessibility, true)
+                | method_attributes::SPECIAL_NAME;
+        } else if explicit.is_some() && !instance {
+            // A static one has no slot: the `MethodImpl` row is all there is.
+            flags = method_attributes::PRIVATE
+                | method_attributes::STATIC
+                | method_attributes::HIDE_BY_SIG
                 | method_attributes::SPECIAL_NAME;
         } else if explicit.is_some() {
             flags = method_attributes::PRIVATE
@@ -7224,6 +7299,9 @@ impl Emitter<'_> {
                 impl_flags: 0,
                 signature: None,
             });
+        }
+        if !instance && explicit.is_none() && !self.declared_in_interface(event) {
+            self.note_static_event_implementations(event, &tokens);
         }
         if let Some(container) = container {
             self.events_of
@@ -8949,6 +9027,10 @@ impl Emitter<'_> {
                     let ty = match &field.sig {
                         Some(sig) => sig.clone(),
                         None => self.sig_type(&field.ty)?,
+                    };
+                    let ty = match field.symbol {
+                        Some(symbol) => self.field_sig_of(symbol, ty),
+                        None => ty,
                     };
                     field_signature(&ty)
                 };
@@ -11176,6 +11258,7 @@ impl Emitter<'_> {
             SymbolKind::Field | SymbolKind::Event => {
                 let ty = self.type_of(member);
                 let ty = self.sig_type(&ty)?;
+                let ty = self.field_sig_of(member, ty);
                 field_signature(&ty)
             }
             // A property stands for the field behind it here: `Holder<T>.
@@ -11233,6 +11316,9 @@ impl Emitter<'_> {
             self.references
                 .member_of_spec(&mut self.metadata, spec, &name, &signature)
         };
+        if self.is_volatile_field(member) {
+            self.volatile_fields.insert(token.0);
+        }
         // The instantiation a call makes of the reference has to carry the
         // inherited parameters, the way one of the definition does.
         if let Some(inherited) = self
@@ -12113,6 +12199,29 @@ impl Emitter<'_> {
             .member_ref_on(&mut self.metadata, parent, &name, &signature))
     }
 
+    /// Whether a field is `volatile`: its signature says so with a
+    /// `modreq(IsVolatile)`, and every read and write of it is under
+    /// `volatile.`.
+    fn is_volatile_field(&self, field: SymbolId) -> bool {
+        let symbol = self.compilation.symbols().get(field);
+        symbol.kind == SymbolKind::Field && symbol.modifiers.contains(Modifiers::VOLATILE)
+    }
+
+    /// A field's type as its signature spells it: under `modreq(IsVolatile)`
+    /// where the field is `volatile`.
+    fn field_sig_of(&mut self, field: SymbolId, ty: SigType) -> SigType {
+        if !self.is_volatile_field(field) {
+            return ty;
+        }
+        SigType::Required {
+            modifier: self.references.type_ref_coded(
+                &mut self.metadata,
+                "System.Runtime.CompilerServices.IsVolatile",
+            ),
+            inner: Box::new(ty),
+        }
+    }
+
     /// A `MemberRef` for a field of a type this assembly does not define.
     ///
     /// `int.MaxValue` and `string.Empty` are ordinary static fields of
@@ -12131,11 +12240,16 @@ impl Emitter<'_> {
             None => self.type_of(field),
         };
         let ty = self.sig_type(&ty)?;
+        let ty = self.field_sig_of(field, ty);
         let signature = field_signature(&ty);
         let parent = self.referenced_type(container);
-        Ok(self
+        let token = self
             .references
-            .member_ref_on(&mut self.metadata, parent, &name, &signature))
+            .member_ref_on(&mut self.metadata, parent, &name, &signature);
+        if self.is_volatile_field(field) {
+            self.volatile_fields.insert(token.0);
+        }
+        Ok(token)
     }
 
     /// The one field of the struct a `fixed` buffer field is of, whose
@@ -13237,6 +13351,7 @@ impl Emitter<'_> {
         if !stream.ends_flow() || stream.last_falls_through() {
             stream.emit(Instruction::Ret);
         }
+        stream.prefix_volatile(|token| self.volatile_fields.contains(&token.0));
         let (code, max_stack, regions) = stream.finish();
         let signature = (!locals.is_empty())
             .then(|| self.metadata.add_stand_alone_sig(&local_signature(locals)));

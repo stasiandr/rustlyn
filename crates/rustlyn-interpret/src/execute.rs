@@ -119,6 +119,7 @@ impl Interpreter<'_> {
                 enumeration,
                 walk: _,
                 dimensions: _,
+                conversion: _,
             } => {
                 let collection = self.eval(body, collection, frame)?;
                 // A collection the interpreter provides is walked directly;

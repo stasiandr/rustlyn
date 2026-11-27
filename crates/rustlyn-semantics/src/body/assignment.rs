@@ -1091,10 +1091,24 @@ impl BodyBinder<'_> {
         // dearer place — `collider.includeLayers |= mask` on Unity's
         // `LayerMask`, a property — is read and written through
         // temporaries, as for an operator the type declares.
+        // That is for an operator the types do not take as they are: `s += w`
+        // on a `string` concatenates `w` itself, or what it converts to
+        // `string`, whatever else it converts to, as `s + w` does.
+        let value = if operator == BinaryOperator::Add
+            && self.binder.special_of(&stored) == Some(SpecialType::String)
+        {
+            self.convert_operand_to_string(value)
+        } else {
+            value
+        };
         let converts = !is_delegate
             && operator != BinaryOperator::Coalesce
             && (!self.predefined_conversions_of(&stored).is_empty()
-                || !self.predefined_conversions_of(&value.ty).is_empty());
+                || !self.predefined_conversions_of(&value.ty).is_empty())
+            && self
+                .binder
+                .binary_result(operator, &stored, &value.ty)
+                .is_none();
         let located = if !converts {
             None
         } else if plain_place {

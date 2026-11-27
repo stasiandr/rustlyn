@@ -316,6 +316,18 @@ impl<'a> Blob<'a> {
         })
     }
 
+    /// The custom modifiers a field's type has in front of it, after the
+    /// convention byte: `modreq(IsVolatile)` is what says a field is
+    /// `volatile`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the blob ends in the middle of one.
+    pub fn field_modifiers(&mut self) -> Result<Vec<CustomModifier>, Error> {
+        self.byte()?;
+        self.modifiers()
+    }
+
     /// A method's signature: the calling convention, the counts, and the types.
     ///
     /// # Errors

@@ -24869,3 +24869,642 @@ True
 ",
     );
 }
+
+/// `foreach (T v in xs)` converts each element to `T` as a cast would (§13.9.5): a nullable to its
+/// underlying type or to another nullable, a number to another number (`decimal` among them), an
+/// enum to its integer, by an operator the type declares, by unboxing or by a reference cast — over an
+/// array, a rectangular array, a string, a span, a pattern enumerator, `IEnumerable` and `await
+/// foreach`. The walk converted only what a hand-written table knew: `foreach (int n in List<int?>)`
+/// stored the `Nullable` itself, `foreach (long n in int?[])` was invalid IL and `foreach (decimal n in
+/// double[])` stored a `double` where a `decimal` goes. The binder now binds the conversion once, and
+/// every way of walking emits it.
+#[test]
+fn foreach_converts_each_element_by_the_explicit_conversion_to_the_variable() {
+    check(
+        "ForeachExplicitConversions",
+        r#"using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+enum E { A = 1, B = 2 }
+struct Cel { public double D; public static explicit operator Cel(int i) => new Cel { D = i * 1.5 }; public static implicit operator Cel(string s) => new Cel { D = s.Length }; public override string ToString() => "Cel" + D; }
+class Base { public override string ToString() => "Base"; } class Der : Base { public override string ToString() => "Der"; }
+class Gen { public static void Run<T>(IEnumerable<object> items) { foreach (T t in items) Console.Write(t + ";"); Console.WriteLine(); } }
+class P {
+  static async IAsyncEnumerable<int> Ints() { await Task.Yield(); yield return 1; yield return 2; }
+  static async Task Main() {
+    foreach (int n in new List<int?> { 1, 2 }) Console.Write(n + " "); Console.WriteLine();
+    foreach (long n in new int?[] { 1, 2 }) Console.Write(n + " "); Console.WriteLine();
+    foreach (decimal n in new double[] { 1.5, 2.5 }) Console.Write(n + " "); Console.WriteLine();
+    foreach (int? n in new long?[] { 1, null }) Console.Write(n + ";"); Console.WriteLine();
+    foreach (decimal n in new double[,] { { 1.5, 2.5 }, { 3.5, 4.5 } }) Console.Write(n + " "); Console.WriteLine();
+    foreach (int n in new int?[,] { { 1, 2 }, { 3, 4 } }) Console.Write(n + " "); Console.WriteLine();
+    foreach (byte b in new int[] { 65, 300 }) Console.Write(b + " "); Console.WriteLine();
+    foreach (char c in new int[] { 65, 66 }) Console.Write(c); Console.WriteLine();
+    foreach (int c in "AB") Console.Write(c + " "); Console.WriteLine();
+    foreach (int e in new[] { E.A, E.B }) Console.Write(e + " "); Console.WriteLine();
+    foreach (E e in new[] { 1, 2, 3 }) Console.Write(e + " "); Console.WriteLine();
+    foreach (Cel c in new[] { 1, 2 }) Console.Write(c + " "); Console.WriteLine();
+    foreach (Cel c in new List<string> { "a", "bcd" }) Console.Write(c + " "); Console.WriteLine();
+    foreach (int n in new List<object> { 1, 2 }) Console.Write(n + " "); Console.WriteLine();
+    foreach (string s in (IEnumerable)new[] { "x", "y" }) Console.Write(s + " "); Console.WriteLine();
+    foreach (Der d in new List<Base> { new Der() }) Console.Write(d + " "); Console.WriteLine();
+    foreach (Base d in new List<Der> { new Der() }) Console.Write(d + " "); Console.WriteLine();
+    foreach (object o in new[] { 1, 2 }) Console.Write(o + " "); Console.WriteLine();
+    foreach (IComparable o in new[] { 1, 2 }) Console.Write(o + " "); Console.WriteLine();
+    foreach (long n in new Span<int>(new[] { 1, 2 })) Console.Write(n + " "); Console.WriteLine();
+    foreach (int n in new Span<long>(new long[] { 5, 6 })) Console.Write(n + " "); Console.WriteLine();
+    foreach (decimal n in new ReadOnlySpan<double>(new[] { 0.5, 1.5 })) Console.Write(n + " "); Console.WriteLine();
+    foreach (int? n in new Span<long>(new long[] { 5, 6 })) Console.Write(n + " "); Console.WriteLine();
+    foreach (int n in new List<int?> { 7 }) { Func<int> f = () => n; Console.Write(f() + " "); } Console.WriteLine();
+    var fs = new List<Func<long>>(); foreach (long n in new int?[] { 1, 2, 3 }) fs.Add(() => n); foreach (var f in fs) Console.Write(f() + " "); Console.WriteLine();
+    foreach (long n in new List<int?> { 1 }) { await Task.Yield(); Console.Write(n + "a "); } Console.WriteLine();
+    await foreach (long n in Ints()) Console.Write(n + " "); Console.WriteLine();
+    await foreach (double n in Ints()) Console.Write(n + " "); Console.WriteLine();
+    await foreach (int? n in Ints()) Console.Write(n + " "); Console.WriteLine();
+    await foreach (Cel c in Ints()) Console.Write(c + " "); Console.WriteLine();
+    Gen.Run<int>(new List<object> { 1, 2 }); Gen.Run<string>(new List<object> { "a" });
+    foreach (var x in It()) Console.Write(x + " "); Console.WriteLine();
+    foreach (dynamic d in new[] { 1, 2 }) Console.Write(d + 1 + " "); Console.WriteLine();
+    foreach (int? n in new int[] { 4 }) Console.Write(n + " "); Console.WriteLine();
+    foreach (decimal? n in new int[] { 4 }) Console.Write(n + " "); Console.WriteLine();
+    foreach (long? n in new int?[] { 4, null }) Console.Write(n + ";"); Console.WriteLine();
+    foreach (double n in new float?[] { 1.5f }) Console.Write(n + ";"); Console.WriteLine();
+    foreach (uint n in new int?[] { 5 }) Console.Write(n + ";"); Console.WriteLine();
+    foreach (float n in new decimal[] { 1.5m }) Console.Write(n + ";"); Console.WriteLine();
+    foreach (nint n in new int[] { 1 }) Console.Write(n + ";"); Console.WriteLine();
+    foreach (int n in new nint[] { 2 }) Console.Write(n + ";"); Console.WriteLine();
+  }
+  static IEnumerable<long> It() { foreach (long n in new int?[] { 1, 2 }) { yield return n * 10; } }
+}
+"#,
+        r#"1 2 
+1 2 
+1.5 2.5 
+1;;
+1.5 2.5 3.5 4.5 
+1 2 3 4 
+65 44 
+AB
+65 66 
+1 2 
+A B 3 
+Cel1.5 Cel3 
+Cel1 Cel3 
+1 2 
+x y 
+Der 
+Der 
+1 2 
+1 2 
+1 2 
+5 6 
+0.5 1.5 
+5 6 
+7 
+1 2 3 
+1a 
+1 2 
+1 2 
+1 2 
+Cel1.5 Cel3 
+1;2;
+a;
+10 20 
+2 3 
+4 
+4 
+4;;
+1.5;
+5;
+1.5;
+1;
+2;
+"#,
+    );
+}
+
+/// A constant in a pattern has the type of the input (§11.2.3): `m is 1`, `m is > 0` and `case 1:` on a
+/// `decimal` compare with `1m`, and a `uint` constant beside a `long` is zero-extended. The constant was
+/// tested as an `int` in a `decimal`, which no `decimal` ever is, so these were always false, and a
+/// `uint` above `int.MaxValue` was sign-extended.
+#[test]
+fn patterns_compare_a_constant_in_the_type_of_the_input() {
+    check(
+        "PatternConstantTypes",
+        r#"using System;
+class P {
+  const decimal DM = 2.5m;
+  const int CI = 1;
+  static string Sw(decimal m) { switch (m) { case 1: return "one"; case 'a': return "a"; case -3: return "m3"; case > 100: return "big"; default: return "other"; } }
+  static string Sx(decimal? m) => m switch { 1 => "one", 2.5m => "twofive", > 10 and < 20 => "teens", null => "null", _ => "other" };
+  static void Main() {
+    foreach (decimal m in new[] { 0m, 1m, 1.5m, -3m, 97m, 2.5m, 15m, 101m })
+      Console.WriteLine($"{m}: {m is 1} {m is 1.5m} {m is DM} {m is -3} {m is 'a'} {m is CI} {m is > 0} {m is >= 97} {m is > 1 and < 2} {m is 1 or 97} {m is not 0} {Sw(m)} {Sx(m)}");
+    decimal? n = 1m; Console.WriteLine($"{n is 1} {n is CI} {n is > 0} {n is 2} {Sx(n)} {Sx(null)} {Sx(15m)}");
+    long l = 1; uint big = 3000000000;
+    Console.WriteLine($"{l is 2147483648} {l is > 2147483648} {l is < 2147483648} {l is CI}");
+    long lb = 3000000000; Console.WriteLine($"{lb is 3000000000} {lb is > 2147483648} {lb is 3000000000u}");
+    double d = 2147483648; Console.WriteLine($"{d is 2147483648} {d is >= 2147483648} {d is 1}");
+    float f = 2; Console.WriteLine($"{f is 2} {f is > 1 and < 3} {f is 2147483648}");
+    ulong ul = 5; Console.WriteLine($"{ul is 5} {ul is 5u} {ul is > 4}");
+    char c = 'a'; Console.WriteLine($"{c is 'a'} {c is > 'B'}");
+    byte b = 200; Console.WriteLine($"{b is 200} {b is > 199}");
+    nint ni = 6; Console.WriteLine($"{ni is 6} {ni is > 5}");
+    object o = 1m; Console.WriteLine($"{o is 1} {o is 1m} {o is 1L}");
+    switch (0m) { case 0: Console.WriteLine("zero"); break; default: Console.WriteLine("d"); break; }
+    Console.WriteLine(0m switch { 0 => "z", _ => "o" });
+    Console.WriteLine(big is 3000000000 ? "yes" : "no");
+  }
+}
+"#,
+        r#"0: False False False False False False False False False False False other other
+1: True False False False False True True False False True True one one
+1.5: False True False False False False True False True False True other other
+-3: False False False True False False False False False False True m3 other
+97: False False False False True False True True False True True a other
+2.5: False False True False False False True False False False True other twofive
+15: False False False False False False True False False False True other teens
+101: False False False False False False True True False False True big other
+True True True False one null teens
+False False True True
+True True True
+True True False
+True True False
+True True True
+True True
+True True
+True True
+False True False
+zero
+z
+yes
+"#,
+    );
+}
+
+/// An operand evaluated before an `await` is read before it (§12.4.4), also a local or a parameter that
+/// a lambda captures, which lives in a closure class and can be changed while the `await` waits:
+/// `x += await F()` and `x = x + await F()` read `x` first, whatever `F` does to it through a lambda.
+/// The read was left for after the `await`, so the lambda's change was added to.
+#[test]
+fn an_await_keeps_the_operands_evaluated_before_it_when_a_closure_can_change_them() {
+    check(
+        "AwaitSpillsCapturedOperands",
+        r#"using System;
+using System.Threading.Tasks;
+class C { public int F; public int P { get; set; } int[] a = new int[2]; public int this[int i] { get => a[i]; set => a[i] = value; } }
+struct S { public int V; }
+class P {
+  static async Task<int> Bump(int k, Action a) { await Task.Yield(); a(); return k; }
+  static async Task<int> G(int k) { await Task.Yield(); return k; }
+  static async Task<string> GS(string k, Action a) { await Task.Yield(); a(); return k; }
+  static async Task<int> Param(int p) { p += await Bump(1, () => p += 100); return p; }
+  static async Task<int> Param2(int p) { p = p + await Bump(1, () => p += 100); return p; }
+  static async Task Main() {
+    int x = 10; x = x + await Bump(1, () => x += 100); Console.WriteLine("a " + x);
+    int a = 10; a = a - await Bump(1, () => a = 100); Console.WriteLine("b " + a);
+    int v = 5; int r = v + await Bump(1, () => v = 50) + v; Console.WriteLine("c " + r);
+    int m = 2; m *= await Bump(3, () => m = 7); Console.WriteLine("d " + m);
+    int s = 1; s <<= await Bump(3, () => s = 4); Console.WriteLine("e " + s);
+    string t = "a"; t += await GS("b", () => t += "X"); Console.WriteLine("f " + t);
+    string u = "a"; u = u + await GS("b", () => u = "Q"); Console.WriteLine("g " + u);
+    int? n = 2; n += await Bump(3, () => n = 7); Console.WriteLine("h " + n);
+    int? n2 = null; n2 += await Bump(3, () => n2 = 7); Console.WriteLine("i " + n2);
+    long l = 2; l += await Bump(3, () => l = 40); Console.WriteLine("j " + l);
+    double d = 1.5; d *= await Bump(2, () => d = 10); Console.WriteLine("k " + d);
+    int b = 1; b |= await Bump(4, () => b = 8); Console.WriteLine("l " + b);
+    int p = 3, q = 4; int rr = p + await Bump(1, () => p = 30) * (q + await Bump(1, () => q = 40)); Console.WriteLine("m " + rr);
+    int aa = 1, bb = 2; int nested = aa + await G(bb + await Bump(1, () => { aa = 10; bb = 20; })); Console.WriteLine("n " + nested);
+    int w = 1; Func<int> read = () => w; w += await Bump(5, () => w = 100); Console.WriteLine("o " + w + read());
+    Console.WriteLine("p " + await Param(10) + " " + await Param2(10));
+    int ok = 1; ok += await G(2); Console.WriteLine("q " + ok);
+    int z = 1; int zz = await Bump(1, () => z = 9) + z; Console.WriteLine("r " + zz);
+    var sv = new S { V = 1 }; Action bumpS = () => sv.V = 50; sv.V += await Bump(1, bumpS); Console.WriteLine("s " + sv.V);
+    int[] arr = { 1, 2 }; int i = 0; arr[i] += await Bump(1, () => i = 1); Console.WriteLine("t " + arr[0] + arr[1]);
+    int j = 0; int[] arr2 = { 1, 2 }; arr2[j] = await Bump(7, () => j = 1); Console.WriteLine("u " + arr2[0] + arr2[1]);
+    int c2 = 5; c2 += c2 + await Bump(1, () => c2 = 0); Console.WriteLine("v " + c2);
+    bool flag = true; flag &= await Task.FromResult(false); Console.WriteLine("w " + flag);
+    int k = 3; k = k > 2 ? k + await Bump(1, () => k = 100) : 0; Console.WriteLine("x " + k);
+    int cc = 2; cc = cc * 2 + await Bump(1, () => cc = 100); Console.WriteLine("y " + cc);
+    for (int ii = 0; ii < 2; ii++) { int li = ii; li += await Bump(1, () => li += 10); Console.Write("z" + li + " "); }
+    Console.WriteLine();
+  }
+}
+"#,
+        r#"a 11
+b 9
+c 56
+d 6
+e 8
+f ab
+g ab
+h 5
+i 
+j 5
+k 3
+l 5
+m 8
+n 4
+o 66
+p 11 11
+q 3
+r 10
+s 2
+t 22
+u 72
+v 11
+w False
+x 4
+y 5
+z1 z2 
+"#,
+    );
+}
+
+/// A `volatile` field has `modreq(IsVolatile)` in its signature, in the metadata of its own type, of a
+/// construction of a generic one and of a reference to it, and every read and write of it is under
+/// `volatile.`. The modifier was ignored, so the field read as `volatile` to nobody and the loop in
+/// `while (!flag) { }` waiting for another thread could be hoisted out by the JIT.
+#[test]
+fn volatile_fields_are_marked_and_read_and_written_as_volatile() {
+    check(
+        "VolatileFields",
+        r#"using System;
+using System.Linq;
+using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
+class G<T> { public volatile int N; public static volatile bool Done; public volatile string S = "s"; }
+struct Sx { public volatile int V; }
+class P {
+  static volatile bool flag;
+  static volatile int counter;
+  volatile int inst;
+  volatile object o;
+  static volatile int[] arr;
+  static string Mods(FieldInfo f) => string.Join(",", f.GetRequiredCustomModifiers().Select(m => m.Name));
+  static void Main() {
+    foreach (var n in new[] { "flag", "counter", "inst", "o", "arr" })
+      Console.WriteLine(n + ": " + Mods(typeof(P).GetField(n, BindingFlags.Static | BindingFlags.Instance | BindingFlags.NonPublic)));
+    Console.WriteLine("G.N: " + Mods(typeof(G<int>).GetField("N")) + " " + Mods(typeof(G<int>).GetField("Done")) + " " + Mods(typeof(Sx).GetField("V")));
+    var t = new Thread(() => { Thread.Sleep(100); flag = true; }); t.Start();
+    long n2 = 0; while (!flag) { n2++; }
+    Console.WriteLine("done");
+    var p = new P(); p.inst = 3; p.inst += 4; p.inst++; p.o = "x"; Console.WriteLine(p.inst + " " + p.o);
+    counter = 5; counter *= 3; counter--; Console.WriteLine(counter);
+    var g = new G<long>(); g.N = 2; g.N += 5; G<long>.Done = true; g.S += "t"; Console.WriteLine(g.N + " " + G<long>.Done + " " + g.S);
+    var sx = new Sx(); sx.V = 4; sx.V <<= 2; Console.WriteLine(sx.V);
+    arr = new int[3]; arr[1] = 9; Console.WriteLine(arr[1] + Volatile.Read(ref counter));
+    Interlocked.Increment(ref counter); Console.WriteLine(counter);
+    var r = Task.Run(async () => { await Task.Delay(10); counter += 100; return counter; }).Result; Console.WriteLine(r);
+    Action a = () => counter = 1; a(); Console.WriteLine(counter);
+    Console.WriteLine(Interlocked.CompareExchange(ref counter, 8, 1) + " " + counter);
+    var ex = typeof(Thread).GetMethod("VolatileRead", new[] { typeof(int).MakeByRefType() });
+  }
+}
+"#,
+        r#"flag: IsVolatile
+counter: IsVolatile
+inst: IsVolatile
+o: IsVolatile
+arr: IsVolatile
+G.N: IsVolatile IsVolatile IsVolatile
+done
+8 x
+14
+7 True st
+16
+23
+15
+115
+1
+1 8
+"#,
+    );
+}
+
+/// `{ get; set => field = ...; } = 5;` stores the 5 in the field the compiler declares for `field`
+/// (C# 14), as a `{ get; set; } = 5;` does in its own: static or not, `init`, in a generic type, a
+/// struct or a record, and in the order the members were written. The initializer was dropped when the
+/// accessors named `field`, since the field was not the one a property with no body of its own is
+/// behind.
+#[test]
+fn a_property_that_uses_the_field_keyword_runs_its_initializer() {
+    check(
+        "FieldKeywordInitializers",
+        r#"using System;
+using System.Collections.Generic;
+class G<T> { public T Val { get => field; set => field = value; } = default(T); public List<T> L { get => field ??= new(); set; } = new List<T>(); public static T S { get; set => field = value; } = default; }
+class Lam { public Func<int, int> F { get => field; set; } = x => x + 1; public int Base = 10; public int D { get => field; set; } = 4; public int E { get; set => field = value; } = 5; }
+struct St { public int A { get => field; set; } = 3; public St(int x) { A += x; } }
+record R(int X) { public int Y { get => field; init; } = 8; public string Z { get; set => field = value.Trim(); } = " z "; }
+class Ctor { public int Q { get => field; set { field = value * 2; } } = 6; public Ctor() { } public Ctor(int q) { Q = q; } }
+class Ord { static int n; static int Next() => ++n; public int A { get; set => field = value; } = Next(); public int B = Next(); public int C { get => field; set; } = Next(); }
+class SO { public static int Cnt { get; set => field = value; } = Init(); static int Init() { Console.WriteLine("init"); return 12; } }
+class P { static void Main() {
+  var g = new G<int>(); Console.WriteLine(g.Val + " " + g.L.Count + " " + G<string>.S);
+  var l = new Lam(); Console.WriteLine(l.F(1) + " " + l.D + " " + l.E);
+  Console.WriteLine(new St().A + " " + new St(2).A);
+  var r = new R(1); Console.WriteLine(r.Y + r.Z + "|");
+  Console.WriteLine(new Ctor().Q + " " + new Ctor(4).Q);
+  var o = new Ord(); Console.WriteLine(o.A + " " + o.B + " " + o.C);
+  Console.WriteLine(SO.Cnt);
+}}
+"#,
+        r#"0 0 
+2 4 5
+0 5
+8 z |
+6 8
+1 2 3
+init
+12
+"#,
+    );
+}
+
+/// A `static abstract` or `static virtual` event of an interface is implemented by a static event of a
+/// class or a struct — field-like, with accessors, or implemented explicitly — and `T.E += h` on a type
+/// parameter calls the implementation through `constrained.`. The accessors had no `MethodImpl` rows,
+/// so the runtime refused to load the type (`Virtual static method 'add_Changed' is not implemented`).
+#[test]
+fn a_static_abstract_event_is_implemented_by_static_accessors() {
+    check(
+        "StaticAbstractEvents",
+        r#"using System;
+interface IE<T> where T : IE<T> { static abstract event Action<int> Changed; static abstract void Raise(int v); }
+interface IV { static virtual event Action Tick { add { Console.WriteLine("default add"); } remove { Console.WriteLine("default remove"); } } }
+class A : IE<A> { public static event Action<int> Changed; public static void Raise(int v) => Changed?.Invoke(v); }
+struct B : IE<B> { static Action<int> h; public static event Action<int> Changed { add { h += value; Console.WriteLine("B add"); } remove { h -= value; Console.WriteLine("B remove"); } } public static void Raise(int v) => h?.Invoke(v); }
+class C : IE<C> { static Action<int> h; static event Action<int> IE<C>.Changed { add { h += value; } remove { h -= value; } } public static void Raise(int v) => h?.Invoke(v); }
+class D : IV { }
+class E2 : IV { public static event Action Tick { add { Console.WriteLine("E2 add"); } remove { Console.WriteLine("E2 remove"); } } }
+class P {
+  static void Run<T>() where T : IE<T> {
+    Action<int> a = v => Console.WriteLine(typeof(T).Name + " got " + v);
+    T.Changed += a; T.Raise(1); T.Changed -= a; T.Raise(2);
+  }
+  static void V<T>() where T : IV { Action a = () => { }; T.Tick += a; T.Tick -= a; }
+  static void Main() { Run<A>(); Run<B>(); Run<C>(); V<D>(); V<E2>(); }
+}
+"#,
+        r#"A got 1
+B add
+B got 1
+B remove
+C got 1
+default add
+default remove
+E2 add
+E2 remove
+"#,
+    );
+}
+
+/// `s += x` on a `string` concatenates as `s + x` does: the object (its `ToString`), or what `x` has a
+/// conversion to `string` to, and not what a conversion to `int` or `char` makes of it. The compound
+/// form took the predefined `+` through the conversion first, so `s += new W()` appended `1` and not
+/// the name of the type.
+#[test]
+fn a_compound_assignment_to_a_string_concatenates_the_object() {
+    check(
+        "StringCompoundThroughConversions",
+        r#"using System;
+struct W { public int V; public static implicit operator int(W w) => w.V; }
+struct Ch { public static implicit operator char(Ch c) => 'z'; }
+struct Both { public static implicit operator int(Both b) => 7; public static implicit operator string(Both b) => "str"; }
+struct Hn { public int V; public static implicit operator int?(Hn h) => h.V; }
+class H { public string F = "f"; public string P { get; set; } = "p"; public string this[int i] { get => "i"; set { Console.WriteLine("set " + value); } } }
+class Prog { static string sf = "s"; static void Main() {
+  string s = "a"; s += new W { V = 1 }; Console.WriteLine(s);
+  s += new Ch(); Console.WriteLine(s);
+  string o = null; o += new W { V = 3 }; Console.WriteLine(o);
+  int n = 5; n += new W { V = 4 }; Console.WriteLine(n);
+  long l = 5; l += new W { V = 4 }; Console.WriteLine(l);
+  var h = new H(); h.F += new Ch(); h.P += new W { V = 2 }; h[0] += new Ch(); Console.WriteLine(h.F + h.P);
+  sf += new Ch(); Console.WriteLine(sf);
+  string[] arr = { "x" }; arr[0] += new Ch(); Console.WriteLine(arr[0]);
+  object ob = "o"; ob += "b"; Console.WriteLine(ob);
+  int? ni = 3; ni += new W { V = 4 }; Console.WriteLine(ni);
+  string b = "b"; b += new Both(); Console.WriteLine(b);
+  char c = 'a'; c += (char)1; Console.WriteLine(c);
+  string t = "t"; t += new Hn { V = 4 }; Console.WriteLine(t);
+}}
+"#,
+        r#"aW
+aWCh
+W
+9
+9
+set iCh
+fChpW
+sCh
+xCh
+ob
+7
+bstr
+b
+tHn
+"#,
+    );
+}
+
+/// An operator on a nullable operand is the plain operator lifted (§12.4.8): the operands are promoted
+/// as they are without the `?` — `~b` on a `byte?` is an `int?`, `-u` on a `uint?` a `long?`, and `+c`
+/// on a `char?` an `int?` — and a null in gives a null out, for the arithmetic, bitwise, shift and
+/// comparison operators of every integer type, `char`, `nint`, enums, `bool` and `decimal`. The unary
+/// operators left the operand a `byte?`, a `uint?` or a `char?`, so `~b` was 245 where it is -11.
+#[test]
+fn lifted_operators_take_a_nullable_operand_as_the_plain_ones_do() {
+    check(
+        "LiftedOperatorsOnNullables",
+        r#"using System;
+enum E { A = 0, B = 1, C = 2 }
+enum L : long { X = 5, Y = 1L << 40 }
+[Flags] enum F : byte { None = 0, P = 1, Q = 2, R = 128 }
+class P {
+  static void Show<T>(string label, T v) { Console.WriteLine(label + " => " + typeof(T).Name + " " + (v == null ? "null" : v.ToString())); }
+  static void Main() {
+    E a = E.B; E? n = E.C; E? z = null; int i = 1; int? ni = 1; int? nz = null;
+    Show("a+1", a + 1); Show("a+i", a + i); Show("a+ni", a + ni); Show("a+nz", a + nz); Show("1+a", 1 + a); Show("ni+a", ni + a); Show("nz+a", nz + a);
+    Show("n+1", n + 1); Show("n+ni", n + ni); Show("n+nz", n + nz); Show("z+1", z + 1); Show("i+n", i + n);
+    Show("a-1", a - 1); Show("a-ni", a - ni); Show("n-1", n - 1); Show("n-nz", n - nz); Show("a-a", a - a); Show("a-n", a - n); Show("n-a", n - a); Show("n-n", n - n); Show("n-z", n - z); Show("z-z", z - z);
+    Show("a&n", a & n); Show("n|a", n | a); Show("n^z", n ^ z); Show("a^a", a ^ a); Show("n&n", n & n); Show("~a", ~a); Show("~n", ~n); Show("~z", ~z);
+    Show("a==n", a == n); Show("n==n", n == n); Show("z==z", z == z); Show("a!=z", a != z); Show("a<n", a < n); Show("n<a", n < a); Show("z<a", z < a); Show("n>=n", n >= n); Show("z<=z", z <= z);
+    L l = L.X; L? ln = L.Y; L? lz = null;
+    Show("l+1", l + 1); Show("l+ni", l + ni); Show("ln+1", ln + 1); Show("ln-l", ln - l); Show("ln-ln", ln - ln); Show("l|ln", l | ln); Show("lz|l", lz | l); Show("ln>l", ln > l);
+    F f = F.P; F? fn = F.R; F? fz = null;
+    Show("f|fn", f | fn); Show("fn&f", fn & f); Show("f^fz", f ^ fz); Show("f+1", f + 1); Show("fn+1", fn + 1); Show("fn-f", fn - f); Show("~fn", ~fn); Show("~f", ~f); Show("f==fn", f == fn); Show("fn>f", fn > f);
+    E? m = E.A; m += 1; Show("m+=1", m); m -= 1; Show("m-=1", m); m |= E.C; Show("m|=C", m); m &= n; Show("m&=n", m); m ^= E.B; Show("m^=B", m); m++; Show("m++", m); m--; Show("m--", m);
+    E? q = null; q += 1; Show("q+=1", q); q++; Show("q++", q);
+    E e2 = E.A; e2 += 2; Show("e+=2", e2); e2 -= 1; Show("e-=1", e2); e2 |= E.C; Show("e|=C", e2); e2++; Show("e++", e2);
+    int sh = 1; int? cnt = 3; Show("sh<<cnt", sh << cnt); Show("cnt<<sh", cnt << sh); Show("sh>>nz", sh >> nz); Show("cnt>>>cnt", cnt >>> cnt); sh <<= cnt.Value; Show("sh", sh);
+    char c = 'a'; char? cn = 'b'; char? cz = null;
+    Show("c+1", c + 1); Show("cn+1", cn + 1); Show("c+cn", c + cn); Show("cn-c", cn - c); Show("cn-cn", cn - cn); Show("cz+c", cz + c); Show("c<cn", c < cn); Show("cn==c", cn == c); Show("c&cn", c & cn); Show("cn<<1", cn << 1); Show("c<<cn", c << cn); Show("~cn", ~cn); Show("-cn", -cn); Show("+cn", +cn);
+    cn++; Show("cn++", cn); cn += (char)1; Show("cn+=", cn); cz++; Show("cz++", cz);
+    nint ptr = 8; nint? pn = 4; nuint up = 8; nuint? un = null;
+    Show("ptr+pn", ptr + pn); Show("pn-ptr", pn - ptr); Show("pn<<1", pn << 1); Show("pn*pn", pn * pn); Show("up+un", up + un); Show("up-up", up - up); Show("-pn", -pn); Show("~pn", ~pn); Show("pn>ptr", pn > ptr); Show("un==un", un == un); Show("pn/pn", pn / pn);
+    sbyte sb = -5; sbyte? sbn = 3; byte by = 250; byte? byn = 10; short sh2 = -7; ushort us = 65535; ushort? usn = 2; uint ui = uint.MaxValue; uint? uin = 2; ulong ul = ulong.MaxValue; ulong? uln = 2; long lg = long.MinValue; long? lgn = -1;
+    Show("sb+sbn", sb + sbn); Show("by+byn", by + byn); Show("by*byn", by * byn); Show("us+usn", us + usn); Show("ui+uin", ui + uin); Show("ui*uin", ui * uin); Show("ul+uln", ul + uln); Show("ul/uln", ul / uln); Show("ul%uln", ul % uln); Show("sb-by", sb - byn); Show("sh2*sbn", sh2 * sbn); Show("ui+lgn", ui + lgn); Show("us<<usn", us << usn); Show("ul>>uin", ul >> (int?)uin); Show("ui>>>2", ui >>> 2); Show("-sbn", -sbn); Show("~byn", ~byn); Show("-uin", -uin); Show("~uln", ~uln);
+    Show("ul>byn", ul > byn); Show("by<=byn", by <= byn); Show("sb>=sbn", sb >= sbn); Show("ui==ni", ui == ni);
+    Show("nz==nz", nz == nz); Show("nz!=nz", nz != nz); Show("nz<nz", nz < nz); Show("nz>=nz", nz >= nz); Show("nz+nz", nz + nz);
+    double dd = 2.5; double? dn = 1.5; double? dz = null; Show("dd+dn", dd + dn); Show("dn*dz", dn * dz); Show("dn<dd", dn < dd); Show("dn%dd", dn % dd); Show("-dn", -dn); Show("dn==dz", dn == dz);
+    bool bb = true; bool? bn = false; bool? bz = null; Show("bb&bn", bb & bn); Show("bz|bb", bz | bb); Show("bz&bb", bz & bb); Show("bz^bb", bz ^ bb); Show("!bn", !bn); Show("bz==bz", bz == bz); Show("bn&&bb", bn & bb);
+    decimal dm = 1.5m; decimal? dmn = 2m; decimal? dmz = null; Show("dm+dmn", dm + dmn); Show("dm*dmz", dm * dmz); Show("dmn<dm", dmn < dm); Show("-dmn", -dmn); Show("dmn%dm", dmn % dm); Show("dmn==dmz", dmn == dmz);
+  }
+}
+"#,
+        r#"a+1 => E C
+a+i => E C
+a+ni => Nullable`1 C
+a+nz => Nullable`1 null
+1+a => E C
+ni+a => Nullable`1 C
+nz+a => Nullable`1 null
+n+1 => Nullable`1 3
+n+ni => Nullable`1 3
+n+nz => Nullable`1 null
+z+1 => Nullable`1 null
+i+n => Nullable`1 3
+a-1 => E A
+a-ni => Nullable`1 A
+n-1 => Nullable`1 B
+n-nz => Nullable`1 null
+a-a => Int32 0
+a-n => Nullable`1 -1
+n-a => Nullable`1 1
+n-n => Nullable`1 0
+n-z => Nullable`1 null
+z-z => Nullable`1 null
+a&n => Nullable`1 A
+n|a => Nullable`1 3
+n^z => Nullable`1 null
+a^a => E A
+n&n => Nullable`1 C
+~a => E -2
+~n => Nullable`1 -3
+~z => Nullable`1 null
+a==n => Boolean False
+n==n => Boolean True
+z==z => Boolean True
+a!=z => Boolean True
+a<n => Boolean True
+n<a => Boolean False
+z<a => Boolean False
+n>=n => Boolean True
+z<=z => Boolean False
+l+1 => L 6
+l+ni => Nullable`1 6
+ln+1 => Nullable`1 1099511627777
+ln-l => Nullable`1 1099511627771
+ln-ln => Nullable`1 0
+l|ln => Nullable`1 1099511627781
+lz|l => Nullable`1 null
+ln>l => Boolean True
+f|fn => Nullable`1 P, R
+fn&f => Nullable`1 None
+f^fz => Nullable`1 null
+f+1 => F Q
+fn+1 => Nullable`1 P, R
+fn-f => Nullable`1 127
+~fn => Nullable`1 127
+~f => F 254
+f==fn => Boolean False
+fn>f => Boolean True
+m+=1 => Nullable`1 B
+m-=1 => Nullable`1 A
+m|=C => Nullable`1 C
+m&=n => Nullable`1 C
+m^=B => Nullable`1 3
+m++ => Nullable`1 4
+m-- => Nullable`1 3
+q+=1 => Nullable`1 null
+q++ => Nullable`1 null
+e+=2 => E C
+e-=1 => E B
+e|=C => E 3
+e++ => E 4
+sh<<cnt => Nullable`1 8
+cnt<<sh => Nullable`1 6
+sh>>nz => Nullable`1 null
+cnt>>>cnt => Nullable`1 0
+sh => Int32 8
+c+1 => Int32 98
+cn+1 => Nullable`1 99
+c+cn => Nullable`1 195
+cn-c => Nullable`1 1
+cn-cn => Nullable`1 0
+cz+c => Nullable`1 null
+c<cn => Boolean True
+cn==c => Boolean False
+c&cn => Nullable`1 96
+cn<<1 => Nullable`1 196
+c<<cn => Nullable`1 388
+~cn => Nullable`1 -99
+-cn => Nullable`1 -98
++cn => Nullable`1 98
+cn++ => Nullable`1 c
+cn+= => Nullable`1 d
+cz++ => Nullable`1 null
+ptr+pn => Nullable`1 12
+pn-ptr => Nullable`1 -4
+pn<<1 => Nullable`1 8
+pn*pn => Nullable`1 16
+up+un => Nullable`1 null
+up-up => UIntPtr 0
+-pn => Nullable`1 -4
+~pn => Nullable`1 -5
+pn>ptr => Boolean False
+un==un => Boolean True
+pn/pn => Nullable`1 1
+sb+sbn => Nullable`1 -2
+by+byn => Nullable`1 260
+by*byn => Nullable`1 2500
+us+usn => Nullable`1 65537
+ui+uin => Nullable`1 1
+ui*uin => Nullable`1 4294967294
+ul+uln => Nullable`1 1
+ul/uln => Nullable`1 9223372036854775807
+ul%uln => Nullable`1 1
+sb-by => Nullable`1 -15
+sh2*sbn => Nullable`1 -21
+ui+lgn => Nullable`1 4294967294
+us<<usn => Nullable`1 262140
+ul>>uin => Nullable`1 4611686018427387903
+ui>>>2 => UInt32 1073741823
+-sbn => Nullable`1 -3
+~byn => Nullable`1 -11
+-uin => Nullable`1 -2
+~uln => Nullable`1 18446744073709551613
+ul>byn => Boolean True
+by<=byn => Boolean False
+sb>=sbn => Boolean False
+ui==ni => Boolean False
+nz==nz => Boolean True
+nz!=nz => Boolean False
+nz<nz => Boolean False
+nz>=nz => Boolean False
+nz+nz => Nullable`1 null
+dd+dn => Nullable`1 4
+dn*dz => Nullable`1 null
+dn<dd => Boolean True
+dn%dd => Nullable`1 1.5
+-dn => Nullable`1 -1.5
+dn==dz => Boolean False
+bb&bn => Nullable`1 False
+bz|bb => Nullable`1 True
+bz&bb => Nullable`1 null
+bz^bb => Nullable`1 null
+!bn => Nullable`1 True
+bz==bz => Boolean True
+bn&&bb => Nullable`1 False
+dm+dmn => Nullable`1 3.5
+dm*dmz => Nullable`1 null
+dmn<dm => Boolean False
+-dmn => Nullable`1 -2
+dmn%dm => Nullable`1 0.5
+dmn==dmz => Boolean False
+"#,
+    );
+}

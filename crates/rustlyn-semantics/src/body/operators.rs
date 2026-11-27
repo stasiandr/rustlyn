@@ -790,6 +790,31 @@ impl BodyBinder<'_> {
         )
     }
 
+    /// The operand of a `+` whose other side is a `string`, brought to
+    /// `string` by the user-defined implicit conversion it has to it: the
+    /// concatenation then takes two strings (§12.10.5), not a string and an
+    /// object. Anything else is left as it is.
+    pub(super) fn convert_operand_to_string(&mut self, value: BoundExpression) -> BoundExpression {
+        let string = self.special(SpecialType::String);
+        // A type with a `+` of its own is asked that first.
+        let declares_addition = value
+            .ty
+            .symbol()
+            .is_some_and(|symbol| !self.binder.lookup_member(symbol, "op_Addition").is_empty());
+        if value.ty == string
+            || value.ty.is_error()
+            || matches!(value.ty, Type::Null)
+            || self.binder.special_of(&value.ty).is_some()
+            || declares_addition
+        {
+            return value;
+        }
+        match self.binder.implicit_operator(&value.ty, &string) {
+            Some(operator) => self.operator_call(operator, value, string),
+            None => value,
+        }
+    }
+
     /// `h + 1` where `h` converts to a number (§12.4.5): the predefined
     /// operators are candidates too, reached through the operand's
     /// user-defined conversions, and the first pair of types that an
@@ -1771,24 +1796,8 @@ impl BodyBinder<'_> {
         // `string` is the better one, and it runs before the concatenation.
         let (left, right) = if operator == BinaryOperator::Add {
             let string = self.special(SpecialType::String);
-            let convert_to_string = |body: &mut Self, value: BoundExpression| {
-                // A type with a `+` of its own is asked that first.
-                let declares_addition = value.ty.symbol().is_some_and(|symbol| {
-                    !body.binder.lookup_member(symbol, "op_Addition").is_empty()
-                });
-                if value.ty == string
-                    || value.ty.is_error()
-                    || matches!(value.ty, Type::Null)
-                    || body.binder.special_of(&value.ty).is_some()
-                    || declares_addition
-                {
-                    return value;
-                }
-                match body.binder.implicit_operator(&value.ty, &string) {
-                    Some(operator) => body.operator_call(operator, value, string.clone()),
-                    None => value,
-                }
-            };
+            let convert_to_string =
+                |body: &mut Self, value: BoundExpression| body.convert_operand_to_string(value);
             if left.ty == string {
                 let right = convert_to_string(self, right);
                 (left, right)

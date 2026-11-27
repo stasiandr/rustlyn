@@ -971,6 +971,7 @@ fn each_child(expression: &BoundExpression, mut visit: impl FnMut(&BoundExpressi
         | K::Parameter(_)
         | K::This
         | K::Base
+        | K::StackValue
         | K::TypeExpression(_)
         | K::NamespaceExpression(_)
         | K::UnboundLambda(_)

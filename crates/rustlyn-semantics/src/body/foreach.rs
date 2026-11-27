@@ -391,6 +391,30 @@ impl BodyBinder<'_> {
             (Some((found, _)), Some(value)) => Some(self.enumerated_as(found, value)),
             (_, collection) => collection,
         };
+        // The element reaches a variable of another type by the explicit
+        // conversion a cast to it would be (§13.9.5), which the walk applies
+        // to what it has read: bound here once, over the value on the stack,
+        // so that every way of walking converts the same way.
+        let conversion = match (&deconstructed, local, by_ref) {
+            (None, Some(local), false)
+                if !through_operator
+                    && !declared_var
+                    && !element.is_error()
+                    && !walked_element.is_error()
+                    && element != walked_element
+                    && !matches!(element, Type::Dynamic)
+                    && !matches!(walked_element, Type::Dynamic) =>
+            {
+                debug_assert!(self.body.locals[local.0 as usize].ty == element);
+                let read = BoundExpression::new(
+                    BoundExpressionKind::StackValue,
+                    walked_element.clone(),
+                    node.span(),
+                );
+                Some(Box::new(self.convert_explicitly(read, &element)))
+            }
+            _ => None,
+        };
         match (local, collection, body) {
             (Some(local), Some(collection), Some(body)) => BoundStatementKind::ForEach {
                 local,
@@ -399,6 +423,7 @@ impl BodyBinder<'_> {
                 enumeration: enumeration.map(|(enumeration, _)| Box::new(enumeration)),
                 walk,
                 dimensions,
+                conversion,
             },
             _ => BoundStatementKind::Unsupported(node.kind()),
         }
@@ -499,6 +524,7 @@ impl BodyBinder<'_> {
                     enumeration: None,
                     walk,
                     dimensions: Vec::new(),
+                    conversion: None,
                 },
                 span,
             ));
@@ -529,6 +555,7 @@ impl BodyBinder<'_> {
                 enumeration: Some(Box::new(found)),
                 walk: None,
                 dimensions: Vec::new(),
+                conversion: None,
             },
             span,
         ))
@@ -606,7 +633,7 @@ impl BodyBinder<'_> {
         let item = if by_ref {
             item
         } else {
-            self.convert(item, &declared)
+            self.convert_explicitly(item, &declared)
         };
         let mut initializers = prefix;
         initializers.push(BoundStatement::new(

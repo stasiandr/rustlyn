@@ -1240,6 +1240,8 @@ impl BodyBinder<'_> {
                                         // what the characters are, as `span is
                                         // "two"` does.
                                         Err(value) => {
+                                            let value =
+                                                Box::new(self.constant_as_decimal(*value, &input));
                                             let kind = self
                                                 .span_string_test(&value, &input, part.span())
                                                 .unwrap_or(BoundPatternKind::Constant(*value));

@@ -182,6 +182,9 @@ pub(crate) enum Instruction {
     /// through, so the runtime skips the check that the array's run-time
     /// element type is the static one — which a covariant array fails.
     Readonly,
+    /// `volatile.` before a load or a store of a field: the access is not
+    /// reordered with the ones around it and is not left out of a loop.
+    Volatile,
 
     /// `sizeof`: how many bytes a type takes, which the runtime fills in.
     SizeOf(Token),
@@ -284,6 +287,7 @@ impl Instruction {
             // A prefix touches nothing.
             | Self::Constrained(_)
             | Self::Readonly
+            | Self::Volatile
             // `rethrow` takes nothing: the exception is the handler's.
             | Self::Rethrow
             | Self::LoadField(_) => 0,
@@ -536,6 +540,44 @@ impl InstructionStream {
             instruction,
             effect: pushes as i32 - pops as i32,
         });
+    }
+
+    /// Puts `volatile.` before every load and store of a field that `is_volatile`
+    /// says is one. A label that was at the access stays in front of the
+    /// prefix, which is part of the instruction it modifies.
+    pub(crate) fn prefix_volatile(&mut self, is_volatile: impl Fn(Token) -> bool) {
+        let volatile = |instruction: Instruction| match instruction {
+            Instruction::LoadField(token)
+            | Instruction::StoreField(token)
+            | Instruction::LoadStaticField(token)
+            | Instruction::StoreStaticField(token) => is_volatile(token),
+            _ => false,
+        };
+        if !self.entries.iter().any(|entry| volatile(entry.instruction)) {
+            return;
+        }
+        let mut moved = Vec::with_capacity(self.entries.len() + 8);
+        let mut shifted = Vec::with_capacity(self.entries.len() + 1);
+        for entry in &self.entries {
+            shifted.push(moved.len());
+            if volatile(entry.instruction) {
+                moved.push(Entry {
+                    instruction: Instruction::Volatile,
+                    effect: 0,
+                });
+            }
+            moved.push(Entry {
+                instruction: entry.instruction,
+                effect: entry.effect,
+            });
+        }
+        shifted.push(moved.len());
+        for at in self.labels.iter_mut().flatten() {
+            *at = shifted[*at];
+        }
+        self.entries = moved;
+        // What was worked out about the old instructions no longer fits.
+        self.reach = RefCell::new(Reach::default());
     }
 
     /// Reserves a label. It must be marked before the stream is laid out.
@@ -1042,6 +1084,7 @@ impl InstructionStream {
                 code.extend_from_slice(&token.0.to_le_bytes());
             }
             I::Readonly => code.extend_from_slice(&[0xFE, 0x1E]),
+            I::Volatile => code.extend_from_slice(&[0xFE, 0x13]),
             I::Constrained(token) => {
                 code.extend_from_slice(&[0xFE, 0x16]);
                 code.extend_from_slice(&token.0.to_le_bytes());
@@ -1233,7 +1276,7 @@ fn size_of_instruction(instruction: Instruction) -> u32 {
         | I::LoadVirtualFunction(_)
         | I::Constrained(_)
         | I::SizeOf(_) => 6,
-        I::Rethrow | I::LocalAlloc | I::RefAnyType | I::Readonly | I::ArgList => 2,
+        I::Rethrow | I::LocalAlloc | I::RefAnyType | I::Readonly | I::Volatile | I::ArgList => 2,
         I::MakeRefAny(_) | I::RefAnyValue(_) => 5,
         I::LoadElementAddress(_) | I::LoadFieldAddress(_) => 5,
         I::LoadIndirect(IndirectKind::Object(_)) | I::StoreIndirect(IndirectKind::Object(_)) => 5,

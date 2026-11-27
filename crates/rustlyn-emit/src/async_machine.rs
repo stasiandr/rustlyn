@@ -16,7 +16,7 @@
 //! dispatch of its own at its entry, since a protected region may only be
 //! entered at its start.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rustlyn_semantics::{
     BinaryOperator, BoundBody, BoundCaseLabel, BoundCatch, BoundExpression, BoundExpressionKind,
@@ -2699,6 +2699,16 @@ fn spill_awaits(
         });
         id
     });
+    let mut captured = HashSet::new();
+    let mut captured_parameters = HashSet::new();
+    for lambda in &body.lambdas {
+        captured.extend(lambda.captured.iter().copied());
+        captured_parameters.extend(lambda.captured_parameters.iter().copied());
+    }
+    for function in &body.local_functions {
+        captured.extend(function.captured.iter().copied());
+        captured_parameters.extend(function.captured_parameters.iter().copied());
+    }
     let mut spiller = Spiller {
         hoisting: Hoisting::Awaits,
         locals: &mut body.locals,
@@ -2711,6 +2721,8 @@ fn spill_awaits(
         nullable,
         symbols,
         dispose_mode,
+        captured,
+        captured_parameters,
     };
     let statements = std::mem::take(&mut body.statements);
     let mut statements = spiller.statements(statements)?;
@@ -2746,6 +2758,8 @@ pub(crate) fn spill_sequences(
         nullable: None,
         symbols,
         dispose_mode: None,
+        captured: HashSet::new(),
+        captured_parameters: HashSet::new(),
     };
     let statements = std::mem::take(&mut body.statements);
     body.statements = spiller.statements(statements)?;
@@ -2816,9 +2830,40 @@ struct Spiller<'a> {
     /// An `async` iterator's dispose mode (see [`DISPOSE_MODE`]), which
     /// `yield break` sets and every resumption after a `yield return` asks.
     dispose_mode: Option<LocalId>,
+    /// The locals and parameters a lambda or a local function reads or
+    /// writes. They live in a closure class, where whatever runs during an
+    /// `await` can change them, so a read ahead of it is kept like any
+    /// other value that can change.
+    captured: HashSet<LocalId>,
+    captured_parameters: HashSet<SymbolId>,
 }
 
 impl Spiller<'_> {
+    /// Whether an expression reads something that nothing between now and
+    /// an `await` could change out from under it: [`is_pure`], and not a
+    /// variable that is captured.
+    fn pure(&self, expression: &BoundExpression) -> bool {
+        match &expression.kind {
+            BoundExpressionKind::Local(local) => !self.captured.contains(local),
+            BoundExpressionKind::Parameter(parameter) => {
+                !self.captured_parameters.contains(parameter)
+            }
+            BoundExpressionKind::Conversion { operand, .. } => self.pure(operand),
+            _ => is_pure(expression),
+        }
+    }
+
+    /// Whether a place is a captured local or parameter.
+    fn is_captured(&self, place: &BoundExpression) -> bool {
+        match &place.kind {
+            BoundExpressionKind::Local(local) => self.captured.contains(local),
+            BoundExpressionKind::Parameter(parameter) => {
+                self.captured_parameters.contains(parameter)
+            }
+            _ => false,
+        }
+    }
+
     /// `local = value;` as a statement.
     fn assign(local: LocalId, value: BoundExpression, span: TextSpan) -> BoundStatement {
         let ty = value.ty.clone();
@@ -3162,6 +3207,7 @@ impl Spiller<'_> {
                 enumeration,
                 walk,
                 dimensions,
+                conversion,
             } => {
                 self.expression(&mut collection, &mut prelude)?;
                 BoundStatementKind::ForEach {
@@ -3171,6 +3217,7 @@ impl Spiller<'_> {
                     enumeration,
                     walk,
                     dimensions,
+                    conversion,
                 }
             }
             // A `switch` whose `when` clauses await matches ahead of itself,
@@ -4261,7 +4308,7 @@ impl Spiller<'_> {
                 );
                 if place {
                     for part in children_mut(receiver) {
-                        if !is_pure(part) {
+                        if !self.pure(part) {
                             let part_type = part.ty.clone();
                             let held = self.temp(&part_type, span);
                             let value =
@@ -4275,7 +4322,7 @@ impl Spiller<'_> {
                             ));
                         }
                     }
-                } else if !is_pure(receiver) {
+                } else if !self.pure(receiver) {
                     let receiver_type = receiver.ty.clone();
                     let held = self.temp(&receiver_type, span);
                     let value =
@@ -4549,7 +4596,7 @@ impl Spiller<'_> {
                     && self.either_kind(&child.ty))
             {
                 for part in children_mut(child) {
-                    if !is_pure(part) {
+                    if !self.pure(part) {
                         let span = part.span;
                         let ty = part.ty.clone();
                         let temp = self.temp(&ty, span);
@@ -4569,7 +4616,7 @@ impl Spiller<'_> {
                 continue;
             }
             if index < last
-                && !is_pure(child)
+                && !self.pure(child)
                 && !matches!(child.kind, BoundExpressionKind::RefArgument { .. })
             {
                 // A `ref struct` may not outlast the `await` (a field may
@@ -4606,13 +4653,13 @@ impl Spiller<'_> {
                 value,
             } = &mut expression.kind
             && *operator != BinaryOperator::Coalesce
-            && matches!(
+            && (matches!(
                 target.kind,
                 BoundExpressionKind::Property { .. }
                     | BoundExpressionKind::IndexerAccess { .. }
                     | BoundExpressionKind::Field { .. }
                     | BoundExpressionKind::ArrayAccess { .. }
-            )
+            ) || self.is_captured(target))
             && !matches!(target.ty, Type::Dynamic)
             && !matches!(value.ty, Type::Dynamic)
         {
@@ -4849,7 +4896,7 @@ impl Spiller<'_> {
                 receiver: Some(_), ..
             } if either => {
                 for part in children_mut(receiver) {
-                    if !is_pure(part) {
+                    if !self.pure(part) {
                         let span = part.span;
                         let ty = part.ty.clone();
                         let temp = self.temp(&ty, span);
@@ -5228,6 +5275,7 @@ pub(crate) fn children_mut(expression: &mut BoundExpression) -> Vec<&mut BoundEx
         | K::Parameter(_)
         | K::This
         | K::Base
+        | K::StackValue
         | K::TypeExpression(_)
         | K::NamespaceExpression(_)
         | K::UnboundLambda(_)
@@ -5373,6 +5421,7 @@ pub(crate) fn children(expression: &BoundExpression) -> Vec<&BoundExpression> {
         | K::Parameter(_)
         | K::This
         | K::Base
+        | K::StackValue
         | K::TypeExpression(_)
         | K::NamespaceExpression(_)
         | K::UnboundLambda(_)

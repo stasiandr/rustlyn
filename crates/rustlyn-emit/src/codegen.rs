@@ -1451,9 +1451,13 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             // stands behind: `int X { get; } = 5;` has its 5 under the
             // property, and the field it writes has no symbol of its own.
             // A field-like event with an initializer stores it in its
-            // field the same way.
+            // field the same way. So does a property that reads the `field`
+            // keyword (C# 14), `{ get => field; set; } = 5;`, into the field
+            // the binder declared for it.
+            let initialized_by = self.property_behind(plan, symbol);
             let written = detail.as_field().is_some_and(|f| f.has_initializer)
                 || detail.kind == SymbolKind::Property
+                || initialized_by.is_some()
                 || self.emitter.event_has_initializer(symbol);
             if !written {
                 continue;
@@ -1470,7 +1474,8 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             if is_static != statics {
                 continue;
             }
-            let Some(body) = self.emitter.body_of(symbol) else {
+            let owner_symbol = initialized_by.unwrap_or(symbol);
+            let Some(body) = self.emitter.body_of(owner_symbol) else {
                 continue;
             };
             let Some(value) = first_returned_value(&body) else {
@@ -1509,15 +1514,20 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             let outer_by_ref = std::mem::replace(&mut self.by_ref_locals, by_ref);
             let outer = std::mem::replace(&mut self.body, body);
             let outer_statements = std::mem::replace(&mut self.statements, Statements::Body);
-            let outer_owner = self.owner.replace(symbol);
+            let outer_owner = self.owner.replace(owner_symbol);
             // A lambda capturing a variable the initializer declares has a
             // class of the initializer's own, made here and nowhere else.
-            let own_display = self.emitter.displays.get(&symbol).cloned().map(|display| {
-                let slot = self.locals.len() as u16;
-                self.locals.push(display.sig.clone());
-                self.local_types.push(Type::Error);
-                (display, DisplayAt::Local(slot))
-            });
+            let own_display = self
+                .emitter
+                .displays
+                .get(&owner_symbol)
+                .cloned()
+                .map(|display| {
+                    let slot = self.locals.len() as u16;
+                    self.locals.push(display.sig.clone());
+                    self.local_types.push(Type::Error);
+                    (display, DisplayAt::Local(slot))
+                });
             let has_own_display = own_display.is_some();
             let outer_display = if has_own_display {
                 Some(std::mem::replace(&mut self.display, own_display))
@@ -1564,6 +1574,33 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             }
         }
         Ok(())
+    }
+
+    /// The property with an initializer that a field the binder declared
+    /// for the `field` keyword is the storage of.
+    fn property_behind(&self, plan: &TypePlan, field: SymbolId) -> Option<SymbolId> {
+        let symbols = self.emitter.compilation.symbols();
+        if symbols.get(field).kind != SymbolKind::Field {
+            return None;
+        }
+        symbols
+            .get(plan.symbol)
+            .members
+            .iter()
+            .copied()
+            .find(|member| {
+                symbols
+                    .get(*member)
+                    .as_property()
+                    .is_some_and(|detail| detail.backing_field == Some(field))
+                    && self
+                        .emitter
+                        .compilation
+                        .declaration_node(*member)
+                        .is_some_and(|node| {
+                            node.child_of_kind(SyntaxKind::EqualsValueClause).is_some()
+                        })
+            })
     }
 
     /// A local slot of a type the body did not declare, for a synthesised
@@ -1795,10 +1832,16 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 enumeration,
                 walk,
                 dimensions,
+                conversion,
             } => match (enumeration, walk) {
-                (Some(enumeration), _) => {
-                    self.emit_enumeration(*local, collection, body, enumeration, statement.span)?
-                }
+                (Some(enumeration), _) => self.emit_enumeration(
+                    *local,
+                    collection,
+                    body,
+                    enumeration,
+                    conversion.as_deref(),
+                    statement.span,
+                )?,
                 (None, Some((array, _))) if !dimensions.is_empty() => {
                     self.emit_foreach_dimensions(
                         *local,
@@ -1806,11 +1849,20 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                         body,
                         *array,
                         dimensions,
+                        conversion.as_deref(),
                         statement.span,
                     )?;
                 }
                 (None, Some((array, index))) => {
-                    self.emit_foreach(*local, collection, body, *array, *index, statement.span)?;
+                    self.emit_foreach(
+                        *local,
+                        collection,
+                        body,
+                        *array,
+                        *index,
+                        conversion.as_deref(),
+                        statement.span,
+                    )?;
                 }
                 (None, None) => {
                     return Err(EmitError::new(
@@ -1943,6 +1995,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
     }
 
     /// `foreach` over an array, lowered to the index loop it is.
+    #[allow(clippy::too_many_arguments)]
     fn emit_foreach(
         &mut self,
         local: LocalId,
@@ -1950,6 +2003,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         body: &BoundStatement,
         array: LocalId,
         index: LocalId,
+        conversion: Option<&BoundExpression>,
         scope_span: TextSpan,
     ) -> Result<(), EmitError> {
         let Type::Array { element, .. } = collection.ty.clone() else {
@@ -1985,7 +2039,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         // `foreach (long n in ints)` and `foreach (dynamic d in ints)` convert
         // each element on the way into the variable, as a walk by enumerator
         // does.
-        self.convert_iterated(&element, local)?;
+        self.convert_iterated(&element, local, conversion)?;
         self.end_store(local);
 
         self.enter_loop(end, step);
@@ -2008,6 +2062,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
     /// Roslyn lowers it: the upper bound of every dimension read first, then
     /// a loop per dimension from its lower bound, the innermost reading the
     /// element with the array's `Get`.
+    #[allow(clippy::too_many_arguments)]
     fn emit_foreach_dimensions(
         &mut self,
         local: LocalId,
@@ -2015,6 +2070,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         body: &BoundStatement,
         array: LocalId,
         dimensions: &[(LocalId, LocalId)],
+        conversion: Option<&BoundExpression>,
         scope_span: TextSpan,
     ) -> Result<(), EmitError> {
         let Type::Array { element, .. } = self.emitter.completed(&collection.ty) else {
@@ -2080,7 +2136,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         }
         self.stream
             .call_effect(Instruction::Call(get), dimensions.len() + 1, 1);
-        self.convert_iterated(&element, local)?;
+        self.convert_iterated(&element, local, conversion)?;
         self.end_store(local);
         self.enter_loop(end, innermost_step);
         self.emit_statement(body)?;
@@ -2181,6 +2237,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         collection: &BoundExpression,
         body: &BoundStatement,
         enumeration: &BoundEnumeration,
+        conversion: Option<&BoundExpression>,
         scope_span: TextSpan,
     ) -> Result<(), EmitError> {
         let slot = self.slot(enumeration.enumerator);
@@ -2324,7 +2381,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         // `foreach (ref var x in c)` keeps the reference `Current` hands back.
         if !self.is_by_ref_local(local) {
             self.read_through_reference(enumeration.current, &enumeration.element_type)?;
-            self.convert_iterated(&enumeration.element_type.clone(), local)?;
+            self.convert_iterated(&enumeration.element_type.clone(), local, conversion)?;
         }
         self.end_store(local);
 
@@ -2368,7 +2425,17 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
     /// variable was declared with: `foreach (INamedTypeDefinition t in
     /// typeDefs)` over `ITypeDefinition`s casts each one (§13.9.5), and
     /// `foreach (int n in objects)` unboxes.
-    fn convert_iterated(&mut self, from: &Type, local: LocalId) -> Result<(), EmitError> {
+    fn convert_iterated(
+        &mut self,
+        from: &Type,
+        local: LocalId,
+        conversion: Option<&BoundExpression>,
+    ) -> Result<(), EmitError> {
+        // The binder says what the conversion is, over the element that is
+        // on the stack.
+        if let Some(conversion) = conversion {
+            return self.emit_expression(conversion, true).map(|_| ());
+        }
         let to = self.local_types[local.0 as usize].clone();
         if to == *from || to.is_error() || from.is_error() {
             return Ok(());
@@ -3295,8 +3362,9 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 // `case 1:` on a `long?` asks whether there is a value, and
                 // then compares it: the constant is one of the `long` inside.
                 if let Some(inner) = self.emitter.nullable_underlying(input)
-                    && (self.numeric_kind(&inner).is_some() || self.is_native_integer(&inner))
-                    && self.numeric_kind(&value.ty).is_some()
+                    && ((self.numeric_kind(&inner).is_some() || self.is_native_integer(&inner))
+                        && self.numeric_kind(&value.ty).is_some()
+                        || self.is_decimal(&inner) && self.is_decimal(&value.ty))
                 {
                     self.emit_type_test(slot, input, &inner, on_fail)?;
                     self.emit_narrowed(slot, input, &inner)?;
@@ -3308,13 +3376,15 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 // question about whether the byte is an `int`: the constant
                 // takes the input's type (§12.2.3), and the values meet on
                 // the stack as whatever the input is.
-                if let Some(input_kind) = self.numeric_kind(input)
+                if self.numeric_kind(input).is_some()
                     && self.numeric_kind(&value.ty).is_some()
                     && input != &value.ty
                 {
                     self.stream.emit(Instruction::LoadLocal(slot));
                     self.emit_expression(value, true)?;
-                    self.widen_to(input_kind);
+                    // By the constant's own type: a `uint` constant beside a
+                    // `long` is zero-extended, not sign-extended.
+                    self.convert_number_from(&value.ty, input)?;
                     self.stream.emit(Instruction::CompareEqual);
                     self.stream.emit(Instruction::BranchIfFalse(on_fail));
                     return Ok(());
@@ -3382,8 +3452,9 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 // As for a constant: `> 0` on an `int?` compares the `int`
                 // inside, where there is one.
                 if let Some(inner) = self.emitter.nullable_underlying(input)
-                    && (self.numeric_kind(&inner).is_some() || self.is_native_integer(&inner))
-                    && self.numeric_kind(&value.ty).is_some()
+                    && ((self.numeric_kind(&inner).is_some() || self.is_native_integer(&inner))
+                        && self.numeric_kind(&value.ty).is_some()
+                        || self.is_decimal(&inner) && self.is_decimal(&value.ty))
                 {
                     self.emit_type_test(slot, input, &inner, on_fail)?;
                     self.emit_narrowed(slot, input, &inner)?;
@@ -3393,12 +3464,10 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 }
                 // As for a constant: `> 0` on a `byte` compares bytes.
                 let compared = match self.numeric_kind(input) {
-                    Some(input_kind)
-                        if self.numeric_kind(&value.ty).is_some() && input != &value.ty =>
-                    {
+                    Some(_) if self.numeric_kind(&value.ty).is_some() && input != &value.ty => {
                         self.stream.emit(Instruction::LoadLocal(slot));
                         self.emit_expression(value, true)?;
-                        self.widen_to(input_kind);
+                        self.convert_number_from(&value.ty, input)?;
                         input.clone()
                     }
                     // `> 6` on an `nint` compares native integers, the
@@ -4896,6 +4965,8 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                     "`__arglist(...)` is only an argument to a varargs method",
                 ));
             }
+            // What a conversion bound over it converts is already there.
+            BoundExpressionKind::StackValue => {}
             BoundExpressionKind::Literal(value) => {
                 self.emit_constant(value, &expression.ty)?;
             }
@@ -11536,6 +11607,25 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             }
         }
         self.emit_expression(handler, true)?;
+        // `T.E += h` where `T : I<T>` and `E` is a static abstract event: the
+        // interface's accessor, reached through the type parameter.
+        if is_static
+            && receiver.is_none_or(is_type_name)
+            && let Some((parameter, construction)) = self.static_abstract_event_constraint(event)
+            && let Some(accessor) = self
+                .emitter
+                .compilation
+                .symbols()
+                .get(event)
+                .as_event()
+                .and_then(|detail| if add { detail.adder } else { detail.remover })
+        {
+            let token = self.constraint_member(accessor, &construction)?;
+            let constraint = self.emitter.type_token(&Type::TypeParameter(parameter))?;
+            self.stream.emit(Instruction::Constrained(constraint));
+            self.stream.call_effect(Instruction::Call(token), 1, 0);
+            return Ok(());
+        }
         let (accessor, instance) = {
             let symbols = self.emitter.compilation.symbols();
             let instance = !symbols.get(event).modifiers.contains(Modifiers::STATIC);
@@ -11851,6 +11941,28 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         let has = |flag: Modifiers| {
             symbol.modifiers.contains(flag)
                 || [detail.getter, detail.setter]
+                    .into_iter()
+                    .flatten()
+                    .any(|accessor| symbols.get(accessor).modifiers.contains(flag))
+        };
+        if symbols.get(container).type_kind() != Some(TypeKind::Interface)
+            || !has(Modifiers::STATIC)
+            || !(has(Modifiers::ABSTRACT) || has(Modifiers::VIRTUAL))
+        {
+            return None;
+        }
+        self.constraint_naming(container)
+    }
+
+    /// The same for a static abstract or virtual event.
+    fn static_abstract_event_constraint(&self, event: SymbolId) -> Option<(SymbolId, Type)> {
+        let symbols = self.emitter.compilation.symbols();
+        let symbol = symbols.get(event);
+        let container = symbol.container?;
+        let detail = symbol.as_event()?;
+        let has = |flag: Modifiers| {
+            symbol.modifiers.contains(flag)
+                || [detail.adder, detail.remover]
                     .into_iter()
                     .flatten()
                     .any(|accessor| symbols.get(accessor).modifiers.contains(flag))
