@@ -20814,3 +20814,3094 @@ class A {
 ",
     );
 }
+
+/// A node the language folds to a constant is the constant in the tree, whatever
+/// wrote it: a constant of a referenced assembly (`Math.PI`, `int.MaxValue`), `1 + 2`,
+/// `(long)5`, `default(int)`, `default(DateTime)`, a `decimal` literal, and a `null`
+/// given to a parameter or compared with a reference, which has the type of what it
+/// meets. A `Math.PI` was a field read of a class the running program might not have
+/// and threw `MissingFieldException` once the tree was built; `d * 1.5m` was a `New`
+/// of the `decimal`, `default(int)` a `Default` node, `~n` an `OnesComplement`, and
+/// `s + 1` converted the string to `object` as well.
+#[test]
+fn expression_tree_constants_are_folded() {
+    check(
+        "ExprTreeConstants",
+        r##"
+using System;
+using System.Collections.Generic;
+using System.Linq.Expressions;
+using System.Text;
+static class Dump {
+  public static string Of(Expression e) { var sb = new StringBuilder(); Walk(e, sb, 0); return sb.ToString(); }
+  static string T(Type t) => t == null ? "-" : t.Name;
+  static string Sig(System.Reflection.MethodBase m) => m.DeclaringType.Name + "." + m.Name + "(" + string.Join(",", Array.ConvertAll(m.GetParameters(), x => x.ParameterType.Name)) + ")";
+  static void Walk(Expression e, StringBuilder sb, int d) {
+    if (e == null) { sb.Append(' ', d*2).Append("<null>\n"); return; }
+    sb.Append(' ', d*2).Append(e.NodeType).Append(' ').Append(T(e.Type));
+    var kids = new List<Expression>();
+    switch (e) {
+      case ConstantExpression c: sb.Append(" value=").Append(c.Value == null ? "null" : c.Value.ToString() + ":" + c.Value.GetType().Name); break;
+      case ParameterExpression p: sb.Append(" name=").Append(p.Name); break;
+      case UnaryExpression u: if (u.Method != null) sb.Append(" method=").Append(Sig(u.Method)); sb.Append(" lifted=").Append(u.IsLifted).Append("/").Append(u.IsLiftedToNull); kids.Add(u.Operand); break;
+      case BinaryExpression b: if (b.Method != null) sb.Append(" method=").Append(Sig(b.Method)); sb.Append(" lifted=").Append(b.IsLifted).Append("/").Append(b.IsLiftedToNull); kids.Add(b.Left); kids.Add(b.Right); if (b.Conversion != null) { sb.Append(" conv"); kids.Add(b.Conversion); } break;
+      case MemberExpression m: sb.Append(" member=").Append(m.Member.DeclaringType.Name + "." + m.Member.Name); kids.Add(m.Expression); break;
+      case MethodCallExpression mc: sb.Append(" method=").Append(Sig(mc.Method)); kids.Add(mc.Object); kids.AddRange(mc.Arguments); break;
+      case NewExpression n: sb.Append(" ctor=").Append(n.Constructor == null ? "none" : Sig(n.Constructor)); kids.AddRange(n.Arguments); break;
+      case NewArrayExpression na: kids.AddRange(na.Expressions); break;
+      case ConditionalExpression ce: kids.Add(ce.Test); kids.Add(ce.IfTrue); kids.Add(ce.IfFalse); break;
+      case TypeBinaryExpression tb: sb.Append(" tt=").Append(T(tb.TypeOperand)); kids.Add(tb.Expression); break;
+      case LambdaExpression l: kids.AddRange(l.Parameters); kids.Add(l.Body); break;
+      case InvocationExpression iv: kids.Add(iv.Expression); kids.AddRange(iv.Arguments); break;
+      case IndexExpression ix: sb.Append(" idx=").Append(ix.Indexer?.Name); kids.Add(ix.Object); kids.AddRange(ix.Arguments); break;
+      case MemberInitExpression mi: kids.Add(mi.NewExpression); foreach (var b in mi.Bindings) sb.Append(" bind:").Append(b.Member.Name).Append(b.BindingType); foreach (var b in mi.Bindings) if (b is MemberAssignment ma) kids.Add(ma.Expression); break;
+      case ListInitExpression li: kids.Add(li.NewExpression); foreach (var i in li.Initializers) { sb.Append(" add:").Append(i.AddMethod.Name); kids.AddRange(i.Arguments);} break;
+      case DefaultExpression: break;
+    }
+    sb.Append('\n');
+    foreach (var k in kids) Walk(k, sb, d + 1);
+  }
+}
+class P {
+  static void Show<T>(Expression<T> e) { Console.WriteLine(e); Console.Write(Dump.Of(e)); }
+  static void Main() {
+    try { Show<Func<double,double>>(n => n + Math.PI); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int>>(n => n + int.MaxValue); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int>>(n => ~n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<decimal,decimal>>(d => d * 1.5m); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int>>(n => default(int)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,bool>>(n => n == null); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int?>>(n => default(int?)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<DateTime,DateTime>>(n => default(DateTime)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<string,string>>(n => n + 1); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<string,string>>(n => 1 + n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<string,string>>(n => n + n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<string,string>>(n => n + 'c'); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,long>>(n => (long)5); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,long>>(n => n + 5L); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<byte,int>>(n => n + 1); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<char,int>>(c => c); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,char>>(n => (char)n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<long,int>>(n => (int)n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int>>(n => checked(n + 1)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int>>(n => checked(-n)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,long>>(n => checked((long)n * 2)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,object>>(n => n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int?>>(n => n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int>>(n => (int)n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int?,int?>>((a, b) => a + b); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,bool>>(a => a > 1); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int>>(a => a ?? 3); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<string,string>>(a => a ?? "x"); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+  }
+}
+"##,
+        r##"n => (n + 3.141592653589793)
+Lambda Func`2
+  Parameter Double name=n
+  Add Double lifted=False/False
+    Parameter Double name=n
+    Constant Double value=3.141592653589793:Double
+n => (n + 2147483647)
+Lambda Func`2
+  Parameter Int32 name=n
+  Add Int32 lifted=False/False
+    Parameter Int32 name=n
+    Constant Int32 value=2147483647:Int32
+n => Not(n)
+Lambda Func`2
+  Parameter Int32 name=n
+  Not Int32 lifted=False/False
+    Parameter Int32 name=n
+d => (d * 1.5)
+Lambda Func`2
+  Parameter Decimal name=d
+  Multiply Decimal method=Decimal.op_Multiply(Decimal,Decimal) lifted=False/False
+    Parameter Decimal name=d
+    Constant Decimal value=1.5:Decimal
+n => 0
+Lambda Func`2
+  Parameter Int32 name=n
+  Constant Int32 value=0:Int32
+n => (n == null)
+Lambda Func`2
+  Parameter Nullable`1 name=n
+  Equal Boolean lifted=True/False
+    Parameter Nullable`1 name=n
+    Constant Nullable`1 value=null
+n => null
+Lambda Func`2
+  Parameter Nullable`1 name=n
+  Constant Nullable`1 value=null
+n => 01/01/0001 00:00:00
+Lambda Func`2
+  Parameter DateTime name=n
+  Constant DateTime value=01/01/0001 00:00:00:DateTime
+n => (n + Convert(1, Object))
+Lambda Func`2
+  Parameter String name=n
+  Add String method=String.Concat(Object,Object) lifted=False/False
+    Parameter String name=n
+    Convert Object lifted=False/False
+      Constant Int32 value=1:Int32
+n => (Convert(1, Object) + n)
+Lambda Func`2
+  Parameter String name=n
+  Add String method=String.Concat(Object,Object) lifted=False/False
+    Convert Object lifted=False/False
+      Constant Int32 value=1:Int32
+    Parameter String name=n
+n => (n + n)
+Lambda Func`2
+  Parameter String name=n
+  Add String method=String.Concat(String,String) lifted=False/False
+    Parameter String name=n
+    Parameter String name=n
+n => (n + Convert(c, Object))
+Lambda Func`2
+  Parameter String name=n
+  Add String method=String.Concat(Object,Object) lifted=False/False
+    Parameter String name=n
+    Convert Object lifted=False/False
+      Constant Char value=c:Char
+n => 5
+Lambda Func`2
+  Parameter Int32 name=n
+  Constant Int64 value=5:Int64
+n => (Convert(n, Int64) + 5)
+Lambda Func`2
+  Parameter Int32 name=n
+  Add Int64 lifted=False/False
+    Convert Int64 lifted=False/False
+      Parameter Int32 name=n
+    Constant Int64 value=5:Int64
+n => (Convert(n, Int32) + 1)
+Lambda Func`2
+  Parameter Byte name=n
+  Add Int32 lifted=False/False
+    Convert Int32 lifted=False/False
+      Parameter Byte name=n
+    Constant Int32 value=1:Int32
+c => Convert(c, Int32)
+Lambda Func`2
+  Parameter Char name=c
+  Convert Int32 lifted=False/False
+    Parameter Char name=c
+n => Convert(n, Char)
+Lambda Func`2
+  Parameter Int32 name=n
+  Convert Char lifted=False/False
+    Parameter Int32 name=n
+n => Convert(n, Int32)
+Lambda Func`2
+  Parameter Int64 name=n
+  Convert Int32 lifted=False/False
+    Parameter Int64 name=n
+n => (n + 1)
+Lambda Func`2
+  Parameter Int32 name=n
+  AddChecked Int32 lifted=False/False
+    Parameter Int32 name=n
+    Constant Int32 value=1:Int32
+n => -n
+Lambda Func`2
+  Parameter Int32 name=n
+  NegateChecked Int32 lifted=False/False
+    Parameter Int32 name=n
+n => (ConvertChecked(n, Int64) * 2)
+Lambda Func`2
+  Parameter Int32 name=n
+  MultiplyChecked Int64 lifted=False/False
+    ConvertChecked Int64 lifted=False/False
+      Parameter Int32 name=n
+    Constant Int64 value=2:Int64
+n => Convert(n, Object)
+Lambda Func`2
+  Parameter Int32 name=n
+  Convert Object lifted=False/False
+    Parameter Int32 name=n
+n => Convert(n, Nullable`1)
+Lambda Func`2
+  Parameter Int32 name=n
+  Convert Nullable`1 lifted=True/True
+    Parameter Int32 name=n
+n => Convert(n, Int32)
+Lambda Func`2
+  Parameter Nullable`1 name=n
+  Convert Int32 lifted=True/False
+    Parameter Nullable`1 name=n
+(a, b) => (a + b)
+Lambda Func`3
+  Parameter Nullable`1 name=a
+  Parameter Nullable`1 name=b
+  Add Nullable`1 lifted=True/True
+    Parameter Nullable`1 name=a
+    Parameter Nullable`1 name=b
+a => (a > Convert(1, Nullable`1))
+Lambda Func`2
+  Parameter Nullable`1 name=a
+  GreaterThan Boolean lifted=True/False
+    Parameter Nullable`1 name=a
+    Convert Nullable`1 lifted=True/True
+      Constant Int32 value=1:Int32
+a => (a ?? 3)
+Lambda Func`2
+  Parameter Nullable`1 name=a
+  Coalesce Int32 lifted=False/False
+    Parameter Nullable`1 name=a
+    Constant Int32 value=3:Int32
+a => (a ?? "x")
+Lambda Func`2
+  Parameter String name=a
+  Coalesce String lifted=False/False
+    Parameter String name=a
+    Constant String value=x:String
+"##,
+    );
+}
+
+/// Operators a tree has no node for are written on the integers, as Roslyn writes
+/// them: an enum is converted to its promoted underlying type (`Convert(e, Int32) ==
+/// 1`, `Convert(Convert(e, Int32) | 1, E)`), a `char` or `byte` to `int`, and a
+/// `checked` region makes `AddChecked`, `NegateChecked` and `ConvertChecked` of the
+/// integer operations only. Enums were compared as themselves, which throws when the
+/// tree is compiled, and `char`s as `char`s; `checked` was not looked up at all.
+#[test]
+fn expression_tree_operators_on_enums_and_small_integers() {
+    check(
+        "ExprTreeEnumsAndChecked",
+        r##"
+using System;
+using System.Collections.Generic;
+using System.Linq.Expressions;
+using System.Text;
+static class Dump {
+  public static string Of(Expression e) { var sb = new StringBuilder(); Walk(e, sb, 0); return sb.ToString(); }
+  static string T(Type t) => t == null ? "-" : t.Name;
+  static string Sig(System.Reflection.MethodBase m) => m.DeclaringType.Name + "." + m.Name + "(" + string.Join(",", Array.ConvertAll(m.GetParameters(), x => x.ParameterType.Name)) + ")";
+  static void Walk(Expression e, StringBuilder sb, int d) {
+    if (e == null) { sb.Append(' ', d*2).Append("<null>\n"); return; }
+    sb.Append(' ', d*2).Append(e.NodeType).Append(' ').Append(T(e.Type));
+    var kids = new List<Expression>();
+    switch (e) {
+      case ConstantExpression c: sb.Append(" value=").Append(c.Value == null ? "null" : c.Value.ToString() + ":" + c.Value.GetType().Name); break;
+      case ParameterExpression p: sb.Append(" name=").Append(p.Name); break;
+      case UnaryExpression u: if (u.Method != null) sb.Append(" method=").Append(Sig(u.Method)); sb.Append(" lifted=").Append(u.IsLifted).Append("/").Append(u.IsLiftedToNull); kids.Add(u.Operand); break;
+      case BinaryExpression b: if (b.Method != null) sb.Append(" method=").Append(Sig(b.Method)); sb.Append(" lifted=").Append(b.IsLifted).Append("/").Append(b.IsLiftedToNull); kids.Add(b.Left); kids.Add(b.Right); if (b.Conversion != null) { sb.Append(" conv"); kids.Add(b.Conversion); } break;
+      case MemberExpression m: sb.Append(" member=").Append(m.Member.DeclaringType.Name + "." + m.Member.Name); kids.Add(m.Expression); break;
+      case MethodCallExpression mc: sb.Append(" method=").Append(Sig(mc.Method)); kids.Add(mc.Object); kids.AddRange(mc.Arguments); break;
+      case NewExpression n: sb.Append(" ctor=").Append(n.Constructor == null ? "none" : Sig(n.Constructor)); kids.AddRange(n.Arguments); break;
+      case NewArrayExpression na: kids.AddRange(na.Expressions); break;
+      case ConditionalExpression ce: kids.Add(ce.Test); kids.Add(ce.IfTrue); kids.Add(ce.IfFalse); break;
+      case TypeBinaryExpression tb: sb.Append(" tt=").Append(T(tb.TypeOperand)); kids.Add(tb.Expression); break;
+      case LambdaExpression l: kids.AddRange(l.Parameters); kids.Add(l.Body); break;
+      case InvocationExpression iv: kids.Add(iv.Expression); kids.AddRange(iv.Arguments); break;
+      case IndexExpression ix: sb.Append(" idx=").Append(ix.Indexer?.Name); kids.Add(ix.Object); kids.AddRange(ix.Arguments); break;
+      case MemberInitExpression mi: kids.Add(mi.NewExpression); foreach (var b in mi.Bindings) sb.Append(" bind:").Append(b.Member.Name).Append(b.BindingType); foreach (var b in mi.Bindings) if (b is MemberAssignment ma) kids.Add(ma.Expression); break;
+      case ListInitExpression li: kids.Add(li.NewExpression); foreach (var i in li.Initializers) { sb.Append(" add:").Append(i.AddMethod.Name); kids.AddRange(i.Arguments);} break;
+      case DefaultExpression: break;
+    }
+    sb.Append('\n');
+    foreach (var k in kids) Walk(k, sb, d + 1);
+  }
+}
+enum E { A = 1, B = 2 }
+[Flags] enum F : byte { X = 1, Y = 2 }
+class P {
+  static void Show<T>(Expression<T> e) { Console.WriteLine(e); Console.Write(Dump.Of(e)); }
+  static void Main() {
+    try { Show<Func<int,int>>(n => checked(n + 1)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int>>(n => checked(-n)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,long>>(n => checked((long)n * 2)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<double,double>>(n => checked(n + 1.5)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<double,double>>(n => checked(-n)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<double,int>>(n => checked((int)n)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,double>>(n => checked((double)n)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,long>>(n => checked(n)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,long>>(n => checked(n + 1L)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<long,int>>(n => checked((int)n)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<long,uint>>(n => checked((uint)n)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,char>>(n => checked((char)n)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<char,int>>(n => checked(n)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int>>(n => checked(n * n - n)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int>>(n => unchecked(n * n - n)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int?>>(n => checked(n + 1)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int?>>(n => checked((int?)n)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<E,bool>>(n => n == E.A); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<E,bool>>(n => n > E.A); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<E,E>>(n => n + 1); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<E,E>>(n => n | E.A); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<F,F>>(n => n | F.X); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<F,F>>(n => ~n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<F,bool>>(n => (n & F.X) == F.X); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<E?,bool>>(n => n == E.A); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<E,int>>(n => (int)n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,E>>(n => (E)n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<E,long>>(n => (long)n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,E>>(n => checked((E)n)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,E>>(n => (E)1); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<E,int>>(n => n - E.A); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<bool,bool>>(n => !n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int>>(n => +n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int>>(n => n << 2); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int>>(n => n >> 2); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<uint,uint>>(n => n >> 2); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int>>(n => n % 3 / 2); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<bool,bool,bool>>((a, b) => a & b | a ^ b); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<bool,bool,bool>>((a, b) => a && b || !a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<short,short,int>>((a, b) => a + b); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<byte,byte,int>>((a, b) => a & b); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<sbyte,int>>(a => -a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<uint,long>>(a => a + 1); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<uint,long>>(a => -a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<float,double>>(a => a + 1.0); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<long,long>>(a => a << 3); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<object,bool>>(a => a == null); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<string,bool>>(a => a == "x"); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<string,bool>>(a => a != null); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<object,object,bool>>((a, b) => a == b); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+  }
+}
+"##,
+        r##"n => (n + 1)
+Lambda Func`2
+  Parameter Int32 name=n
+  AddChecked Int32 lifted=False/False
+    Parameter Int32 name=n
+    Constant Int32 value=1:Int32
+n => -n
+Lambda Func`2
+  Parameter Int32 name=n
+  NegateChecked Int32 lifted=False/False
+    Parameter Int32 name=n
+n => (ConvertChecked(n, Int64) * 2)
+Lambda Func`2
+  Parameter Int32 name=n
+  MultiplyChecked Int64 lifted=False/False
+    ConvertChecked Int64 lifted=False/False
+      Parameter Int32 name=n
+    Constant Int64 value=2:Int64
+n => (n + 1.5)
+Lambda Func`2
+  Parameter Double name=n
+  Add Double lifted=False/False
+    Parameter Double name=n
+    Constant Double value=1.5:Double
+n => -n
+Lambda Func`2
+  Parameter Double name=n
+  Negate Double lifted=False/False
+    Parameter Double name=n
+n => ConvertChecked(n, Int32)
+Lambda Func`2
+  Parameter Double name=n
+  ConvertChecked Int32 lifted=False/False
+    Parameter Double name=n
+n => Convert(n, Double)
+Lambda Func`2
+  Parameter Int32 name=n
+  Convert Double lifted=False/False
+    Parameter Int32 name=n
+n => ConvertChecked(n, Int64)
+Lambda Func`2
+  Parameter Int32 name=n
+  ConvertChecked Int64 lifted=False/False
+    Parameter Int32 name=n
+n => (ConvertChecked(n, Int64) + 1)
+Lambda Func`2
+  Parameter Int32 name=n
+  AddChecked Int64 lifted=False/False
+    ConvertChecked Int64 lifted=False/False
+      Parameter Int32 name=n
+    Constant Int64 value=1:Int64
+n => ConvertChecked(n, Int32)
+Lambda Func`2
+  Parameter Int64 name=n
+  ConvertChecked Int32 lifted=False/False
+    Parameter Int64 name=n
+n => ConvertChecked(n, UInt32)
+Lambda Func`2
+  Parameter Int64 name=n
+  ConvertChecked UInt32 lifted=False/False
+    Parameter Int64 name=n
+n => ConvertChecked(n, Char)
+Lambda Func`2
+  Parameter Int32 name=n
+  ConvertChecked Char lifted=False/False
+    Parameter Int32 name=n
+n => ConvertChecked(n, Int32)
+Lambda Func`2
+  Parameter Char name=n
+  ConvertChecked Int32 lifted=False/False
+    Parameter Char name=n
+n => ((n * n) - n)
+Lambda Func`2
+  Parameter Int32 name=n
+  SubtractChecked Int32 lifted=False/False
+    MultiplyChecked Int32 lifted=False/False
+      Parameter Int32 name=n
+      Parameter Int32 name=n
+    Parameter Int32 name=n
+n => ((n * n) - n)
+Lambda Func`2
+  Parameter Int32 name=n
+  Subtract Int32 lifted=False/False
+    Multiply Int32 lifted=False/False
+      Parameter Int32 name=n
+      Parameter Int32 name=n
+    Parameter Int32 name=n
+n => (n + Convert(1, Nullable`1))
+Lambda Func`2
+  Parameter Nullable`1 name=n
+  AddChecked Nullable`1 lifted=True/True
+    Parameter Nullable`1 name=n
+    Convert Nullable`1 lifted=True/True
+      Constant Int32 value=1:Int32
+n => Convert(n, Nullable`1)
+Lambda Func`2
+  Parameter Nullable`1 name=n
+  Convert Nullable`1 lifted=True/True
+    Parameter Nullable`1 name=n
+n => (Convert(n, Int32) == 1)
+Lambda Func`2
+  Parameter E name=n
+  Equal Boolean lifted=False/False
+    Convert Int32 lifted=False/False
+      Parameter E name=n
+    Constant Int32 value=1:Int32
+n => (Convert(n, Int32) > 1)
+Lambda Func`2
+  Parameter E name=n
+  GreaterThan Boolean lifted=False/False
+    Convert Int32 lifted=False/False
+      Parameter E name=n
+    Constant Int32 value=1:Int32
+n => Convert((Convert(n, Int32) + 1), E)
+Lambda Func`2
+  Parameter E name=n
+  Convert E lifted=False/False
+    Add Int32 lifted=False/False
+      Convert Int32 lifted=False/False
+        Parameter E name=n
+      Constant Int32 value=1:Int32
+n => Convert((Convert(n, Int32) | 1), E)
+Lambda Func`2
+  Parameter E name=n
+  Convert E lifted=False/False
+    Or Int32 lifted=False/False
+      Convert Int32 lifted=False/False
+        Parameter E name=n
+      Constant Int32 value=1:Int32
+n => Convert((Convert(n, Int32) | 1), F)
+Lambda Func`2
+  Parameter F name=n
+  Convert F lifted=False/False
+    Or Int32 lifted=False/False
+      Convert Int32 lifted=False/False
+        Parameter F name=n
+      Constant Int32 value=1:Int32
+n => Convert(Not(Convert(n, Int32)), F)
+Lambda Func`2
+  Parameter F name=n
+  Convert F lifted=False/False
+    Not Int32 lifted=False/False
+      Convert Int32 lifted=False/False
+        Parameter F name=n
+n => (Convert(Convert((Convert(n, Int32) & 1), F), Int32) == 1)
+Lambda Func`2
+  Parameter F name=n
+  Equal Boolean lifted=False/False
+    Convert Int32 lifted=False/False
+      Convert F lifted=False/False
+        And Int32 lifted=False/False
+          Convert Int32 lifted=False/False
+            Parameter F name=n
+          Constant Int32 value=1:Int32
+    Constant Int32 value=1:Int32
+n => (Convert(n, Nullable`1) == Convert(A, Nullable`1))
+Lambda Func`2
+  Parameter Nullable`1 name=n
+  Equal Boolean lifted=True/False
+    Convert Nullable`1 lifted=True/True
+      Parameter Nullable`1 name=n
+    Convert Nullable`1 lifted=True/True
+      Constant E value=A:E
+n => Convert(n, Int32)
+Lambda Func`2
+  Parameter E name=n
+  Convert Int32 lifted=False/False
+    Parameter E name=n
+n => Convert(n, E)
+Lambda Func`2
+  Parameter Int32 name=n
+  Convert E lifted=False/False
+    Parameter Int32 name=n
+n => Convert(n, Int64)
+Lambda Func`2
+  Parameter E name=n
+  Convert Int64 lifted=False/False
+    Parameter E name=n
+n => ConvertChecked(n, E)
+Lambda Func`2
+  Parameter Int32 name=n
+  ConvertChecked E lifted=False/False
+    Parameter Int32 name=n
+n => A
+Lambda Func`2
+  Parameter Int32 name=n
+  Constant E value=A:E
+n => (Convert(n, Int32) - 1)
+Lambda Func`2
+  Parameter E name=n
+  Subtract Int32 lifted=False/False
+    Convert Int32 lifted=False/False
+      Parameter E name=n
+    Constant Int32 value=1:Int32
+n => Not(n)
+Lambda Func`2
+  Parameter Boolean name=n
+  Not Boolean lifted=False/False
+    Parameter Boolean name=n
+n => n
+Lambda Func`2
+  Parameter Int32 name=n
+  Parameter Int32 name=n
+n => (n << 2)
+Lambda Func`2
+  Parameter Int32 name=n
+  LeftShift Int32 lifted=False/False
+    Parameter Int32 name=n
+    Constant Int32 value=2:Int32
+n => (n >> 2)
+Lambda Func`2
+  Parameter Int32 name=n
+  RightShift Int32 lifted=False/False
+    Parameter Int32 name=n
+    Constant Int32 value=2:Int32
+n => (n >> 2)
+Lambda Func`2
+  Parameter UInt32 name=n
+  RightShift UInt32 lifted=False/False
+    Parameter UInt32 name=n
+    Constant Int32 value=2:Int32
+n => ((n % 3) / 2)
+Lambda Func`2
+  Parameter Int32 name=n
+  Divide Int32 lifted=False/False
+    Modulo Int32 lifted=False/False
+      Parameter Int32 name=n
+      Constant Int32 value=3:Int32
+    Constant Int32 value=2:Int32
+(a, b) => ((a And b) Or (a ^ b))
+Lambda Func`3
+  Parameter Boolean name=a
+  Parameter Boolean name=b
+  Or Boolean lifted=False/False
+    And Boolean lifted=False/False
+      Parameter Boolean name=a
+      Parameter Boolean name=b
+    ExclusiveOr Boolean lifted=False/False
+      Parameter Boolean name=a
+      Parameter Boolean name=b
+(a, b) => ((a AndAlso b) OrElse Not(a))
+Lambda Func`3
+  Parameter Boolean name=a
+  Parameter Boolean name=b
+  OrElse Boolean lifted=False/False
+    AndAlso Boolean lifted=False/False
+      Parameter Boolean name=a
+      Parameter Boolean name=b
+    Not Boolean lifted=False/False
+      Parameter Boolean name=a
+(a, b) => (Convert(a, Int32) + Convert(b, Int32))
+Lambda Func`3
+  Parameter Int16 name=a
+  Parameter Int16 name=b
+  Add Int32 lifted=False/False
+    Convert Int32 lifted=False/False
+      Parameter Int16 name=a
+    Convert Int32 lifted=False/False
+      Parameter Int16 name=b
+(a, b) => (Convert(a, Int32) & Convert(b, Int32))
+Lambda Func`3
+  Parameter Byte name=a
+  Parameter Byte name=b
+  And Int32 lifted=False/False
+    Convert Int32 lifted=False/False
+      Parameter Byte name=a
+    Convert Int32 lifted=False/False
+      Parameter Byte name=b
+a => -Convert(a, Int32)
+Lambda Func`2
+  Parameter SByte name=a
+  Negate Int32 lifted=False/False
+    Convert Int32 lifted=False/False
+      Parameter SByte name=a
+a => Convert((a + 1), Int64)
+Lambda Func`2
+  Parameter UInt32 name=a
+  Convert Int64 lifted=False/False
+    Add UInt32 lifted=False/False
+      Parameter UInt32 name=a
+      Constant UInt32 value=1:UInt32
+a => -Convert(a, Int64)
+Lambda Func`2
+  Parameter UInt32 name=a
+  Negate Int64 lifted=False/False
+    Convert Int64 lifted=False/False
+      Parameter UInt32 name=a
+a => (Convert(a, Double) + 1)
+Lambda Func`2
+  Parameter Single name=a
+  Add Double lifted=False/False
+    Convert Double lifted=False/False
+      Parameter Single name=a
+    Constant Double value=1:Double
+a => (a << 3)
+Lambda Func`2
+  Parameter Int64 name=a
+  LeftShift Int64 lifted=False/False
+    Parameter Int64 name=a
+    Constant Int32 value=3:Int32
+a => (a == null)
+Lambda Func`2
+  Parameter Object name=a
+  Equal Boolean lifted=False/False
+    Parameter Object name=a
+    Constant Object value=null
+a => (a == "x")
+Lambda Func`2
+  Parameter String name=a
+  Equal Boolean method=String.op_Equality(String,String) lifted=False/False
+    Parameter String name=a
+    Constant String value=x:String
+a => (a != null)
+Lambda Func`2
+  Parameter String name=a
+  NotEqual Boolean method=String.op_Inequality(String,String) lifted=False/False
+    Parameter String name=a
+    Constant String value=null
+(a, b) => (a == b)
+Lambda Func`3
+  Parameter Object name=a
+  Parameter Object name=b
+  Equal Boolean lifted=False/False
+    Parameter Object name=a
+    Parameter Object name=b
+"##,
+    );
+}
+
+/// Casts the program wrote, conversions through user-defined operators, nullable
+/// operands, `decimal` and string comparisons: `(int)n` on an `int` is a `Convert`, `s ==
+/// null` is `String.op_Equality` with a `null` of type `string`, an integer given to a
+/// `decimal` is its constant, and one given to a `decimal?` a `Convert` of a `Convert`.
+#[test]
+fn expression_tree_conversions_and_user_defined_operators() {
+    check(
+        "ExprTreeConversions",
+        r##"
+using System;
+using System.Collections.Generic;
+using System.Linq.Expressions;
+using System.Text;
+static class Dump {
+  public static string Of(Expression e) { var sb = new StringBuilder(); Walk(e, sb, 0); return sb.ToString(); }
+  static string T(Type t) => t == null ? "-" : t.Name;
+  static string Sig(System.Reflection.MethodBase m) => m.DeclaringType.Name + "." + m.Name + "(" + string.Join(",", Array.ConvertAll(m.GetParameters(), x => x.ParameterType.Name)) + ")";
+  static void Walk(Expression e, StringBuilder sb, int d) {
+    if (e == null) { sb.Append(' ', d*2).Append("<null>\n"); return; }
+    sb.Append(' ', d*2).Append(e.NodeType).Append(' ').Append(T(e.Type));
+    var kids = new List<Expression>();
+    switch (e) {
+      case ConstantExpression c: sb.Append(" value=").Append(c.Value == null ? "null" : c.Value.ToString() + ":" + c.Value.GetType().Name); break;
+      case ParameterExpression p: sb.Append(" name=").Append(p.Name); break;
+      case UnaryExpression u: if (u.Method != null) sb.Append(" method=").Append(Sig(u.Method)); sb.Append(" lifted=").Append(u.IsLifted).Append("/").Append(u.IsLiftedToNull); kids.Add(u.Operand); break;
+      case BinaryExpression b: if (b.Method != null) sb.Append(" method=").Append(Sig(b.Method)); sb.Append(" lifted=").Append(b.IsLifted).Append("/").Append(b.IsLiftedToNull); kids.Add(b.Left); kids.Add(b.Right); if (b.Conversion != null) { sb.Append(" conv"); kids.Add(b.Conversion); } break;
+      case MemberExpression m: sb.Append(" member=").Append(m.Member.DeclaringType.Name + "." + m.Member.Name); kids.Add(m.Expression); break;
+      case MethodCallExpression mc: sb.Append(" method=").Append(Sig(mc.Method)); kids.Add(mc.Object); kids.AddRange(mc.Arguments); break;
+      case NewExpression n: sb.Append(" ctor=").Append(n.Constructor == null ? "none" : Sig(n.Constructor)); kids.AddRange(n.Arguments); break;
+      case NewArrayExpression na: kids.AddRange(na.Expressions); break;
+      case ConditionalExpression ce: kids.Add(ce.Test); kids.Add(ce.IfTrue); kids.Add(ce.IfFalse); break;
+      case TypeBinaryExpression tb: sb.Append(" tt=").Append(T(tb.TypeOperand)); kids.Add(tb.Expression); break;
+      case LambdaExpression l: kids.AddRange(l.Parameters); kids.Add(l.Body); break;
+      case InvocationExpression iv: kids.Add(iv.Expression); kids.AddRange(iv.Arguments); break;
+      case IndexExpression ix: sb.Append(" idx=").Append(ix.Indexer?.Name); kids.Add(ix.Object); kids.AddRange(ix.Arguments); break;
+      case MemberInitExpression mi: kids.Add(mi.NewExpression); foreach (var b in mi.Bindings) sb.Append(" bind:").Append(b.Member.Name).Append(b.BindingType); foreach (var b in mi.Bindings) if (b is MemberAssignment ma) kids.Add(ma.Expression); break;
+      case ListInitExpression li: kids.Add(li.NewExpression); foreach (var i in li.Initializers) { sb.Append(" add:").Append(i.AddMethod.Name); kids.AddRange(i.Arguments);} break;
+      case DefaultExpression: break;
+    }
+    sb.Append('\n');
+    foreach (var k in kids) Walk(k, sb, d + 1);
+  }
+}
+class Base { public int V; public static bool operator ==(Base a, Base b) => true; public static bool operator !=(Base a, Base b) => false; public override bool Equals(object o) => true; public override int GetHashCode() => 0; }
+class Derived : Base { }
+struct S { public int X; public static S operator +(S a, S b) => a; public static implicit operator int(S s) => s.X; public static explicit operator S(int i) => default(S); public static bool operator ==(S a, S b) => true; public static bool operator !=(S a, S b) => false; public override bool Equals(object o) => true; public override int GetHashCode() => 0; public static S operator -(S a) => a; public static S operator !(S a) => a; }
+class P {
+  static void Show<T>(Expression<T> e) { Console.WriteLine(e); Console.Write(Dump.Of(e)); }
+  static void Main() {
+    try { Show<Func<int,int>>(n => (int)n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int?>>(n => (int?)n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<string,object>>(n => (object)n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<string,object>>(n => n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Derived,Base>>(n => n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Derived,Base>>(n => (Base)n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,Derived>>(n => (Derived)n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<object,int>>(n => (int)n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<object,int?>>(n => (int?)n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<object,string>>(n => (string)n); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<object,bool>>(n => n is string); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<object,string>>(n => n as string); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<object,bool>>(n => n is int); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<object,int?>>(n => n as int?); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<string,bool>>(a => a != null); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<string,bool>>(a => null == a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<string,string,bool>>((a, b) => a == b); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a == null); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,Base,bool>>((a, b) => a == b); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,Derived,bool>>((a, b) => a != b); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<S,S,S>>((a, b) => a + b); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<S,int>>(a => a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,S>>(a => (S)a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<S,S>>(a => -a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<S,S>>(a => !a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<S?,S?,S?>>((a, b) => a + b); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<S,S,bool>>((a, b) => a == b); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,S?>>(a => (S?)a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int>>(a => (a > 1) ? a : -a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int>>(a => a.HasValue ? a.Value : 0); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int>>(a => a.Value); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int>>(a => a.GetValueOrDefault()); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int?>>(a => a ?? 3); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<string,string,string>>((a, b) => a ?? b ?? "z"); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<long?,int>>(a => (int)(a ?? 1)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,decimal>>(a => a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,decimal>>(a => (decimal)a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<decimal,int>>(a => (int)a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<decimal,decimal>>(a => a + 1); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<decimal,decimal>>(a => -a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<decimal,bool>>(a => a > 1); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<decimal,bool>>(a => a == 0m); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<decimal?,decimal?>>(a => a * 2); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int?>>(a => null); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,string>>(a => null); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,double>>(a => a / 2); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,double>>(a => a / 2.0); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int>>(a => a ^ 3); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<bool?,bool>>(a => a == true); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<bool?,bool?>>(a => !a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<bool,bool>>(a => a == true); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<char,bool>>(a => a == 'x'); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<char,bool>>(a => a > 'a' && a < 'z'); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<char,int>>(a => a + 1); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<byte,byte>>(a => (byte)(a + 1)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<float,float>>(a => a * 2); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<double,float>>(a => (float)a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<ulong,double>>(a => a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IntPtr,IntPtr>>(a => a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Nullable<int>,bool>>(a => a != null); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int?,bool>>((a, b) => a < b); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int?,bool>>((a, b) => a == b); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int,bool>>((a, b) => a == b); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int?>>(a => -a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int?>>(a => ~a); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int?>>(a => a << 1); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+  }
+}
+"##,
+        r##"n => Convert(n, Int32)
+Lambda Func`2
+  Parameter Int32 name=n
+  Convert Int32 lifted=False/False
+    Parameter Int32 name=n
+n => Convert(n, Nullable`1)
+Lambda Func`2
+  Parameter Nullable`1 name=n
+  Convert Nullable`1 lifted=True/True
+    Parameter Nullable`1 name=n
+n => Convert(n, Object)
+Lambda Func`2
+  Parameter String name=n
+  Convert Object lifted=False/False
+    Parameter String name=n
+n => n
+Lambda Func`2
+  Parameter String name=n
+  Parameter String name=n
+n => n
+Lambda Func`2
+  Parameter Derived name=n
+  Parameter Derived name=n
+n => Convert(n, Base)
+Lambda Func`2
+  Parameter Derived name=n
+  Convert Base lifted=False/False
+    Parameter Derived name=n
+n => Convert(n, Derived)
+Lambda Func`2
+  Parameter Base name=n
+  Convert Derived lifted=False/False
+    Parameter Base name=n
+n => Convert(n, Int32)
+Lambda Func`2
+  Parameter Object name=n
+  Convert Int32 lifted=False/False
+    Parameter Object name=n
+n => Convert(n, Nullable`1)
+Lambda Func`2
+  Parameter Object name=n
+  Convert Nullable`1 lifted=True/True
+    Parameter Object name=n
+n => Convert(n, String)
+Lambda Func`2
+  Parameter Object name=n
+  Convert String lifted=False/False
+    Parameter Object name=n
+n => (n Is String)
+Lambda Func`2
+  Parameter Object name=n
+  TypeIs Boolean tt=String
+    Parameter Object name=n
+n => (n As String)
+Lambda Func`2
+  Parameter Object name=n
+  TypeAs String lifted=False/False
+    Parameter Object name=n
+n => (n Is Int32)
+Lambda Func`2
+  Parameter Object name=n
+  TypeIs Boolean tt=Int32
+    Parameter Object name=n
+n => (n As Nullable`1)
+Lambda Func`2
+  Parameter Object name=n
+  TypeAs Nullable`1 lifted=False/False
+    Parameter Object name=n
+a => (a != null)
+Lambda Func`2
+  Parameter String name=a
+  NotEqual Boolean method=String.op_Inequality(String,String) lifted=False/False
+    Parameter String name=a
+    Constant String value=null
+a => (null == a)
+Lambda Func`2
+  Parameter String name=a
+  Equal Boolean method=String.op_Equality(String,String) lifted=False/False
+    Constant String value=null
+    Parameter String name=a
+(a, b) => (a == b)
+Lambda Func`3
+  Parameter String name=a
+  Parameter String name=b
+  Equal Boolean method=String.op_Equality(String,String) lifted=False/False
+    Parameter String name=a
+    Parameter String name=b
+a => (a == null)
+Lambda Func`2
+  Parameter Base name=a
+  Equal Boolean method=Base.op_Equality(Base,Base) lifted=False/False
+    Parameter Base name=a
+    Constant Base value=null
+(a, b) => (a == b)
+Lambda Func`3
+  Parameter Base name=a
+  Parameter Base name=b
+  Equal Boolean method=Base.op_Equality(Base,Base) lifted=False/False
+    Parameter Base name=a
+    Parameter Base name=b
+(a, b) => (a != b)
+Lambda Func`3
+  Parameter Base name=a
+  Parameter Derived name=b
+  NotEqual Boolean method=Base.op_Inequality(Base,Base) lifted=False/False
+    Parameter Base name=a
+    Parameter Derived name=b
+(a, b) => (a + b)
+Lambda Func`3
+  Parameter S name=a
+  Parameter S name=b
+  Add S method=S.op_Addition(S,S) lifted=False/False
+    Parameter S name=a
+    Parameter S name=b
+a => Convert(a, Int32)
+Lambda Func`2
+  Parameter S name=a
+  Convert Int32 method=S.op_Implicit(S) lifted=False/False
+    Parameter S name=a
+a => Convert(a, S)
+Lambda Func`2
+  Parameter Int32 name=a
+  Convert S method=S.op_Explicit(Int32) lifted=False/False
+    Parameter Int32 name=a
+a => -a
+Lambda Func`2
+  Parameter S name=a
+  Negate S method=S.op_UnaryNegation(S) lifted=False/False
+    Parameter S name=a
+a => Not(a)
+Lambda Func`2
+  Parameter S name=a
+  Not S method=S.op_LogicalNot(S) lifted=False/False
+    Parameter S name=a
+(a, b) => (a + b)
+Lambda Func`3
+  Parameter Nullable`1 name=a
+  Parameter Nullable`1 name=b
+  Add Nullable`1 method=S.op_Addition(S,S) lifted=True/True
+    Parameter Nullable`1 name=a
+    Parameter Nullable`1 name=b
+(a, b) => (a == b)
+Lambda Func`3
+  Parameter S name=a
+  Parameter S name=b
+  Equal Boolean method=S.op_Equality(S,S) lifted=False/False
+    Parameter S name=a
+    Parameter S name=b
+a => Convert(Convert(a, S), Nullable`1)
+Lambda Func`2
+  Parameter Int32 name=a
+  Convert Nullable`1 lifted=True/True
+    Convert S method=S.op_Explicit(Int32) lifted=False/False
+      Parameter Int32 name=a
+a => IIF((a > 1), a, -a)
+Lambda Func`2
+  Parameter Int32 name=a
+  Conditional Int32
+    GreaterThan Boolean lifted=False/False
+      Parameter Int32 name=a
+      Constant Int32 value=1:Int32
+    Parameter Int32 name=a
+    Negate Int32 lifted=False/False
+      Parameter Int32 name=a
+a => IIF(a.HasValue, a.Value, 0)
+Lambda Func`2
+  Parameter Nullable`1 name=a
+  Conditional Int32
+    MemberAccess Boolean member=Nullable`1.HasValue
+      Parameter Nullable`1 name=a
+    MemberAccess Int32 member=Nullable`1.Value
+      Parameter Nullable`1 name=a
+    Constant Int32 value=0:Int32
+a => a.Value
+Lambda Func`2
+  Parameter Nullable`1 name=a
+  MemberAccess Int32 member=Nullable`1.Value
+    Parameter Nullable`1 name=a
+a => a.GetValueOrDefault()
+Lambda Func`2
+  Parameter Nullable`1 name=a
+  Call Int32 method=Nullable`1.GetValueOrDefault()
+    Parameter Nullable`1 name=a
+a => Convert((a ?? 3), Nullable`1)
+Lambda Func`2
+  Parameter Nullable`1 name=a
+  Convert Nullable`1 lifted=True/True
+    Coalesce Int32 lifted=False/False
+      Parameter Nullable`1 name=a
+      Constant Int32 value=3:Int32
+(a, b) => (a ?? (b ?? "z"))
+Lambda Func`3
+  Parameter String name=a
+  Parameter String name=b
+  Coalesce String lifted=False/False
+    Parameter String name=a
+    Coalesce String lifted=False/False
+      Parameter String name=b
+      Constant String value=z:String
+a => Convert((a ?? 1), Int32)
+Lambda Func`2
+  Parameter Nullable`1 name=a
+  Convert Int32 lifted=False/False
+    Coalesce Int64 lifted=False/False
+      Parameter Nullable`1 name=a
+      Constant Int64 value=1:Int64
+a => Convert(a, Decimal)
+Lambda Func`2
+  Parameter Int32 name=a
+  Convert Decimal method=Decimal.op_Implicit(Int32) lifted=False/False
+    Parameter Int32 name=a
+a => Convert(a, Decimal)
+Lambda Func`2
+  Parameter Int32 name=a
+  Convert Decimal method=Decimal.op_Implicit(Int32) lifted=False/False
+    Parameter Int32 name=a
+a => Convert(a, Int32)
+Lambda Func`2
+  Parameter Decimal name=a
+  Convert Int32 method=Decimal.op_Explicit(Decimal) lifted=False/False
+    Parameter Decimal name=a
+a => (a + 1)
+Lambda Func`2
+  Parameter Decimal name=a
+  Add Decimal method=Decimal.op_Addition(Decimal,Decimal) lifted=False/False
+    Parameter Decimal name=a
+    Constant Decimal value=1:Decimal
+a => -a
+Lambda Func`2
+  Parameter Decimal name=a
+  Negate Decimal method=Decimal.op_UnaryNegation(Decimal) lifted=False/False
+    Parameter Decimal name=a
+a => (a > 1)
+Lambda Func`2
+  Parameter Decimal name=a
+  GreaterThan Boolean method=Decimal.op_GreaterThan(Decimal,Decimal) lifted=False/False
+    Parameter Decimal name=a
+    Constant Decimal value=1:Decimal
+a => (a == 0)
+Lambda Func`2
+  Parameter Decimal name=a
+  Equal Boolean method=Decimal.op_Equality(Decimal,Decimal) lifted=False/False
+    Parameter Decimal name=a
+    Constant Decimal value=0:Decimal
+a => (a * Convert(Convert(2, Decimal), Nullable`1))
+Lambda Func`2
+  Parameter Nullable`1 name=a
+  Multiply Nullable`1 method=Decimal.op_Multiply(Decimal,Decimal) lifted=True/True
+    Parameter Nullable`1 name=a
+    Convert Nullable`1 lifted=True/True
+      Convert Decimal method=Decimal.op_Implicit(Int32) lifted=False/False
+        Constant Int32 value=2:Int32
+a => null
+Lambda Func`2
+  Parameter Int32 name=a
+  Constant Nullable`1 value=null
+a => null
+Lambda Func`2
+  Parameter Int32 name=a
+  Constant String value=null
+a => Convert((a / 2), Double)
+Lambda Func`2
+  Parameter Int32 name=a
+  Convert Double lifted=False/False
+    Divide Int32 lifted=False/False
+      Parameter Int32 name=a
+      Constant Int32 value=2:Int32
+a => (Convert(a, Double) / 2)
+Lambda Func`2
+  Parameter Int32 name=a
+  Divide Double lifted=False/False
+    Convert Double lifted=False/False
+      Parameter Int32 name=a
+    Constant Double value=2:Double
+a => (a ^ 3)
+Lambda Func`2
+  Parameter Int32 name=a
+  ExclusiveOr Int32 lifted=False/False
+    Parameter Int32 name=a
+    Constant Int32 value=3:Int32
+a => (a == Convert(True, Nullable`1))
+Lambda Func`2
+  Parameter Nullable`1 name=a
+  Equal Boolean lifted=True/False
+    Parameter Nullable`1 name=a
+    Convert Nullable`1 lifted=True/True
+      Constant Boolean value=True:Boolean
+a => Not(a)
+Lambda Func`2
+  Parameter Nullable`1 name=a
+  Not Nullable`1 lifted=True/True
+    Parameter Nullable`1 name=a
+a => (a == True)
+Lambda Func`2
+  Parameter Boolean name=a
+  Equal Boolean lifted=False/False
+    Parameter Boolean name=a
+    Constant Boolean value=True:Boolean
+a => (Convert(a, Int32) == 120)
+Lambda Func`2
+  Parameter Char name=a
+  Equal Boolean lifted=False/False
+    Convert Int32 lifted=False/False
+      Parameter Char name=a
+    Constant Int32 value=120:Int32
+a => ((Convert(a, Int32) > 97) AndAlso (Convert(a, Int32) < 122))
+Lambda Func`2
+  Parameter Char name=a
+  AndAlso Boolean lifted=False/False
+    GreaterThan Boolean lifted=False/False
+      Convert Int32 lifted=False/False
+        Parameter Char name=a
+      Constant Int32 value=97:Int32
+    LessThan Boolean lifted=False/False
+      Convert Int32 lifted=False/False
+        Parameter Char name=a
+      Constant Int32 value=122:Int32
+a => (Convert(a, Int32) + 1)
+Lambda Func`2
+  Parameter Char name=a
+  Add Int32 lifted=False/False
+    Convert Int32 lifted=False/False
+      Parameter Char name=a
+    Constant Int32 value=1:Int32
+a => Convert((Convert(a, Int32) + 1), Byte)
+Lambda Func`2
+  Parameter Byte name=a
+  Convert Byte lifted=False/False
+    Add Int32 lifted=False/False
+      Convert Int32 lifted=False/False
+        Parameter Byte name=a
+      Constant Int32 value=1:Int32
+a => (a * 2)
+Lambda Func`2
+  Parameter Single name=a
+  Multiply Single lifted=False/False
+    Parameter Single name=a
+    Constant Single value=2:Single
+a => Convert(a, Single)
+Lambda Func`2
+  Parameter Double name=a
+  Convert Single lifted=False/False
+    Parameter Double name=a
+a => Convert(a, Double)
+Lambda Func`2
+  Parameter UInt64 name=a
+  Convert Double lifted=False/False
+    Parameter UInt64 name=a
+a => a
+Lambda Func`2
+  Parameter IntPtr name=a
+  Parameter IntPtr name=a
+a => (a != null)
+Lambda Func`2
+  Parameter Nullable`1 name=a
+  NotEqual Boolean lifted=True/False
+    Parameter Nullable`1 name=a
+    Constant Nullable`1 value=null
+(a, b) => (a < b)
+Lambda Func`3
+  Parameter Nullable`1 name=a
+  Parameter Nullable`1 name=b
+  LessThan Boolean lifted=True/False
+    Parameter Nullable`1 name=a
+    Parameter Nullable`1 name=b
+(a, b) => (a == b)
+Lambda Func`3
+  Parameter Nullable`1 name=a
+  Parameter Nullable`1 name=b
+  Equal Boolean lifted=True/False
+    Parameter Nullable`1 name=a
+    Parameter Nullable`1 name=b
+(a, b) => (a == Convert(b, Nullable`1))
+Lambda Func`3
+  Parameter Nullable`1 name=a
+  Parameter Int32 name=b
+  Equal Boolean lifted=True/False
+    Parameter Nullable`1 name=a
+    Convert Nullable`1 lifted=True/True
+      Parameter Int32 name=b
+a => -a
+Lambda Func`2
+  Parameter Nullable`1 name=a
+  Negate Nullable`1 lifted=True/True
+    Parameter Nullable`1 name=a
+a => Not(a)
+Lambda Func`2
+  Parameter Nullable`1 name=a
+  Not Nullable`1 lifted=True/True
+    Parameter Nullable`1 name=a
+a => (a << Convert(1, Nullable`1))
+Lambda Func`2
+  Parameter Nullable`1 name=a
+  LeftShift Nullable`1 lifted=True/True
+    Parameter Nullable`1 name=a
+    Convert Nullable`1 lifted=True/True
+      Constant Int32 value=1:Int32
+"##,
+    );
+}
+
+/// Calls, members, closures, initializers and anonymous types: a delegate call is
+/// an `Invoke`, an anonymous type names its members, the override a type has is the
+/// method called (`Int32.ToString()`), a `null` argument has the type of its
+/// parameter, and `x == null` on a struct is the lifted comparison.
+#[test]
+fn expression_tree_calls_members_and_initializers() {
+    check(
+        "ExprTreeCalls",
+        r##"
+using System;
+using System.Collections.Generic;
+using System.Linq.Expressions;
+using System.Text;
+using System.Linq;
+static class Dump {
+  public static string Of(Expression e) { var sb = new StringBuilder(); Walk(e, sb, 0); return sb.ToString(); }
+  static string T(Type t) => t == null ? "-" : t.Name;
+  static string Sig(System.Reflection.MethodBase m) => m.DeclaringType.Name + "." + m.Name + "(" + string.Join(",", Array.ConvertAll(m.GetParameters(), x => x.ParameterType.Name)) + ")";
+  static void Walk(Expression e, StringBuilder sb, int d) {
+    if (e == null) { sb.Append(' ', d*2).Append("<null>\n"); return; }
+    sb.Append(' ', d*2).Append(e.NodeType).Append(' ').Append(T(e.Type));
+    var kids = new List<Expression>();
+    switch (e) {
+      case ConstantExpression c: sb.Append(" value=").Append(c.Value == null ? "null" : c.Value.ToString() + ":" + c.Value.GetType().Name); break;
+      case ParameterExpression p: sb.Append(" name=").Append(p.Name); break;
+      case UnaryExpression u: if (u.Method != null) sb.Append(" method=").Append(Sig(u.Method)); sb.Append(" lifted=").Append(u.IsLifted).Append("/").Append(u.IsLiftedToNull); kids.Add(u.Operand); break;
+      case BinaryExpression b: if (b.Method != null) sb.Append(" method=").Append(Sig(b.Method)); sb.Append(" lifted=").Append(b.IsLifted).Append("/").Append(b.IsLiftedToNull); kids.Add(b.Left); kids.Add(b.Right); if (b.Conversion != null) { sb.Append(" conv"); kids.Add(b.Conversion); } break;
+      case MemberExpression m: sb.Append(" member=").Append(m.Member.DeclaringType.Name + "." + m.Member.Name); kids.Add(m.Expression); break;
+      case MethodCallExpression mc: sb.Append(" method=").Append(Sig(mc.Method)); kids.Add(mc.Object); kids.AddRange(mc.Arguments); break;
+      case NewExpression n: sb.Append(" ctor=").Append(n.Constructor == null ? "none" : Sig(n.Constructor)); kids.AddRange(n.Arguments); break;
+      case NewArrayExpression na: kids.AddRange(na.Expressions); break;
+      case ConditionalExpression ce: kids.Add(ce.Test); kids.Add(ce.IfTrue); kids.Add(ce.IfFalse); break;
+      case TypeBinaryExpression tb: sb.Append(" tt=").Append(T(tb.TypeOperand)); kids.Add(tb.Expression); break;
+      case LambdaExpression l: kids.AddRange(l.Parameters); kids.Add(l.Body); break;
+      case InvocationExpression iv: kids.Add(iv.Expression); kids.AddRange(iv.Arguments); break;
+      case IndexExpression ix: sb.Append(" idx=").Append(ix.Indexer?.Name); kids.Add(ix.Object); kids.AddRange(ix.Arguments); break;
+      case MemberInitExpression mi: kids.Add(mi.NewExpression); foreach (var b in mi.Bindings) sb.Append(" bind:").Append(b.Member.Name).Append(b.BindingType); foreach (var b in mi.Bindings) if (b is MemberAssignment ma) kids.Add(ma.Expression); break;
+      case ListInitExpression li: kids.Add(li.NewExpression); foreach (var i in li.Initializers) { sb.Append(" add:").Append(i.AddMethod.Name); kids.AddRange(i.Arguments);} break;
+      case DefaultExpression: break;
+    }
+    sb.Append('\n');
+    foreach (var k in kids) Walk(k, sb, d + 1);
+  }
+}
+class Base { public int V; public string Name; public List<int> L; public int[] Arr;
+  public static bool operator ==(Base a, Base b) => true; public static bool operator !=(Base a, Base b) => false; public override bool Equals(object o) => true; public override int GetHashCode() => 0;
+  public int this[int i] => i; public int this[string s, int j] => j;
+  public static int Sm(string s) => 1; public int Im(string s, int[] a, params int[] more) => 1; public int Opt(int a = 5, string b = "x") => a;
+  public Base Self => this; public decimal D; public DateTime Dt; public Guid G; public double Db; public long Lg; public int? NI; public E En; public E? NE; }
+enum E { A, B }
+static class Ext { public static int Twice(this Base b, int x) => x * 2; public static IEnumerable<T> Where2<T>(this IEnumerable<T> s, Func<T, bool> f) => s; }
+class P {
+  static int Local = 4;
+  static int Sf = 2;
+  const int K = 3;
+  static void Show<T>(Expression<T> e) { Console.WriteLine(e); Console.Write(Dump.Of(e)); }
+  static void Main() {
+    int cl = 7; string cs = "q"; Base cb = new Base();
+    try { Show<Func<Base,bool>>(a => a == null); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => Base.Sm(null)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => a.Im(null, null)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => a.Im("x", new int[0], 1, 2, 3)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => a.Im("x", new[] { 1 })); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => a.Twice(3)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => a[3]); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => a["z", 4]); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => a.Arr[2]); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => a.Arr.Length); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => a.L.Count + a.L[0]); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => a.V + cl); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,string>>(a => a.Name + cs); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => a.V + Local + Sf + K); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.Name == cs); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.Name.StartsWith("a") && a.Name.Length > 3); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,string>>(a => a.Name.ToUpper().Substring(1, 2)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,string>>(a => a.V.ToString()); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,string>>(a => string.Format("{0}-{1}", a.V, a.Name)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,string>>(a => $"{a.V}x{a.Name}"); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => a.Opt()); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,Base>>(a => a.Self.Self); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,Base>>(a => new Base { V = 1, Name = "n" }); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,List<int>>>(a => new List<int> { 1, 2, 3 }); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int[]>>(a => new int[] { 1, 2 }); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int[]>>(a => new int[3]); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int[][]>>(a => new int[][] { new[] { 1 } }); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int[,]>>(a => new int[2, 3]); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,object>>(a => new { a.V, N = a.Name }); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,Tuple<int,string>>>(a => Tuple.Create(a.V, a.Name)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,Func<int,int>>>(a => x => x + a.V); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,Expression<Func<int,int>>>>(a => x => x + 1); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => new[] { 1, 2, 3 }.Where(x => x > a.V).Count()); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,IEnumerable<int>>>(a => a.L.Where2(x => x > 1)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IEnumerable<Base>,IEnumerable<string>>>(s => s.Where(x => x.V > 1).Select(x => x.Name)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Func<int,int>,int>>(f => f(3)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a is Base); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.V > 1 ? a.Name != null : false); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => a.NI ?? 0); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => a.NI.GetValueOrDefault()); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.NI == 3); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.NI > 3); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.NI != null); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.En == E.B); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.NE == E.B); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.NE == null); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.NE.HasValue); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.D > 1.5m); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.D == 0); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,decimal>>(a => a.D + a.V); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,double>>(a => a.V * a.Db); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,double>>(a => a.Lg + a.Db); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,long>>(a => a.V + a.Lg); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.Dt > DateTime.Now); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.Dt == DateTime.MinValue); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.G == Guid.Empty); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.Dt.Year == 2020); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.G == default(Guid)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,DateTime>>(a => DateTime.MaxValue); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,string>>(a => string.Empty); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => cb.V); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => cb.Im("x", null)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.Name.Contains(cs)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,bool>>(a => a.V.Equals(3)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,string>>(a => a.Name ?? "none"); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => a.Name.Length); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,Type>>(a => typeof(int)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,Type>>(a => a.GetType()); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,object>>(a => (object)a.V); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,object>>(a => a.V); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => (int)a.Lg); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,int>>(a => (int)a.Db); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Base,string>>(a => a.V > 1 ? "big" : "small"); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int[]>>(a => new[] { a, a + 1 }); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,Base>>(a => new Base() { V = a }); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,Base>>(a => new Base()); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,DateTime>>(a => new DateTime(2020, 1, a)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,DateTime>>(a => new DateTime()); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,Guid>>(a => new Guid()); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,Guid>>(a => default); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+  }
+}
+"##,
+        r##"a => (a == null)
+Lambda Func`2
+  Parameter Base name=a
+  Equal Boolean method=Base.op_Equality(Base,Base) lifted=False/False
+    Parameter Base name=a
+    Constant Base value=null
+a => Sm(null)
+Lambda Func`2
+  Parameter Base name=a
+  Call Int32 method=Base.Sm(String)
+    <null>
+    Constant String value=null
+a => a.Im(null, null, new [] {})
+Lambda Func`2
+  Parameter Base name=a
+  Call Int32 method=Base.Im(String,Int32[],Int32[])
+    Parameter Base name=a
+    Constant String value=null
+    Constant Int32[] value=null
+    NewArrayInit Int32[]
+a => a.Im("x", new System.Int32[](0), new [] {1, 2, 3})
+Lambda Func`2
+  Parameter Base name=a
+  Call Int32 method=Base.Im(String,Int32[],Int32[])
+    Parameter Base name=a
+    Constant String value=x:String
+    NewArrayBounds Int32[]
+      Constant Int32 value=0:Int32
+    NewArrayInit Int32[]
+      Constant Int32 value=1:Int32
+      Constant Int32 value=2:Int32
+      Constant Int32 value=3:Int32
+a => a.Im("x", new [] {1}, new [] {})
+Lambda Func`2
+  Parameter Base name=a
+  Call Int32 method=Base.Im(String,Int32[],Int32[])
+    Parameter Base name=a
+    Constant String value=x:String
+    NewArrayInit Int32[]
+      Constant Int32 value=1:Int32
+    NewArrayInit Int32[]
+a => a.Twice(3)
+Lambda Func`2
+  Parameter Base name=a
+  Call Int32 method=Ext.Twice(Base,Int32)
+    <null>
+    Parameter Base name=a
+    Constant Int32 value=3:Int32
+a => a.get_Item(3)
+Lambda Func`2
+  Parameter Base name=a
+  Call Int32 method=Base.get_Item(Int32)
+    Parameter Base name=a
+    Constant Int32 value=3:Int32
+a => a.get_Item("z", 4)
+Lambda Func`2
+  Parameter Base name=a
+  Call Int32 method=Base.get_Item(String,Int32)
+    Parameter Base name=a
+    Constant String value=z:String
+    Constant Int32 value=4:Int32
+a => a.Arr[2]
+Lambda Func`2
+  Parameter Base name=a
+  ArrayIndex Int32 lifted=False/False
+    MemberAccess Int32[] member=Base.Arr
+      Parameter Base name=a
+    Constant Int32 value=2:Int32
+a => ArrayLength(a.Arr)
+Lambda Func`2
+  Parameter Base name=a
+  ArrayLength Int32 lifted=False/False
+    MemberAccess Int32[] member=Base.Arr
+      Parameter Base name=a
+a => (a.L.Count + a.L.get_Item(0))
+Lambda Func`2
+  Parameter Base name=a
+  Add Int32 lifted=False/False
+    MemberAccess Int32 member=List`1.Count
+      MemberAccess List`1 member=Base.L
+        Parameter Base name=a
+    Call Int32 method=List`1.get_Item(Int32)
+      MemberAccess List`1 member=Base.L
+        Parameter Base name=a
+      Constant Int32 value=0:Int32
+a => (a.V + value(P+<>c__DisplayClass4_0).cl)
+Lambda Func`2
+  Parameter Base name=a
+  Add Int32 lifted=False/False
+    MemberAccess Int32 member=Base.V
+      Parameter Base name=a
+    MemberAccess Int32 member=<>c__DisplayClass4_0.cl
+      Constant <>c__DisplayClass4_0 value=P+<>c__DisplayClass4_0:<>c__DisplayClass4_0
+a => (a.Name + value(P+<>c__DisplayClass4_0).cs)
+Lambda Func`2
+  Parameter Base name=a
+  Add String method=String.Concat(String,String) lifted=False/False
+    MemberAccess String member=Base.Name
+      Parameter Base name=a
+    MemberAccess String member=<>c__DisplayClass4_0.cs
+      Constant <>c__DisplayClass4_0 value=P+<>c__DisplayClass4_0:<>c__DisplayClass4_0
+a => (((a.V + P.Local) + P.Sf) + 3)
+Lambda Func`2
+  Parameter Base name=a
+  Add Int32 lifted=False/False
+    Add Int32 lifted=False/False
+      Add Int32 lifted=False/False
+        MemberAccess Int32 member=Base.V
+          Parameter Base name=a
+        MemberAccess Int32 member=P.Local
+          <null>
+      MemberAccess Int32 member=P.Sf
+        <null>
+    Constant Int32 value=3:Int32
+a => (a.Name == value(P+<>c__DisplayClass4_0).cs)
+Lambda Func`2
+  Parameter Base name=a
+  Equal Boolean method=String.op_Equality(String,String) lifted=False/False
+    MemberAccess String member=Base.Name
+      Parameter Base name=a
+    MemberAccess String member=<>c__DisplayClass4_0.cs
+      Constant <>c__DisplayClass4_0 value=P+<>c__DisplayClass4_0:<>c__DisplayClass4_0
+a => (a.Name.StartsWith("a") AndAlso (a.Name.Length > 3))
+Lambda Func`2
+  Parameter Base name=a
+  AndAlso Boolean lifted=False/False
+    Call Boolean method=String.StartsWith(String)
+      MemberAccess String member=Base.Name
+        Parameter Base name=a
+      Constant String value=a:String
+    GreaterThan Boolean lifted=False/False
+      MemberAccess Int32 member=String.Length
+        MemberAccess String member=Base.Name
+          Parameter Base name=a
+      Constant Int32 value=3:Int32
+a => a.Name.ToUpper().Substring(1, 2)
+Lambda Func`2
+  Parameter Base name=a
+  Call String method=String.Substring(Int32,Int32)
+    Call String method=String.ToUpper()
+      MemberAccess String member=Base.Name
+        Parameter Base name=a
+    Constant Int32 value=1:Int32
+    Constant Int32 value=2:Int32
+a => a.V.ToString()
+Lambda Func`2
+  Parameter Base name=a
+  Call String method=Int32.ToString()
+    MemberAccess Int32 member=Base.V
+      Parameter Base name=a
+a => Format("{0}-{1}", Convert(a.V, Object), a.Name)
+Lambda Func`2
+  Parameter Base name=a
+  Call String method=String.Format(String,Object,Object)
+    <null>
+    Constant String value={0}-{1}:String
+    Convert Object lifted=False/False
+      MemberAccess Int32 member=Base.V
+        Parameter Base name=a
+    MemberAccess String member=Base.Name
+      Parameter Base name=a
+a => Format("{0}x{1}", Convert(a.V, Object), a.Name)
+Lambda Func`2
+  Parameter Base name=a
+  Call String method=String.Format(String,Object,Object)
+    <null>
+    Constant String value={0}x{1}:String
+    Convert Object lifted=False/False
+      MemberAccess Int32 member=Base.V
+        Parameter Base name=a
+    MemberAccess String member=Base.Name
+      Parameter Base name=a
+a => a.Opt(5, "x")
+Lambda Func`2
+  Parameter Base name=a
+  Call Int32 method=Base.Opt(Int32,String)
+    Parameter Base name=a
+    Constant Int32 value=5:Int32
+    Constant String value=x:String
+a => a.Self.Self
+Lambda Func`2
+  Parameter Base name=a
+  MemberAccess Base member=Base.Self
+    MemberAccess Base member=Base.Self
+      Parameter Base name=a
+a => new Base() {V = 1, Name = "n"}
+Lambda Func`2
+  Parameter Base name=a
+  MemberInit Base bind:VAssignment bind:NameAssignment
+    New Base ctor=Base..ctor()
+    Constant Int32 value=1:Int32
+    Constant String value=n:String
+a => new List`1() {Void Add(Int32)(1), Void Add(Int32)(2), Void Add(Int32)(3)}
+Lambda Func`2
+  Parameter Base name=a
+  ListInit List`1 add:Add add:Add add:Add
+    New List`1 ctor=List`1..ctor()
+    Constant Int32 value=1:Int32
+    Constant Int32 value=2:Int32
+    Constant Int32 value=3:Int32
+a => new [] {1, 2}
+Lambda Func`2
+  Parameter Base name=a
+  NewArrayInit Int32[]
+    Constant Int32 value=1:Int32
+    Constant Int32 value=2:Int32
+a => new System.Int32[](3)
+Lambda Func`2
+  Parameter Base name=a
+  NewArrayBounds Int32[]
+    Constant Int32 value=3:Int32
+a => new [] {new [] {1}}
+Lambda Func`2
+  Parameter Base name=a
+  NewArrayInit Int32[][]
+    NewArrayInit Int32[]
+      Constant Int32 value=1:Int32
+a => new System.Int32[,](2, 3)
+Lambda Func`2
+  Parameter Base name=a
+  NewArrayBounds Int32[,]
+    Constant Int32 value=2:Int32
+    Constant Int32 value=3:Int32
+a => new <>f__AnonymousType0`2(V = a.V, N = a.Name)
+Lambda Func`2
+  Parameter Base name=a
+  New <>f__AnonymousType0`2 ctor=<>f__AnonymousType0`2..ctor(Int32,String)
+    MemberAccess Int32 member=Base.V
+      Parameter Base name=a
+    MemberAccess String member=Base.Name
+      Parameter Base name=a
+a => Create(a.V, a.Name)
+Lambda Func`2
+  Parameter Base name=a
+  Call Tuple`2 method=Tuple.Create(Int32,String)
+    <null>
+    MemberAccess Int32 member=Base.V
+      Parameter Base name=a
+    MemberAccess String member=Base.Name
+      Parameter Base name=a
+a => x => (x + a.V)
+Lambda Func`2
+  Parameter Base name=a
+  Lambda Func`2
+    Parameter Int32 name=x
+    Add Int32 lifted=False/False
+      Parameter Int32 name=x
+      MemberAccess Int32 member=Base.V
+        Parameter Base name=a
+a => x => (x + 1)
+Lambda Func`2
+  Parameter Base name=a
+  Quote Expression`1 lifted=False/False
+    Lambda Func`2
+      Parameter Int32 name=x
+      Add Int32 lifted=False/False
+        Parameter Int32 name=x
+        Constant Int32 value=1:Int32
+a => new [] {1, 2, 3}.Where(x => (x > a.V)).Count()
+Lambda Func`2
+  Parameter Base name=a
+  Call Int32 method=Enumerable.Count(IEnumerable`1)
+    <null>
+    Call IEnumerable`1 method=Enumerable.Where(IEnumerable`1,Func`2)
+      <null>
+      NewArrayInit Int32[]
+        Constant Int32 value=1:Int32
+        Constant Int32 value=2:Int32
+        Constant Int32 value=3:Int32
+      Lambda Func`2
+        Parameter Int32 name=x
+        GreaterThan Boolean lifted=False/False
+          Parameter Int32 name=x
+          MemberAccess Int32 member=Base.V
+            Parameter Base name=a
+a => a.L.Where2(x => (x > 1))
+Lambda Func`2
+  Parameter Base name=a
+  Call IEnumerable`1 method=Ext.Where2(IEnumerable`1,Func`2)
+    <null>
+    MemberAccess List`1 member=Base.L
+      Parameter Base name=a
+    Lambda Func`2
+      Parameter Int32 name=x
+      GreaterThan Boolean lifted=False/False
+        Parameter Int32 name=x
+        Constant Int32 value=1:Int32
+s => s.Where(x => (x.V > 1)).Select(x => x.Name)
+Lambda Func`2
+  Parameter IEnumerable`1 name=s
+  Call IEnumerable`1 method=Enumerable.Select(IEnumerable`1,Func`2)
+    <null>
+    Call IEnumerable`1 method=Enumerable.Where(IEnumerable`1,Func`2)
+      <null>
+      Parameter IEnumerable`1 name=s
+      Lambda Func`2
+        Parameter Base name=x
+        GreaterThan Boolean lifted=False/False
+          MemberAccess Int32 member=Base.V
+            Parameter Base name=x
+          Constant Int32 value=1:Int32
+    Lambda Func`2
+      Parameter Base name=x
+      MemberAccess String member=Base.Name
+        Parameter Base name=x
+f => Invoke(f, 3)
+Lambda Func`2
+  Parameter Func`2 name=f
+  Invoke Int32
+    Parameter Func`2 name=f
+    Constant Int32 value=3:Int32
+a => (a Is Base)
+Lambda Func`2
+  Parameter Base name=a
+  TypeIs Boolean tt=Base
+    Parameter Base name=a
+a => IIF((a.V > 1), (a.Name != null), False)
+Lambda Func`2
+  Parameter Base name=a
+  Conditional Boolean
+    GreaterThan Boolean lifted=False/False
+      MemberAccess Int32 member=Base.V
+        Parameter Base name=a
+      Constant Int32 value=1:Int32
+    NotEqual Boolean method=String.op_Inequality(String,String) lifted=False/False
+      MemberAccess String member=Base.Name
+        Parameter Base name=a
+      Constant String value=null
+    Constant Boolean value=False:Boolean
+a => (a.NI ?? 0)
+Lambda Func`2
+  Parameter Base name=a
+  Coalesce Int32 lifted=False/False
+    MemberAccess Nullable`1 member=Base.NI
+      Parameter Base name=a
+    Constant Int32 value=0:Int32
+a => a.NI.GetValueOrDefault()
+Lambda Func`2
+  Parameter Base name=a
+  Call Int32 method=Nullable`1.GetValueOrDefault()
+    MemberAccess Nullable`1 member=Base.NI
+      Parameter Base name=a
+a => (a.NI == Convert(3, Nullable`1))
+Lambda Func`2
+  Parameter Base name=a
+  Equal Boolean lifted=True/False
+    MemberAccess Nullable`1 member=Base.NI
+      Parameter Base name=a
+    Convert Nullable`1 lifted=True/True
+      Constant Int32 value=3:Int32
+a => (a.NI > Convert(3, Nullable`1))
+Lambda Func`2
+  Parameter Base name=a
+  GreaterThan Boolean lifted=True/False
+    MemberAccess Nullable`1 member=Base.NI
+      Parameter Base name=a
+    Convert Nullable`1 lifted=True/True
+      Constant Int32 value=3:Int32
+a => (a.NI != null)
+Lambda Func`2
+  Parameter Base name=a
+  NotEqual Boolean lifted=True/False
+    MemberAccess Nullable`1 member=Base.NI
+      Parameter Base name=a
+    Constant Nullable`1 value=null
+a => (Convert(a.En, Int32) == 1)
+Lambda Func`2
+  Parameter Base name=a
+  Equal Boolean lifted=False/False
+    Convert Int32 lifted=False/False
+      MemberAccess E member=Base.En
+        Parameter Base name=a
+    Constant Int32 value=1:Int32
+a => (Convert(a.NE, Nullable`1) == Convert(B, Nullable`1))
+Lambda Func`2
+  Parameter Base name=a
+  Equal Boolean lifted=True/False
+    Convert Nullable`1 lifted=True/True
+      MemberAccess Nullable`1 member=Base.NE
+        Parameter Base name=a
+    Convert Nullable`1 lifted=True/True
+      Constant E value=B:E
+a => (a.NE == null)
+Lambda Func`2
+  Parameter Base name=a
+  Equal Boolean lifted=True/False
+    MemberAccess Nullable`1 member=Base.NE
+      Parameter Base name=a
+    Constant Nullable`1 value=null
+a => a.NE.HasValue
+Lambda Func`2
+  Parameter Base name=a
+  MemberAccess Boolean member=Nullable`1.HasValue
+    MemberAccess Nullable`1 member=Base.NE
+      Parameter Base name=a
+a => (a.D > 1.5)
+Lambda Func`2
+  Parameter Base name=a
+  GreaterThan Boolean method=Decimal.op_GreaterThan(Decimal,Decimal) lifted=False/False
+    MemberAccess Decimal member=Base.D
+      Parameter Base name=a
+    Constant Decimal value=1.5:Decimal
+a => (a.D == 0)
+Lambda Func`2
+  Parameter Base name=a
+  Equal Boolean method=Decimal.op_Equality(Decimal,Decimal) lifted=False/False
+    MemberAccess Decimal member=Base.D
+      Parameter Base name=a
+    Constant Decimal value=0:Decimal
+a => (a.D + Convert(a.V, Decimal))
+Lambda Func`2
+  Parameter Base name=a
+  Add Decimal method=Decimal.op_Addition(Decimal,Decimal) lifted=False/False
+    MemberAccess Decimal member=Base.D
+      Parameter Base name=a
+    Convert Decimal method=Decimal.op_Implicit(Int32) lifted=False/False
+      MemberAccess Int32 member=Base.V
+        Parameter Base name=a
+a => (Convert(a.V, Double) * a.Db)
+Lambda Func`2
+  Parameter Base name=a
+  Multiply Double lifted=False/False
+    Convert Double lifted=False/False
+      MemberAccess Int32 member=Base.V
+        Parameter Base name=a
+    MemberAccess Double member=Base.Db
+      Parameter Base name=a
+a => (Convert(a.Lg, Double) + a.Db)
+Lambda Func`2
+  Parameter Base name=a
+  Add Double lifted=False/False
+    Convert Double lifted=False/False
+      MemberAccess Int64 member=Base.Lg
+        Parameter Base name=a
+    MemberAccess Double member=Base.Db
+      Parameter Base name=a
+a => (Convert(a.V, Int64) + a.Lg)
+Lambda Func`2
+  Parameter Base name=a
+  Add Int64 lifted=False/False
+    Convert Int64 lifted=False/False
+      MemberAccess Int32 member=Base.V
+        Parameter Base name=a
+    MemberAccess Int64 member=Base.Lg
+      Parameter Base name=a
+a => (a.Dt > DateTime.Now)
+Lambda Func`2
+  Parameter Base name=a
+  GreaterThan Boolean method=DateTime.op_GreaterThan(DateTime,DateTime) lifted=False/False
+    MemberAccess DateTime member=Base.Dt
+      Parameter Base name=a
+    MemberAccess DateTime member=DateTime.Now
+      <null>
+a => (a.Dt == DateTime.MinValue)
+Lambda Func`2
+  Parameter Base name=a
+  Equal Boolean method=DateTime.op_Equality(DateTime,DateTime) lifted=False/False
+    MemberAccess DateTime member=Base.Dt
+      Parameter Base name=a
+    MemberAccess DateTime member=DateTime.MinValue
+      <null>
+a => (a.G == Guid.Empty)
+Lambda Func`2
+  Parameter Base name=a
+  Equal Boolean method=Guid.op_Equality(Guid,Guid) lifted=False/False
+    MemberAccess Guid member=Base.G
+      Parameter Base name=a
+    MemberAccess Guid member=Guid.Empty
+      <null>
+a => (a.Dt.Year == 2020)
+Lambda Func`2
+  Parameter Base name=a
+  Equal Boolean lifted=False/False
+    MemberAccess Int32 member=DateTime.Year
+      MemberAccess DateTime member=Base.Dt
+        Parameter Base name=a
+    Constant Int32 value=2020:Int32
+a => (a.G == 00000000-0000-0000-0000-000000000000)
+Lambda Func`2
+  Parameter Base name=a
+  Equal Boolean method=Guid.op_Equality(Guid,Guid) lifted=False/False
+    MemberAccess Guid member=Base.G
+      Parameter Base name=a
+    Constant Guid value=00000000-0000-0000-0000-000000000000:Guid
+a => DateTime.MaxValue
+Lambda Func`2
+  Parameter Base name=a
+  MemberAccess DateTime member=DateTime.MaxValue
+    <null>
+a => String.Empty
+Lambda Func`2
+  Parameter Base name=a
+  MemberAccess String member=String.Empty
+    <null>
+a => value(P+<>c__DisplayClass4_0).cb.V
+Lambda Func`2
+  Parameter Base name=a
+  MemberAccess Int32 member=Base.V
+    MemberAccess Base member=<>c__DisplayClass4_0.cb
+      Constant <>c__DisplayClass4_0 value=P+<>c__DisplayClass4_0:<>c__DisplayClass4_0
+a => value(P+<>c__DisplayClass4_0).cb.Im("x", null, new [] {})
+Lambda Func`2
+  Parameter Base name=a
+  Call Int32 method=Base.Im(String,Int32[],Int32[])
+    MemberAccess Base member=<>c__DisplayClass4_0.cb
+      Constant <>c__DisplayClass4_0 value=P+<>c__DisplayClass4_0:<>c__DisplayClass4_0
+    Constant String value=x:String
+    Constant Int32[] value=null
+    NewArrayInit Int32[]
+a => a.Name.Contains(value(P+<>c__DisplayClass4_0).cs)
+Lambda Func`2
+  Parameter Base name=a
+  Call Boolean method=String.Contains(String)
+    MemberAccess String member=Base.Name
+      Parameter Base name=a
+    MemberAccess String member=<>c__DisplayClass4_0.cs
+      Constant <>c__DisplayClass4_0 value=P+<>c__DisplayClass4_0:<>c__DisplayClass4_0
+a => a.V.Equals(3)
+Lambda Func`2
+  Parameter Base name=a
+  Call Boolean method=Int32.Equals(Int32)
+    MemberAccess Int32 member=Base.V
+      Parameter Base name=a
+    Constant Int32 value=3:Int32
+a => (a.Name ?? "none")
+Lambda Func`2
+  Parameter Base name=a
+  Coalesce String lifted=False/False
+    MemberAccess String member=Base.Name
+      Parameter Base name=a
+    Constant String value=none:String
+a => a.Name.Length
+Lambda Func`2
+  Parameter Base name=a
+  MemberAccess Int32 member=String.Length
+    MemberAccess String member=Base.Name
+      Parameter Base name=a
+a => System.Int32
+Lambda Func`2
+  Parameter Base name=a
+  Constant Type value=System.Int32:RuntimeType
+a => a.GetType()
+Lambda Func`2
+  Parameter Base name=a
+  Call Type method=Object.GetType()
+    Parameter Base name=a
+a => Convert(a.V, Object)
+Lambda Func`2
+  Parameter Base name=a
+  Convert Object lifted=False/False
+    MemberAccess Int32 member=Base.V
+      Parameter Base name=a
+a => Convert(a.V, Object)
+Lambda Func`2
+  Parameter Base name=a
+  Convert Object lifted=False/False
+    MemberAccess Int32 member=Base.V
+      Parameter Base name=a
+a => Convert(a.Lg, Int32)
+Lambda Func`2
+  Parameter Base name=a
+  Convert Int32 lifted=False/False
+    MemberAccess Int64 member=Base.Lg
+      Parameter Base name=a
+a => Convert(a.Db, Int32)
+Lambda Func`2
+  Parameter Base name=a
+  Convert Int32 lifted=False/False
+    MemberAccess Double member=Base.Db
+      Parameter Base name=a
+a => IIF((a.V > 1), "big", "small")
+Lambda Func`2
+  Parameter Base name=a
+  Conditional String
+    GreaterThan Boolean lifted=False/False
+      MemberAccess Int32 member=Base.V
+        Parameter Base name=a
+      Constant Int32 value=1:Int32
+    Constant String value=big:String
+    Constant String value=small:String
+a => new [] {a, (a + 1)}
+Lambda Func`2
+  Parameter Int32 name=a
+  NewArrayInit Int32[]
+    Parameter Int32 name=a
+    Add Int32 lifted=False/False
+      Parameter Int32 name=a
+      Constant Int32 value=1:Int32
+a => new Base() {V = a}
+Lambda Func`2
+  Parameter Int32 name=a
+  MemberInit Base bind:VAssignment
+    New Base ctor=Base..ctor()
+    Parameter Int32 name=a
+a => new Base()
+Lambda Func`2
+  Parameter Int32 name=a
+  New Base ctor=Base..ctor()
+a => new DateTime(2020, 1, a)
+Lambda Func`2
+  Parameter Int32 name=a
+  New DateTime ctor=DateTime..ctor(Int32,Int32,Int32)
+    Constant Int32 value=2020:Int32
+    Constant Int32 value=1:Int32
+    Parameter Int32 name=a
+a => new DateTime()
+Lambda Func`2
+  Parameter Int32 name=a
+  New DateTime ctor=none
+a => new Guid()
+Lambda Func`2
+  Parameter Int32 name=a
+  New Guid ctor=none
+a => 00000000-0000-0000-0000-000000000000
+Lambda Func`2
+  Parameter Int32 name=a
+  Constant Guid value=00000000-0000-0000-0000-000000000000:Guid
+"##,
+    );
+}
+
+/// A conversion to a nullable is two nodes where the number changes first
+/// (`Convert(Convert(n, Int64), Nullable)`) and one where it is lifted
+/// (`(long)n` on an `int?`), and is `ConvertChecked` inside `checked` where an integer
+/// is converted, not where the value only gets wrapped.
+#[test]
+fn expression_tree_checked_conversions_of_nullables() {
+    check(
+        "ExprTreeCheckedNullable",
+        r##"
+using System;
+using System.Collections.Generic;
+using System.Linq.Expressions;
+using System.Text;
+static class Dump {
+  public static string Of(Expression e) { var sb = new StringBuilder(); Walk(e, sb, 0); return sb.ToString(); }
+  static string T(Type t) => t == null ? "-" : t.Name;
+  static string Sig(System.Reflection.MethodBase m) => m.DeclaringType.Name + "." + m.Name + "(" + string.Join(",", Array.ConvertAll(m.GetParameters(), x => x.ParameterType.Name)) + ")";
+  static void Walk(Expression e, StringBuilder sb, int d) {
+    if (e == null) { sb.Append(' ', d*2).Append("<null>\n"); return; }
+    sb.Append(' ', d*2).Append(e.NodeType).Append(' ').Append(T(e.Type));
+    var kids = new List<Expression>();
+    switch (e) {
+      case ConstantExpression c: sb.Append(" value=").Append(c.Value == null ? "null" : c.Value.ToString() + ":" + c.Value.GetType().Name); break;
+      case ParameterExpression p: sb.Append(" name=").Append(p.Name); break;
+      case UnaryExpression u: if (u.Method != null) sb.Append(" method=").Append(Sig(u.Method)); sb.Append(" lifted=").Append(u.IsLifted).Append("/").Append(u.IsLiftedToNull); kids.Add(u.Operand); break;
+      case BinaryExpression b: if (b.Method != null) sb.Append(" method=").Append(Sig(b.Method)); sb.Append(" lifted=").Append(b.IsLifted).Append("/").Append(b.IsLiftedToNull); kids.Add(b.Left); kids.Add(b.Right); if (b.Conversion != null) { sb.Append(" conv"); kids.Add(b.Conversion); } break;
+      case MemberExpression m: sb.Append(" member=").Append(m.Member.DeclaringType.Name + "." + m.Member.Name); kids.Add(m.Expression); break;
+      case MethodCallExpression mc: sb.Append(" method=").Append(Sig(mc.Method)); kids.Add(mc.Object); kids.AddRange(mc.Arguments); break;
+      case NewExpression n: sb.Append(" ctor=").Append(n.Constructor == null ? "none" : Sig(n.Constructor)); kids.AddRange(n.Arguments); break;
+      case NewArrayExpression na: kids.AddRange(na.Expressions); break;
+      case ConditionalExpression ce: kids.Add(ce.Test); kids.Add(ce.IfTrue); kids.Add(ce.IfFalse); break;
+      case TypeBinaryExpression tb: sb.Append(" tt=").Append(T(tb.TypeOperand)); kids.Add(tb.Expression); break;
+      case LambdaExpression l: kids.AddRange(l.Parameters); kids.Add(l.Body); break;
+      case InvocationExpression iv: kids.Add(iv.Expression); kids.AddRange(iv.Arguments); break;
+      case IndexExpression ix: sb.Append(" idx=").Append(ix.Indexer?.Name); kids.Add(ix.Object); kids.AddRange(ix.Arguments); break;
+      case MemberInitExpression mi: kids.Add(mi.NewExpression); foreach (var b in mi.Bindings) sb.Append(" bind:").Append(b.Member.Name).Append(b.BindingType); foreach (var b in mi.Bindings) if (b is MemberAssignment ma) kids.Add(ma.Expression); break;
+      case ListInitExpression li: kids.Add(li.NewExpression); foreach (var i in li.Initializers) { sb.Append(" add:").Append(i.AddMethod.Name); kids.AddRange(i.Arguments);} break;
+      case DefaultExpression: break;
+    }
+    sb.Append('\n');
+    foreach (var k in kids) Walk(k, sb, d + 1);
+  }
+}
+class P {
+  static void Show<T>(Expression<T> e) { Console.WriteLine(e); Console.Write(Dump.Of(e)); }
+  static long? F(long? a) => a;
+  static void Main() {
+    try { Show<Func<int,byte?>>(arg => checked((byte?)arg)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,long?>>(arg => checked((long?)arg)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,long?>>(arg => checked(F(arg))); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,long?>>(arg => F(arg)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,long?>>(arg => checked(arg)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,long>>(arg => checked((long)arg)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int>>(arg => checked((int)arg)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int>>(arg => (int)arg); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,double?>>(arg => checked(arg)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,int?>>(arg => checked(arg)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int,object>>(arg => checked(arg)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<double?,int>>(arg => checked((int)arg)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int?>>(arg => checked(arg + 1)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<int?,int?>>(arg => checked(-arg)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+  }
+}
+"##,
+        r##"arg => ConvertChecked(arg, Nullable`1)
+Lambda Func`2
+  Parameter Int32 name=arg
+  ConvertChecked Nullable`1 lifted=True/True
+    Parameter Int32 name=arg
+arg => ConvertChecked(ConvertChecked(arg, Int64), Nullable`1)
+Lambda Func`2
+  Parameter Int32 name=arg
+  ConvertChecked Nullable`1 lifted=True/True
+    ConvertChecked Int64 lifted=False/False
+      Parameter Int32 name=arg
+arg => F(ConvertChecked(ConvertChecked(arg, Int64), Nullable`1))
+Lambda Func`2
+  Parameter Int32 name=arg
+  Call Nullable`1 method=P.F(Nullable`1)
+    <null>
+    ConvertChecked Nullable`1 lifted=True/True
+      ConvertChecked Int64 lifted=False/False
+        Parameter Int32 name=arg
+arg => F(Convert(Convert(arg, Int64), Nullable`1))
+Lambda Func`2
+  Parameter Int32 name=arg
+  Call Nullable`1 method=P.F(Nullable`1)
+    <null>
+    Convert Nullable`1 lifted=True/True
+      Convert Int64 lifted=False/False
+        Parameter Int32 name=arg
+arg => ConvertChecked(arg, Nullable`1)
+Lambda Func`2
+  Parameter Nullable`1 name=arg
+  ConvertChecked Nullable`1 lifted=True/True
+    Parameter Nullable`1 name=arg
+arg => ConvertChecked(arg, Int64)
+Lambda Func`2
+  Parameter Nullable`1 name=arg
+  ConvertChecked Int64 lifted=True/False
+    Parameter Nullable`1 name=arg
+arg => ConvertChecked(arg, Int32)
+Lambda Func`2
+  Parameter Nullable`1 name=arg
+  ConvertChecked Int32 lifted=True/False
+    Parameter Nullable`1 name=arg
+arg => Convert(arg, Int32)
+Lambda Func`2
+  Parameter Nullable`1 name=arg
+  Convert Int32 lifted=True/False
+    Parameter Nullable`1 name=arg
+arg => Convert(Convert(arg, Double), Nullable`1)
+Lambda Func`2
+  Parameter Int32 name=arg
+  Convert Nullable`1 lifted=True/True
+    Convert Double lifted=False/False
+      Parameter Int32 name=arg
+arg => Convert(arg, Nullable`1)
+Lambda Func`2
+  Parameter Int32 name=arg
+  Convert Nullable`1 lifted=True/True
+    Parameter Int32 name=arg
+arg => Convert(arg, Object)
+Lambda Func`2
+  Parameter Int32 name=arg
+  Convert Object lifted=False/False
+    Parameter Int32 name=arg
+arg => ConvertChecked(arg, Int32)
+Lambda Func`2
+  Parameter Nullable`1 name=arg
+  ConvertChecked Int32 lifted=True/False
+    Parameter Nullable`1 name=arg
+arg => (arg + Convert(1, Nullable`1))
+Lambda Func`2
+  Parameter Nullable`1 name=arg
+  AddChecked Nullable`1 lifted=True/True
+    Parameter Nullable`1 name=arg
+    Convert Nullable`1 lifted=True/True
+      Constant Int32 value=1:Int32
+arg => -arg
+Lambda Func`2
+  Parameter Nullable`1 name=arg
+  NegateChecked Nullable`1 lifted=True/True
+    Parameter Nullable`1 name=arg
+"##,
+    );
+}
+
+/// The trees a query provider is given: `Queryable` calls with quoted lambdas,
+/// closures over locals, nullable and enum comparisons, string and `DateTime`
+/// members, projections to anonymous types and initialized objects, and the
+/// array-to-span conversion of `arr.Contains(x)`, which is a call of `op_Implicit`.
+#[test]
+fn expression_tree_query_provider_shapes() {
+    check(
+        "ExprTreeQueryShapes",
+        r##"
+using System;
+using System.Collections.Generic;
+using System.Linq.Expressions;
+using System.Text;
+using System.Linq;
+static class Dump {
+  public static string Of(Expression e) { var sb = new StringBuilder(); Walk(e, sb, 0); return sb.ToString(); }
+  static string T(Type t) => t == null ? "-" : t.Name;
+  static string Sig(System.Reflection.MethodBase m) => m.DeclaringType.Name + "." + m.Name + "(" + string.Join(",", Array.ConvertAll(m.GetParameters(), x => x.ParameterType.Name)) + ")";
+  static void Walk(Expression e, StringBuilder sb, int d) {
+    if (e == null) { sb.Append(' ', d*2).Append("<null>\n"); return; }
+    sb.Append(' ', d*2).Append(e.NodeType).Append(' ').Append(T(e.Type));
+    var kids = new List<Expression>();
+    switch (e) {
+      case ConstantExpression c: sb.Append(" value=").Append(c.Value == null ? "null" : c.Value.ToString() + ":" + c.Value.GetType().Name); break;
+      case ParameterExpression p: sb.Append(" name=").Append(p.Name); break;
+      case UnaryExpression u: if (u.Method != null) sb.Append(" method=").Append(Sig(u.Method)); sb.Append(" lifted=").Append(u.IsLifted).Append("/").Append(u.IsLiftedToNull); kids.Add(u.Operand); break;
+      case BinaryExpression b: if (b.Method != null) sb.Append(" method=").Append(Sig(b.Method)); sb.Append(" lifted=").Append(b.IsLifted).Append("/").Append(b.IsLiftedToNull); kids.Add(b.Left); kids.Add(b.Right); if (b.Conversion != null) { sb.Append(" conv"); kids.Add(b.Conversion); } break;
+      case MemberExpression m: sb.Append(" member=").Append(m.Member.DeclaringType.Name + "." + m.Member.Name); kids.Add(m.Expression); break;
+      case MethodCallExpression mc: sb.Append(" method=").Append(Sig(mc.Method)); kids.Add(mc.Object); kids.AddRange(mc.Arguments); break;
+      case NewExpression n: sb.Append(" ctor=").Append(n.Constructor == null ? "none" : Sig(n.Constructor)); kids.AddRange(n.Arguments); break;
+      case NewArrayExpression na: kids.AddRange(na.Expressions); break;
+      case ConditionalExpression ce: kids.Add(ce.Test); kids.Add(ce.IfTrue); kids.Add(ce.IfFalse); break;
+      case TypeBinaryExpression tb: sb.Append(" tt=").Append(T(tb.TypeOperand)); kids.Add(tb.Expression); break;
+      case LambdaExpression l: kids.AddRange(l.Parameters); kids.Add(l.Body); break;
+      case InvocationExpression iv: kids.Add(iv.Expression); kids.AddRange(iv.Arguments); break;
+      case IndexExpression ix: sb.Append(" idx=").Append(ix.Indexer?.Name); kids.Add(ix.Object); kids.AddRange(ix.Arguments); break;
+      case MemberInitExpression mi: kids.Add(mi.NewExpression); foreach (var b in mi.Bindings) sb.Append(" bind:").Append(b.Member.Name).Append(b.BindingType); foreach (var b in mi.Bindings) if (b is MemberAssignment ma) kids.Add(ma.Expression); break;
+      case ListInitExpression li: kids.Add(li.NewExpression); foreach (var i in li.Initializers) { sb.Append(" add:").Append(i.AddMethod.Name); kids.AddRange(i.Arguments);} break;
+      case DefaultExpression: break;
+    }
+    sb.Append('\n');
+    foreach (var k in kids) Walk(k, sb, d + 1);
+  }
+}
+class Person { public int Id; public string Name; public int? Age; public DateTime Born; public decimal Pay; public List<Person> Kids; public Status St; public bool Active; public double Score; public long Big; public byte B; public char C; public Guid G; public string[] Tags;
+  public Person() { } public Person(int id) { Id = id; } }
+enum Status { Off, On }
+class Dto { public int Id { get; set; } public string Name { get; set; } public List<int> Items { get; set; } = new List<int>(); }
+class P {
+  static void Show<T>(Expression<T> e) { Console.WriteLine(e); Console.Write(Dump.Of(e)); }
+  static void Main() {
+    var q = new List<Person>().AsQueryable();
+    int min = 3; string nm = "x"; var ids = new List<int> { 1, 2 }; var arr = new[] { 1, 2 }; Status st = Status.On; DateTime d0 = DateTime.Today; int? nn = 4; decimal dec = 2.5m;
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Id > min && p.Name.StartsWith(nm))); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => ids.Contains(p.Id))); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => arr.Contains(p.Id))); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Age > 3 && p.Age != null)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Age == nn)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Age.HasValue && p.Age.Value > 3)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Born > d0 && p.Born.Year == 2020)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.St == st || p.St == Status.Off)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Pay > dec && p.Pay < 100)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Active && !p.Active)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Score > 1 && p.Big > 2 && p.B > 3 && p.C > 'a')); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.G == Guid.Empty)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Name == null || p.Name == "" || p.Name.Length > 0)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Kids.Any(k => k.Id == p.Id))); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Tags.Length > 1 && p.Tags[0] == "a")); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.OrderBy(p => p.Name).ThenByDescending(p => p.Id)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<object>>>(() => q.Select(p => new { p.Id, Name = p.Name.ToUpper() })); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Dto>>>(() => q.Select(p => new Dto { Id = p.Id, Name = p.Name, Items = new List<int> { 1 } })); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Select(p => new Person(p.Id))); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<int>>>(() => q.Select(p => p.Id + 1)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<long>>>(() => q.Select(p => p.Id + p.Big)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<double>>>(() => q.Select(p => p.Id / 2.0)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<int>>>(() => q.Select(p => p.Age ?? 0)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<int?>>>(() => q.Select(p => p.Age + 1)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<int?>>>(() => q.Select(p => (int?)p.Id)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<string>>>(() => q.Select(p => p.Id > 3 ? p.Name : "n")); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<string>>>(() => q.Select(p => p.Name + "-" + p.Id)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<string>>>(() => q.Select(p => $"{p.Name}:{p.Id}")); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<string>>>(() => q.Select(p => p.Id.ToString() + p.St)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<object>>>(() => q.Select(p => (object)p.St)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<int>>>(() => q.Select(p => (int)p.St)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<int>>>(() => q.Select(p => (int)p.Score)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Status>>>(() => q.Select(p => (Status)p.Id)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IGrouping<int, Person>, int>>(g => g.Count()); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<IGrouping<string, Person>>>>(() => q.GroupBy(p => p.Name)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<int>>>(() => q.Select(p => p.Kids.Count)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<int>>>(() => q.Select(p => p.Kids.Sum(k => k.Id))); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<bool>>>(() => q.Select(p => p is Person)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Name.Substring(1, 2) == "ab" && p.Name.IndexOf('a') >= 0)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => string.IsNullOrEmpty(p.Name))); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => Math.Abs(p.Id) > 1 && Math.Max(p.Id, 3) == 3)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Born.AddDays(1) > DateTime.Now)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Born == default(DateTime) || p.G == default)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Id % 2 == 0 && (p.Id & 1) == 0 && (p.Id | 1) > 0)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Id == (min + 1) * 2)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Id > 1L)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => p.Score == 1)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Where(p => (long)p.Id == p.Big)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<IQueryable<Person>>>(() => q.Take(5).Skip(min)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Person, Func<int, int>>>(p => x => x + p.Id); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Person, Expression<Func<int, bool>>>>(p => x => x == p.Id); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Person, bool>>(p => new[] { 1, 2, 3 }.Any(x => x == p.Id)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Person, int[]>>(p => new int[] { p.Id, 2 }); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Person, List<int>>>(p => new List<int>(new[] { p.Id })); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Person, Dictionary<string, int>>>(p => new Dictionary<string, int> { { "a", p.Id } }); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Person, Tuple<int, string>>>(p => new Tuple<int, string>(p.Id, p.Name)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+    try { Show<Func<Person, KeyValuePair<int, string>>>(p => new KeyValuePair<int, string>(p.Id, p.Name)); } catch (Exception ex) { Console.WriteLine("EX " + ex.GetType().Name + ": " + ex.Message); }
+  }
+}
+"##,
+        r##"() => value(P+<>c__DisplayClass1_0).q.Where(p => ((p.Id > value(P+<>c__DisplayClass1_0).min) AndAlso p.Name.StartsWith(value(P+<>c__DisplayClass1_0).nm)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        AndAlso Boolean lifted=False/False
+          GreaterThan Boolean lifted=False/False
+            MemberAccess Int32 member=Person.Id
+              Parameter Person name=p
+            MemberAccess Int32 member=<>c__DisplayClass1_0.min
+              Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+          Call Boolean method=String.StartsWith(String)
+            MemberAccess String member=Person.Name
+              Parameter Person name=p
+            MemberAccess String member=<>c__DisplayClass1_0.nm
+              Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+() => value(P+<>c__DisplayClass1_0).q.Where(p => value(P+<>c__DisplayClass1_0).ids.Contains(p.Id))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Call Boolean method=List`1.Contains(Int32)
+          MemberAccess List`1 member=<>c__DisplayClass1_0.ids
+            Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+          MemberAccess Int32 member=Person.Id
+            Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Where(p => op_Implicit(value(P+<>c__DisplayClass1_0).arr).Contains(p.Id))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Call Boolean method=MemoryExtensions.Contains(ReadOnlySpan`1,Int32)
+          <null>
+          Call ReadOnlySpan`1 method=ReadOnlySpan`1.op_Implicit(Int32[])
+            <null>
+            MemberAccess Int32[] member=<>c__DisplayClass1_0.arr
+              Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+          MemberAccess Int32 member=Person.Id
+            Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Where(p => ((p.Age > Convert(3, Nullable`1)) AndAlso (p.Age != null)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        AndAlso Boolean lifted=False/False
+          GreaterThan Boolean lifted=True/False
+            MemberAccess Nullable`1 member=Person.Age
+              Parameter Person name=p
+            Convert Nullable`1 lifted=True/True
+              Constant Int32 value=3:Int32
+          NotEqual Boolean lifted=True/False
+            MemberAccess Nullable`1 member=Person.Age
+              Parameter Person name=p
+            Constant Nullable`1 value=null
+() => value(P+<>c__DisplayClass1_0).q.Where(p => (p.Age == value(P+<>c__DisplayClass1_0).nn))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Equal Boolean lifted=True/False
+          MemberAccess Nullable`1 member=Person.Age
+            Parameter Person name=p
+          MemberAccess Nullable`1 member=<>c__DisplayClass1_0.nn
+            Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+() => value(P+<>c__DisplayClass1_0).q.Where(p => (p.Age.HasValue AndAlso (p.Age.Value > 3)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        AndAlso Boolean lifted=False/False
+          MemberAccess Boolean member=Nullable`1.HasValue
+            MemberAccess Nullable`1 member=Person.Age
+              Parameter Person name=p
+          GreaterThan Boolean lifted=False/False
+            MemberAccess Int32 member=Nullable`1.Value
+              MemberAccess Nullable`1 member=Person.Age
+                Parameter Person name=p
+            Constant Int32 value=3:Int32
+() => value(P+<>c__DisplayClass1_0).q.Where(p => ((p.Born > value(P+<>c__DisplayClass1_0).d0) AndAlso (p.Born.Year == 2020)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        AndAlso Boolean lifted=False/False
+          GreaterThan Boolean method=DateTime.op_GreaterThan(DateTime,DateTime) lifted=False/False
+            MemberAccess DateTime member=Person.Born
+              Parameter Person name=p
+            MemberAccess DateTime member=<>c__DisplayClass1_0.d0
+              Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+          Equal Boolean lifted=False/False
+            MemberAccess Int32 member=DateTime.Year
+              MemberAccess DateTime member=Person.Born
+                Parameter Person name=p
+            Constant Int32 value=2020:Int32
+() => value(P+<>c__DisplayClass1_0).q.Where(p => ((Convert(p.St, Int32) == Convert(value(P+<>c__DisplayClass1_0).st, Int32)) OrElse (Convert(p.St, Int32) == 0)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        OrElse Boolean lifted=False/False
+          Equal Boolean lifted=False/False
+            Convert Int32 lifted=False/False
+              MemberAccess Status member=Person.St
+                Parameter Person name=p
+            Convert Int32 lifted=False/False
+              MemberAccess Status member=<>c__DisplayClass1_0.st
+                Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+          Equal Boolean lifted=False/False
+            Convert Int32 lifted=False/False
+              MemberAccess Status member=Person.St
+                Parameter Person name=p
+            Constant Int32 value=0:Int32
+() => value(P+<>c__DisplayClass1_0).q.Where(p => ((p.Pay > value(P+<>c__DisplayClass1_0).dec) AndAlso (p.Pay < 100)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        AndAlso Boolean lifted=False/False
+          GreaterThan Boolean method=Decimal.op_GreaterThan(Decimal,Decimal) lifted=False/False
+            MemberAccess Decimal member=Person.Pay
+              Parameter Person name=p
+            MemberAccess Decimal member=<>c__DisplayClass1_0.dec
+              Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+          LessThan Boolean method=Decimal.op_LessThan(Decimal,Decimal) lifted=False/False
+            MemberAccess Decimal member=Person.Pay
+              Parameter Person name=p
+            Constant Decimal value=100:Decimal
+() => value(P+<>c__DisplayClass1_0).q.Where(p => (p.Active AndAlso Not(p.Active)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        AndAlso Boolean lifted=False/False
+          MemberAccess Boolean member=Person.Active
+            Parameter Person name=p
+          Not Boolean lifted=False/False
+            MemberAccess Boolean member=Person.Active
+              Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Where(p => ((((p.Score > 1) AndAlso (p.Big > 2)) AndAlso (Convert(p.B, Int32) > 3)) AndAlso (Convert(p.C, Int32) > 97)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        AndAlso Boolean lifted=False/False
+          AndAlso Boolean lifted=False/False
+            AndAlso Boolean lifted=False/False
+              GreaterThan Boolean lifted=False/False
+                MemberAccess Double member=Person.Score
+                  Parameter Person name=p
+                Constant Double value=1:Double
+              GreaterThan Boolean lifted=False/False
+                MemberAccess Int64 member=Person.Big
+                  Parameter Person name=p
+                Constant Int64 value=2:Int64
+            GreaterThan Boolean lifted=False/False
+              Convert Int32 lifted=False/False
+                MemberAccess Byte member=Person.B
+                  Parameter Person name=p
+              Constant Int32 value=3:Int32
+          GreaterThan Boolean lifted=False/False
+            Convert Int32 lifted=False/False
+              MemberAccess Char member=Person.C
+                Parameter Person name=p
+            Constant Int32 value=97:Int32
+() => value(P+<>c__DisplayClass1_0).q.Where(p => (p.G == Guid.Empty))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Equal Boolean method=Guid.op_Equality(Guid,Guid) lifted=False/False
+          MemberAccess Guid member=Person.G
+            Parameter Person name=p
+          MemberAccess Guid member=Guid.Empty
+            <null>
+() => value(P+<>c__DisplayClass1_0).q.Where(p => (((p.Name == null) OrElse (p.Name == "")) OrElse (p.Name.Length > 0)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        OrElse Boolean lifted=False/False
+          OrElse Boolean lifted=False/False
+            Equal Boolean method=String.op_Equality(String,String) lifted=False/False
+              MemberAccess String member=Person.Name
+                Parameter Person name=p
+              Constant String value=null
+            Equal Boolean method=String.op_Equality(String,String) lifted=False/False
+              MemberAccess String member=Person.Name
+                Parameter Person name=p
+              Constant String value=:String
+          GreaterThan Boolean lifted=False/False
+            MemberAccess Int32 member=String.Length
+              MemberAccess String member=Person.Name
+                Parameter Person name=p
+            Constant Int32 value=0:Int32
+() => value(P+<>c__DisplayClass1_0).q.Where(p => p.Kids.Any(k => (k.Id == p.Id)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Call Boolean method=Enumerable.Any(IEnumerable`1,Func`2)
+          <null>
+          MemberAccess List`1 member=Person.Kids
+            Parameter Person name=p
+          Lambda Func`2
+            Parameter Person name=k
+            Equal Boolean lifted=False/False
+              MemberAccess Int32 member=Person.Id
+                Parameter Person name=k
+              MemberAccess Int32 member=Person.Id
+                Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Where(p => ((ArrayLength(p.Tags) > 1) AndAlso (p.Tags[0] == "a")))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        AndAlso Boolean lifted=False/False
+          GreaterThan Boolean lifted=False/False
+            ArrayLength Int32 lifted=False/False
+              MemberAccess String[] member=Person.Tags
+                Parameter Person name=p
+            Constant Int32 value=1:Int32
+          Equal Boolean method=String.op_Equality(String,String) lifted=False/False
+            ArrayIndex String lifted=False/False
+              MemberAccess String[] member=Person.Tags
+                Parameter Person name=p
+              Constant Int32 value=0:Int32
+            Constant String value=a:String
+() => value(P+<>c__DisplayClass1_0).q.OrderBy(p => p.Name).ThenByDescending(p => p.Id)
+Lambda Func`1
+  Call IOrderedQueryable`1 method=Queryable.ThenByDescending(IOrderedQueryable`1,Expression`1)
+    <null>
+    Call IOrderedQueryable`1 method=Queryable.OrderBy(IQueryable`1,Expression`1)
+      <null>
+      MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+        Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+      Quote Expression`1 lifted=False/False
+        Lambda Func`2
+          Parameter Person name=p
+          MemberAccess String member=Person.Name
+            Parameter Person name=p
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        MemberAccess Int32 member=Person.Id
+          Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Select(p => new <>f__AnonymousType0`2(Id = p.Id, Name = p.Name.ToUpper()))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        New <>f__AnonymousType0`2 ctor=<>f__AnonymousType0`2..ctor(Int32,String)
+          MemberAccess Int32 member=Person.Id
+            Parameter Person name=p
+          Call String method=String.ToUpper()
+            MemberAccess String member=Person.Name
+              Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Select(p => new Dto() {Id = p.Id, Name = p.Name, Items = new List`1() {Void Add(Int32)(1)}})
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        MemberInit Dto bind:IdAssignment bind:NameAssignment bind:ItemsAssignment
+          New Dto ctor=Dto..ctor()
+          MemberAccess Int32 member=Person.Id
+            Parameter Person name=p
+          MemberAccess String member=Person.Name
+            Parameter Person name=p
+          ListInit List`1 add:Add
+            New List`1 ctor=List`1..ctor()
+            Constant Int32 value=1:Int32
+() => value(P+<>c__DisplayClass1_0).q.Select(p => new Person(p.Id))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        New Person ctor=Person..ctor(Int32)
+          MemberAccess Int32 member=Person.Id
+            Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Select(p => (p.Id + 1))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Add Int32 lifted=False/False
+          MemberAccess Int32 member=Person.Id
+            Parameter Person name=p
+          Constant Int32 value=1:Int32
+() => value(P+<>c__DisplayClass1_0).q.Select(p => (Convert(p.Id, Int64) + p.Big))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Add Int64 lifted=False/False
+          Convert Int64 lifted=False/False
+            MemberAccess Int32 member=Person.Id
+              Parameter Person name=p
+          MemberAccess Int64 member=Person.Big
+            Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Select(p => (Convert(p.Id, Double) / 2))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Divide Double lifted=False/False
+          Convert Double lifted=False/False
+            MemberAccess Int32 member=Person.Id
+              Parameter Person name=p
+          Constant Double value=2:Double
+() => value(P+<>c__DisplayClass1_0).q.Select(p => (p.Age ?? 0))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Coalesce Int32 lifted=False/False
+          MemberAccess Nullable`1 member=Person.Age
+            Parameter Person name=p
+          Constant Int32 value=0:Int32
+() => value(P+<>c__DisplayClass1_0).q.Select(p => (p.Age + Convert(1, Nullable`1)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Add Nullable`1 lifted=True/True
+          MemberAccess Nullable`1 member=Person.Age
+            Parameter Person name=p
+          Convert Nullable`1 lifted=True/True
+            Constant Int32 value=1:Int32
+() => value(P+<>c__DisplayClass1_0).q.Select(p => Convert(p.Id, Nullable`1))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Convert Nullable`1 lifted=True/True
+          MemberAccess Int32 member=Person.Id
+            Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Select(p => IIF((p.Id > 3), p.Name, "n"))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Conditional String
+          GreaterThan Boolean lifted=False/False
+            MemberAccess Int32 member=Person.Id
+              Parameter Person name=p
+            Constant Int32 value=3:Int32
+          MemberAccess String member=Person.Name
+            Parameter Person name=p
+          Constant String value=n:String
+() => value(P+<>c__DisplayClass1_0).q.Select(p => ((p.Name + "-") + Convert(p.Id, Object)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Add String method=String.Concat(Object,Object) lifted=False/False
+          Add String method=String.Concat(String,String) lifted=False/False
+            MemberAccess String member=Person.Name
+              Parameter Person name=p
+            Constant String value=-:String
+          Convert Object lifted=False/False
+            MemberAccess Int32 member=Person.Id
+              Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Select(p => Format("{0}:{1}", p.Name, Convert(p.Id, Object)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Call String method=String.Format(String,Object,Object)
+          <null>
+          Constant String value={0}:{1}:String
+          MemberAccess String member=Person.Name
+            Parameter Person name=p
+          Convert Object lifted=False/False
+            MemberAccess Int32 member=Person.Id
+              Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Select(p => (p.Id.ToString() + Convert(p.St, Object)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Add String method=String.Concat(Object,Object) lifted=False/False
+          Call String method=Int32.ToString()
+            MemberAccess Int32 member=Person.Id
+              Parameter Person name=p
+          Convert Object lifted=False/False
+            MemberAccess Status member=Person.St
+              Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Select(p => Convert(p.St, Object))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Convert Object lifted=False/False
+          MemberAccess Status member=Person.St
+            Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Select(p => Convert(p.St, Int32))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Convert Int32 lifted=False/False
+          MemberAccess Status member=Person.St
+            Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Select(p => Convert(p.Score, Int32))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Convert Int32 lifted=False/False
+          MemberAccess Double member=Person.Score
+            Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Select(p => Convert(p.Id, Status))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Convert Status lifted=False/False
+          MemberAccess Int32 member=Person.Id
+            Parameter Person name=p
+g => g.Count()
+Lambda Func`2
+  Parameter IGrouping`2 name=g
+  Call Int32 method=Enumerable.Count(IEnumerable`1)
+    <null>
+    Parameter IGrouping`2 name=g
+() => value(P+<>c__DisplayClass1_0).q.GroupBy(p => p.Name)
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.GroupBy(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        MemberAccess String member=Person.Name
+          Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Select(p => p.Kids.Count)
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        MemberAccess Int32 member=List`1.Count
+          MemberAccess List`1 member=Person.Kids
+            Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Select(p => p.Kids.Sum(k => k.Id))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Call Int32 method=Enumerable.Sum(IEnumerable`1,Func`2)
+          <null>
+          MemberAccess List`1 member=Person.Kids
+            Parameter Person name=p
+          Lambda Func`2
+            Parameter Person name=k
+            MemberAccess Int32 member=Person.Id
+              Parameter Person name=k
+() => value(P+<>c__DisplayClass1_0).q.Select(p => (p Is Person))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Select(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        TypeIs Boolean tt=Person
+          Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Where(p => ((p.Name.Substring(1, 2) == "ab") AndAlso (p.Name.IndexOf(a) >= 0)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        AndAlso Boolean lifted=False/False
+          Equal Boolean method=String.op_Equality(String,String) lifted=False/False
+            Call String method=String.Substring(Int32,Int32)
+              MemberAccess String member=Person.Name
+                Parameter Person name=p
+              Constant Int32 value=1:Int32
+              Constant Int32 value=2:Int32
+            Constant String value=ab:String
+          GreaterThanOrEqual Boolean lifted=False/False
+            Call Int32 method=String.IndexOf(Char)
+              MemberAccess String member=Person.Name
+                Parameter Person name=p
+              Constant Char value=a:Char
+            Constant Int32 value=0:Int32
+() => value(P+<>c__DisplayClass1_0).q.Where(p => IsNullOrEmpty(p.Name))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Call Boolean method=String.IsNullOrEmpty(String)
+          <null>
+          MemberAccess String member=Person.Name
+            Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Where(p => ((Abs(p.Id) > 1) AndAlso (Max(p.Id, 3) == 3)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        AndAlso Boolean lifted=False/False
+          GreaterThan Boolean lifted=False/False
+            Call Int32 method=Math.Abs(Int32)
+              <null>
+              MemberAccess Int32 member=Person.Id
+                Parameter Person name=p
+            Constant Int32 value=1:Int32
+          Equal Boolean lifted=False/False
+            Call Int32 method=Math.Max(Int32,Int32)
+              <null>
+              MemberAccess Int32 member=Person.Id
+                Parameter Person name=p
+              Constant Int32 value=3:Int32
+            Constant Int32 value=3:Int32
+() => value(P+<>c__DisplayClass1_0).q.Where(p => (p.Born.AddDays(1) > DateTime.Now))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        GreaterThan Boolean method=DateTime.op_GreaterThan(DateTime,DateTime) lifted=False/False
+          Call DateTime method=DateTime.AddDays(Double)
+            MemberAccess DateTime member=Person.Born
+              Parameter Person name=p
+            Constant Double value=1:Double
+          MemberAccess DateTime member=DateTime.Now
+            <null>
+() => value(P+<>c__DisplayClass1_0).q.Where(p => ((p.Born == 01/01/0001 00:00:00) OrElse (p.G == 00000000-0000-0000-0000-000000000000)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        OrElse Boolean lifted=False/False
+          Equal Boolean method=DateTime.op_Equality(DateTime,DateTime) lifted=False/False
+            MemberAccess DateTime member=Person.Born
+              Parameter Person name=p
+            Constant DateTime value=01/01/0001 00:00:00:DateTime
+          Equal Boolean method=Guid.op_Equality(Guid,Guid) lifted=False/False
+            MemberAccess Guid member=Person.G
+              Parameter Person name=p
+            Constant Guid value=00000000-0000-0000-0000-000000000000:Guid
+() => value(P+<>c__DisplayClass1_0).q.Where(p => ((((p.Id % 2) == 0) AndAlso ((p.Id & 1) == 0)) AndAlso ((p.Id | 1) > 0)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        AndAlso Boolean lifted=False/False
+          AndAlso Boolean lifted=False/False
+            Equal Boolean lifted=False/False
+              Modulo Int32 lifted=False/False
+                MemberAccess Int32 member=Person.Id
+                  Parameter Person name=p
+                Constant Int32 value=2:Int32
+              Constant Int32 value=0:Int32
+            Equal Boolean lifted=False/False
+              And Int32 lifted=False/False
+                MemberAccess Int32 member=Person.Id
+                  Parameter Person name=p
+                Constant Int32 value=1:Int32
+              Constant Int32 value=0:Int32
+          GreaterThan Boolean lifted=False/False
+            Or Int32 lifted=False/False
+              MemberAccess Int32 member=Person.Id
+                Parameter Person name=p
+              Constant Int32 value=1:Int32
+            Constant Int32 value=0:Int32
+() => value(P+<>c__DisplayClass1_0).q.Where(p => (p.Id == ((value(P+<>c__DisplayClass1_0).min + 1) * 2)))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Equal Boolean lifted=False/False
+          MemberAccess Int32 member=Person.Id
+            Parameter Person name=p
+          Multiply Int32 lifted=False/False
+            Add Int32 lifted=False/False
+              MemberAccess Int32 member=<>c__DisplayClass1_0.min
+                Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+              Constant Int32 value=1:Int32
+            Constant Int32 value=2:Int32
+() => value(P+<>c__DisplayClass1_0).q.Where(p => (Convert(p.Id, Int64) > 1))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        GreaterThan Boolean lifted=False/False
+          Convert Int64 lifted=False/False
+            MemberAccess Int32 member=Person.Id
+              Parameter Person name=p
+          Constant Int64 value=1:Int64
+() => value(P+<>c__DisplayClass1_0).q.Where(p => (p.Score == 1))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Equal Boolean lifted=False/False
+          MemberAccess Double member=Person.Score
+            Parameter Person name=p
+          Constant Double value=1:Double
+() => value(P+<>c__DisplayClass1_0).q.Where(p => (Convert(p.Id, Int64) == p.Big))
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Where(IQueryable`1,Expression`1)
+    <null>
+    MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+    Quote Expression`1 lifted=False/False
+      Lambda Func`2
+        Parameter Person name=p
+        Equal Boolean lifted=False/False
+          Convert Int64 lifted=False/False
+            MemberAccess Int32 member=Person.Id
+              Parameter Person name=p
+          MemberAccess Int64 member=Person.Big
+            Parameter Person name=p
+() => value(P+<>c__DisplayClass1_0).q.Take(5).Skip(value(P+<>c__DisplayClass1_0).min)
+Lambda Func`1
+  Call IQueryable`1 method=Queryable.Skip(IQueryable`1,Int32)
+    <null>
+    Call IQueryable`1 method=Queryable.Take(IQueryable`1,Int32)
+      <null>
+      MemberAccess IQueryable`1 member=<>c__DisplayClass1_0.q
+        Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+      Constant Int32 value=5:Int32
+    MemberAccess Int32 member=<>c__DisplayClass1_0.min
+      Constant <>c__DisplayClass1_0 value=P+<>c__DisplayClass1_0:<>c__DisplayClass1_0
+p => x => (x + p.Id)
+Lambda Func`2
+  Parameter Person name=p
+  Lambda Func`2
+    Parameter Int32 name=x
+    Add Int32 lifted=False/False
+      Parameter Int32 name=x
+      MemberAccess Int32 member=Person.Id
+        Parameter Person name=p
+p => x => (x == p.Id)
+Lambda Func`2
+  Parameter Person name=p
+  Quote Expression`1 lifted=False/False
+    Lambda Func`2
+      Parameter Int32 name=x
+      Equal Boolean lifted=False/False
+        Parameter Int32 name=x
+        MemberAccess Int32 member=Person.Id
+          Parameter Person name=p
+p => new [] {1, 2, 3}.Any(x => (x == p.Id))
+Lambda Func`2
+  Parameter Person name=p
+  Call Boolean method=Enumerable.Any(IEnumerable`1,Func`2)
+    <null>
+    NewArrayInit Int32[]
+      Constant Int32 value=1:Int32
+      Constant Int32 value=2:Int32
+      Constant Int32 value=3:Int32
+    Lambda Func`2
+      Parameter Int32 name=x
+      Equal Boolean lifted=False/False
+        Parameter Int32 name=x
+        MemberAccess Int32 member=Person.Id
+          Parameter Person name=p
+p => new [] {p.Id, 2}
+Lambda Func`2
+  Parameter Person name=p
+  NewArrayInit Int32[]
+    MemberAccess Int32 member=Person.Id
+      Parameter Person name=p
+    Constant Int32 value=2:Int32
+p => new List`1(new [] {p.Id})
+Lambda Func`2
+  Parameter Person name=p
+  New List`1 ctor=List`1..ctor(IEnumerable`1)
+    NewArrayInit Int32[]
+      MemberAccess Int32 member=Person.Id
+        Parameter Person name=p
+p => new Dictionary`2() {Void Add(System.String, Int32)("a", p.Id)}
+Lambda Func`2
+  Parameter Person name=p
+  ListInit Dictionary`2 add:Add
+    New Dictionary`2 ctor=Dictionary`2..ctor()
+    Constant String value=a:String
+    MemberAccess Int32 member=Person.Id
+      Parameter Person name=p
+p => new Tuple`2(p.Id, p.Name)
+Lambda Func`2
+  Parameter Person name=p
+  New Tuple`2 ctor=Tuple`2..ctor(Int32,String)
+    MemberAccess Int32 member=Person.Id
+      Parameter Person name=p
+    MemberAccess String member=Person.Name
+      Parameter Person name=p
+p => new KeyValuePair`2(p.Id, p.Name)
+Lambda Func`2
+  Parameter Person name=p
+  New KeyValuePair`2 ctor=KeyValuePair`2..ctor(Int32,String)
+    MemberAccess Int32 member=Person.Id
+      Parameter Person name=p
+    MemberAccess String member=Person.Name
+      Parameter Person name=p
+"##,
+    );
+}

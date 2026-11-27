@@ -4728,19 +4728,23 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             return self.emit_expression_in(expression, used);
         }
         let was = self.checked;
-        let span = expression.span;
-        if let Some((_, checked)) = self
-            .body
-            .checked_regions
-            .iter()
-            .filter(|(region, _)| region.start() <= span.start() && span.end() <= region.end())
-            .min_by_key(|(region, _)| region.length())
-        {
-            self.checked = *checked;
+        if let Some(checked) = self.checked_region_at(expression.span) {
+            self.checked = checked;
         }
         let result = self.emit_expression_in(expression, used);
         self.checked = was;
         result
+    }
+
+    /// Whether the innermost `checked` or `unchecked` region around `span`
+    /// is a `checked` one; `None` where no region holds it.
+    pub(crate) fn checked_region_at(&self, span: TextSpan) -> Option<bool> {
+        self.body
+            .checked_regions
+            .iter()
+            .filter(|(region, _)| region.start() <= span.start() && span.end() <= region.end())
+            .min_by_key(|(region, _)| region.length())
+            .map(|(_, checked)| *checked)
     }
 
     fn emit_expression_in(
@@ -5857,7 +5861,11 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         Ok(true)
     }
 
-    fn emit_constant(&mut self, value: &ConstantValue, ty: &Type) -> Result<(), EmitError> {
+    pub(crate) fn emit_constant(
+        &mut self,
+        value: &ConstantValue,
+        ty: &Type,
+    ) -> Result<(), EmitError> {
         // `const long Mask = 0x1F` holds the literal as written, which is an
         // `int`; what is loaded is a value of the constant's type, or an
         // `and` on it has one side of each width.

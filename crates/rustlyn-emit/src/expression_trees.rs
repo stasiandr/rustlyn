@@ -30,6 +30,10 @@ const EXPRESSION: &str = "System.Linq.Expressions.Expression";
 #[derive(Default)]
 struct Tree {
     parameters: Vec<(LocalId, u16)>,
+    /// Set while the operand of a conversion into a `T?` is written: an
+    /// integer given to a `decimal?` is `Convert(Convert(2, Decimal),
+    /// Nullable)`, not the constant it is as a `decimal`.
+    keep_decimal_conversion: bool,
 }
 
 impl BodyEmitter<'_, '_> {
@@ -173,6 +177,36 @@ impl BodyEmitter<'_, '_> {
 
     /// Leaves the `Expression` describing one node on the stack.
     fn emit_tree_node(&mut self, node: &BoundExpression, tree: &mut Tree) -> Result<(), EmitError> {
+        // The nodes of a tree are not emitted as expressions, so a `checked`
+        // region around one is looked up here: it says `AddChecked`.
+        let was = self.checked;
+        if let Some(checked) = self.checked_region_at(node.span) {
+            self.checked = checked;
+        }
+        let keep_decimal_conversion = std::mem::take(&mut tree.keep_decimal_conversion);
+        let result = self.emit_tree_node_in(node, tree, keep_decimal_conversion);
+        self.checked = was;
+        result
+    }
+
+    fn emit_tree_node_in(
+        &mut self,
+        node: &BoundExpression,
+        tree: &mut Tree,
+        keep_decimal_conversion: bool,
+    ) -> Result<(), EmitError> {
+        if let Some(value) = self.tree_constant(node) {
+            self.emit_constant(&value, &node.ty)?;
+            self.box_if_needed(&node.ty)?;
+            self.push_type(&node.ty)?;
+            return self.constant_factory(true);
+        }
+        if self.is_tree_value(node) {
+            self.emit_expression(node, true)?;
+            self.box_if_needed(&node.ty)?;
+            self.push_type(&node.ty)?;
+            return self.constant_factory(true);
+        }
         match &node.kind {
             BoundExpressionKind::Local(local) => {
                 if let Some((_, slot)) = tree
@@ -439,25 +473,111 @@ impl BodyEmitter<'_, '_> {
                 conversion,
                 written,
             } => {
+                // `null` converted to a type is the constant `null` of that type:
+                // an operator or a method checks what it is given against
+                // its parameter.
+                if matches!(
+                    operand.kind,
+                    BoundExpressionKind::Literal(ConstantValue::Null)
+                ) && matches!(operand.ty, Type::Null)
+                    && !node.ty.is_error()
+                    && !matches!(node.ty, Type::Null)
+                {
+                    return self.emit_tree_null(&node.ty);
+                }
                 // A reference converts to what it already is without a node
                 // of its own, unless the program wrote the cast (Roslyn's
-                // `VisitConversion`): `F(arg)` on an `object` parameter.
-                if matches!(conversion, ConversionKind::Identity)
+                // `VisitConversion`): `F(arg)` on an `object` parameter. A
+                // cast the program wrote is a node of its own, even to the
+                // type the operand already has: `(int)n` is `Convert(n,
+                // Int32)`.
+                let identity =
+                    matches!(conversion, ConversionKind::Identity) || node.ty == operand.ty;
+                if (identity && !*written)
                     || (matches!(conversion, ConversionKind::ImplicitReference) && !*written)
-                    || node.ty == operand.ty
                     || node.ty.is_error()
                 {
                     return self.emit_tree_node(operand, tree);
+                }
+                // An integer constant given to a `decimal` is the constant
+                // `decimal`, as the language folds it.
+                if !keep_decimal_conversion
+                    && self.emitter.special_type_of(&node.ty) == Some(SpecialType::Decimal)
+                    && matches!(
+                        self.emitter.binder.folded(operand),
+                        Some(
+                            ConstantValue::Int32(_)
+                                | ConstantValue::UInt32(_)
+                                | ConstantValue::Int64(_)
+                                | ConstantValue::UInt64(_)
+                                | ConstantValue::Char(_)
+                        )
+                    )
+                    && let Some(value) = self.emitter.binder.folded(operand)
+                {
+                    self.emit_constant(&value, &node.ty)?;
+                    self.box_if_needed(&node.ty)?;
+                    self.push_type(&node.ty)?;
+                    return self.constant_factory(true);
                 }
                 if matches!(conversion, ConversionKind::TupleElements) {
                     return Err(EmitError::new(
                         "a tuple conversion cannot be written in an expression tree yet",
                     ));
                 }
+                let checked_conversion = |this: &Self, target: &Type| {
+                    if this.checked && !this.is_floating(target) {
+                        "ConvertChecked"
+                    } else {
+                        "Convert"
+                    }
+                };
+                // `(long)n` on an `int?` is one lifted node, not the value
+                // taken out and then converted.
+                let operand = match (&operand.kind, conversion) {
+                    (
+                        BoundExpressionKind::Conversion {
+                            operand: inner,
+                            conversion: ConversionKind::NullableUnwrap,
+                            ..
+                        },
+                        ConversionKind::Numeric,
+                    ) => inner,
+                    _ => operand,
+                };
+                tree.keep_decimal_conversion = matches!(conversion, ConversionKind::NullableWrap);
                 self.emit_tree_node(operand, tree)?;
+                tree.keep_decimal_conversion = false;
+                // `int` to `long?` converts the number, and then makes it
+                // a `long?`: two nodes.
+                let numeric_wrap = matches!(conversion, ConversionKind::NullableWrap)
+                    && self
+                        .emitter
+                        .nullable_underlying(&node.ty)
+                        .is_some_and(|inner| inner != operand.ty && !inner.is_error());
+                if numeric_wrap
+                    && let Some(inner) = self.emitter.nullable_underlying(&node.ty)
+                    && self.emitter.binder.converts_implicitly(&operand.ty, &inner)
+                {
+                    self.push_type(&inner)?;
+                    let name = checked_conversion(self, &inner);
+                    self.unary_type_factory(name, "UnaryExpression")?;
+                }
                 self.push_type(&node.ty)?;
-                let name = if self.checked && matches!(conversion, ConversionKind::Numeric) {
-                    "ConvertChecked"
+                // `(int?)n` is a numeric conversion where the program wrote
+                // it, and checked as one.
+                let written_numeric_wrap = matches!(conversion, ConversionKind::NullableWrap)
+                    && *written
+                    && self.emitter.special_type_of(&operand.ty).is_some();
+                let name = if numeric_wrap
+                    || written_numeric_wrap
+                    || matches!(
+                        conversion,
+                        ConversionKind::Numeric
+                            | ConversionKind::NullableLift
+                            | ConversionKind::NullableUnwrap
+                    ) {
+                    checked_conversion(self, &node.ty)
                 } else {
                     "Convert"
                 };
@@ -512,7 +632,7 @@ impl BodyEmitter<'_, '_> {
                     .emitter
                     .property_accessor(*indexer, Some(&receiver.ty), false)?;
                 let declaring = self.declaring_type_of(*indexer, Some(&receiver.ty));
-                self.emit_tree_call(Some(receiver), getter, &declaring, arguments, tree)
+                self.emit_tree_call(Some(receiver), getter, &declaring, arguments, &[], tree)
             }
             BoundExpressionKind::Call {
                 receiver,
@@ -531,17 +651,27 @@ impl BodyEmitter<'_, '_> {
                 // `Expression.Add(l, r, op_Addition)`, `Expression.Convert(x,
                 // T, op_Implicit)`, as a query provider expects to find it.
                 let name = symbols.get(*method).name.clone();
+                // The conversion of an array to a span is a call of the
+                // operator, which is not a conversion a tree knows.
+                let of_span = symbols.get(*method).container.is_some_and(|container| {
+                    matches!(
+                        symbols.qualified_name(container).as_str(),
+                        "System.Span`1" | "System.ReadOnlySpan`1"
+                    )
+                });
                 if is_static
+                    && !of_span
                     && type_arguments.is_empty()
                     && let Some((factory, unary)) = operator_factory(&name, arguments.len())
                 {
                     let receiver_type = receiver.as_ref().map(|receiver| receiver.ty.clone());
                     let token = self.method_token_on(*method, receiver_type.as_ref())?;
                     let declaring = self.declaring_type_of(*method, receiver_type.as_ref());
-                    for argument in arguments {
-                        self.emit_tree_node(argument, tree)?;
+                    let parameters = self.tree_parameter_types(*method, &declaring, &[]);
+                    for (position, argument) in arguments.iter().enumerate() {
+                        self.emit_tree_argument(argument, parameters.get(position), tree)?;
                     }
-                    let converts = factory == "Convert";
+                    let converts = factory.starts_with("Convert");
                     // A comparison's factory also asks whether a lifted
                     // comparison gives `null` (it does not in C#).
                     let compares = matches!(
@@ -600,21 +730,126 @@ impl BodyEmitter<'_, '_> {
                         .call_effect(Instruction::Call(made), parameters.len(), 1);
                     return Ok(());
                 }
+                // `f(x)` on a delegate is `Expression.Invoke(f, x)`.
+                if !is_static
+                    && name == "Invoke"
+                    && let Some(receiver) = receiver
+                    && receiver.ty.symbol().is_some_and(|symbol| {
+                        self.emitter.compilation.symbols().get(symbol).type_kind()
+                            == Some(rustlyn_semantics::TypeKind::Delegate)
+                    })
+                {
+                    let parameters = self.tree_parameter_types(*method, &receiver.ty, &[]);
+                    self.emit_tree_node(receiver, tree)?;
+                    self.emit_tree_arguments(arguments, &parameters, tree)?;
+                    let invocation = self.tree_named("InvocationExpression");
+                    let expression = self.tree_named("Expression");
+                    let factory = self.emitter.framework_member(
+                        EXPRESSION,
+                        "Invoke",
+                        false,
+                        &invocation,
+                        &[expression.clone(), SigType::Array(Box::new(expression))],
+                    );
+                    self.stream.call_effect(Instruction::Call(factory), 2, 1);
+                    return Ok(());
+                }
                 let receiver_type = receiver.as_ref().map(|receiver| receiver.ty.clone());
+                let method = &self.tree_method_on(*method, receiver_type.as_ref());
                 let mut token = self.method_token_on(*method, receiver_type.as_ref())?;
                 if !type_arguments.is_empty() {
                     token = self.emitter.method_instantiation(token, type_arguments)?;
                 }
                 let declaring = self.declaring_type_of(*method, receiver_type.as_ref());
                 let instance = if is_static { None } else { receiver.as_deref() };
-                self.emit_tree_call(instance, token, &declaring, arguments, tree)
+                let parameters = self.tree_parameter_types(*method, &declaring, type_arguments);
+                self.emit_tree_call(instance, token, &declaring, arguments, &parameters, tree)
             }
             BoundExpressionKind::ObjectCreation {
                 constructor,
                 arguments,
                 initializers,
             } => {
+                let anonymous = node.ty.symbol().and_then(|symbol| {
+                    self.emitter
+                        .compilation
+                        .anonymous_names(symbol)
+                        .map(<[String]>::to_vec)
+                });
                 match constructor {
+                    // `new { a.X, Y = 1 }` names the members the arguments
+                    // are of, through their getters, so that a provider can
+                    // tell the projection from a call of a constructor.
+                    Some(constructor) if anonymous.is_some() => {
+                        let names = anonymous.unwrap_or_default();
+                        let token = self.method_token_on(*constructor, Some(&node.ty))?;
+                        self.push_method_info(
+                            token,
+                            &node.ty,
+                            "System.Reflection.ConstructorInfo",
+                        )?;
+                        let parameters = self.tree_parameter_types(*constructor, &node.ty, &[]);
+                        self.emit_tree_arguments(arguments, &parameters, tree)?;
+                        let member_info_type =
+                            self.reflection_named("System.Reflection.MemberInfo");
+                        let element = self
+                            .emitter
+                            .references
+                            .type_ref(&mut self.emitter.metadata, "System.Reflection.MemberInfo");
+                        self.stream.emit(Instruction::LoadInt32(names.len() as i32));
+                        self.stream.emit(Instruction::NewArray(element));
+                        let owner = node.ty.symbol();
+                        for (position, name) in names.iter().enumerate() {
+                            let property = owner.and_then(|owner| {
+                                self.emitter
+                                    .compilation
+                                    .symbols()
+                                    .lookup(owner, name)
+                                    .first()
+                                    .copied()
+                            });
+                            let Some(property) = property else {
+                                return Err(EmitError::new(
+                                    "an anonymous type without a member it was made of",
+                                ));
+                            };
+                            self.stream.emit(Instruction::Dup);
+                            self.stream.emit(Instruction::LoadInt32(position as i32));
+                            let getter =
+                                self.emitter
+                                    .property_accessor(property, Some(&node.ty), false)?;
+                            self.push_method_info(
+                                getter,
+                                &node.ty,
+                                "System.Reflection.MethodInfo",
+                            )?;
+                            self.stream.emit(Instruction::StoreElementRef);
+                        }
+                        let new = self.tree_named("NewExpression");
+                        let expression = self.tree_named("Expression");
+                        let constructor_info =
+                            self.reflection_named("System.Reflection.ConstructorInfo");
+                        let sequence = SigType::Constructed {
+                            value_type: false,
+                            coded: self.emitter.references.type_ref_coded(
+                                &mut self.emitter.metadata,
+                                "System.Collections.Generic.IEnumerable`1",
+                            ),
+                            arguments: vec![expression],
+                        };
+                        let factory = self.emitter.framework_member(
+                            EXPRESSION,
+                            "New",
+                            false,
+                            &new,
+                            &[
+                                constructor_info,
+                                sequence,
+                                SigType::Array(Box::new(member_info_type)),
+                            ],
+                        );
+                        self.stream.call_effect(Instruction::Call(factory), 3, 1);
+                    }
                     Some(constructor) => {
                         let token = self.method_token_on(*constructor, Some(&node.ty))?;
                         self.push_method_info(
@@ -622,7 +857,8 @@ impl BodyEmitter<'_, '_> {
                             &node.ty,
                             "System.Reflection.ConstructorInfo",
                         )?;
-                        self.emit_tree_array(arguments, tree)?;
+                        let parameters = self.tree_parameter_types(*constructor, &node.ty, &[]);
+                        self.emit_tree_arguments(arguments, &parameters, tree)?;
                         let new = self.tree_named("NewExpression");
                         let expression = self.tree_named("Expression");
                         let constructor_info =
@@ -714,16 +950,31 @@ impl BodyEmitter<'_, '_> {
                 self.unary_factory("ArrayLength")
             }
             BoundExpressionKind::Unary { operator, operand } => {
+                // `~e` on an enum is on the integer: `Convert(Not(Convert(e,
+                // Int32)), E)`.
+                if matches!(operator, UnaryOperator::BitwiseNot)
+                    && let Some(target) = self.enum_operation_type(&[operand])
+                {
+                    self.emit_tree_as(operand, &target, tree)?;
+                    self.unary_factory("Not")?;
+                    self.push_type(&node.ty)?;
+                    return self.unary_type_factory("Convert", "UnaryExpression");
+                }
                 self.emit_tree_node(operand, tree)?;
                 match operator {
                     UnaryOperator::Plus => Ok(()),
-                    UnaryOperator::Minus => self.unary_factory(if self.checked {
-                        "NegateChecked"
-                    } else {
-                        "Negate"
-                    }),
-                    UnaryOperator::BitwiseNot => self.unary_factory("OnesComplement"),
-                    UnaryOperator::LogicalNot => self.unary_factory("Not"),
+                    UnaryOperator::Minus => {
+                        self.unary_factory(if self.checked && !self.is_floating(&node.ty) {
+                            "NegateChecked"
+                        } else {
+                            "Negate"
+                        })
+                    }
+                    // `~x` is `Not` on an integer, as `!x` is on a `bool`:
+                    // Roslyn writes no `OnesComplement`.
+                    UnaryOperator::BitwiseNot | UnaryOperator::LogicalNot => {
+                        self.unary_factory("Not")
+                    }
                 }
             }
             BoundExpressionKind::Binary {
@@ -802,6 +1053,35 @@ impl BodyEmitter<'_, '_> {
                 }
                 Ok(())
             }
+            // `M(in x)` and `M(ref x)` on a `ref readonly` parameter pass
+            // the value, which is all a tree holds of the reference.
+            BoundExpressionKind::RefArgument { operand, .. } => self.emit_tree_node(operand, tree),
+            // `x == null` on a struct, which the binder settled as the
+            // constant it is once `x` has been evaluated, is the lifted
+            // comparison Roslyn writes: `Convert(x, T?) == null`.
+            BoundExpressionKind::Sequence(steps)
+                if let [operand, answer] = steps.as_slice()
+                    && let BoundExpressionKind::Literal(ConstantValue::Boolean(unequal)) =
+                        answer.kind
+                    && !operand
+                        .ty
+                        .is_reference_type(self.emitter.compilation.symbols())
+                    && self.emitter.nullable_underlying(&operand.ty).is_none()
+                    && let Some(wrapper) = self
+                        .emitter
+                        .compilation
+                        .type_by_metadata_name("System.Nullable`1") =>
+            {
+                let nullable = Type::Named {
+                    symbol: wrapper,
+                    type_arguments: vec![operand.ty.clone()],
+                };
+                self.emit_tree_node(operand, tree)?;
+                self.push_type(&nullable)?;
+                self.unary_type_factory("Convert", "UnaryExpression")?;
+                self.emit_tree_null(&nullable)?;
+                self.binary_factory(if unequal { "NotEqual" } else { "Equal" })
+            }
             BoundExpressionKind::Sequence(steps) if steps.len() == 1 => {
                 self.emit_tree_node(&steps[0], tree)
             }
@@ -812,6 +1092,40 @@ impl BodyEmitter<'_, '_> {
                 let Some(call) = lifted_operator(steps) else {
                     unreachable!("the shape was just matched");
                 };
+                // `s + n` on an `S` and an `S?` is `Convert(s, S?) + n`: an
+                // operator is lifted over operands that are both nullable.
+                let mut call = call;
+                if let BoundExpressionKind::Call { arguments, .. } = &mut call
+                    && let [left, right] = arguments.as_mut_slice()
+                {
+                    let (left_nullable, right_nullable) = (
+                        self.emitter.nullable_underlying(&left.ty).is_some(),
+                        self.emitter.nullable_underlying(&right.ty).is_some(),
+                    );
+                    if left_nullable != right_nullable
+                        && let Some(wrapper) = self
+                            .emitter
+                            .compilation
+                            .type_by_metadata_name("System.Nullable`1")
+                    {
+                        let plain = if left_nullable { right } else { left };
+                        let nullable = Type::Named {
+                            symbol: wrapper,
+                            type_arguments: vec![plain.ty.clone()],
+                        };
+                        let span = plain.span;
+                        let inner = std::mem::replace(plain, BoundExpression::error(span));
+                        *plain = BoundExpression::new(
+                            BoundExpressionKind::Conversion {
+                                operand: Box::new(inner),
+                                conversion: ConversionKind::NullableWrap,
+                                written: false,
+                            },
+                            nullable,
+                            span,
+                        );
+                    }
+                }
                 let call = BoundExpression::new(call, node.ty.clone(), node.span);
                 self.emit_tree_node(&call, tree)
             }
@@ -819,6 +1133,86 @@ impl BodyEmitter<'_, '_> {
                 "cannot write {} in an expression tree yet",
                 kind_name(other)
             ))),
+        }
+    }
+
+    /// The value a node is, where the language folds it to a constant: a
+    /// tree holds that as `Expression.Constant`, whatever wrote it — `n +
+    /// Math.PI` has the value of `Math.PI` in it, not a field read of a
+    /// class the running program may not have, and `default(int)`, `(long)5`
+    /// and `1 + 2` are `0`, `5` and `3`.
+    fn tree_constant(&self, node: &BoundExpression) -> Option<ConstantValue> {
+        if matches!(
+            node.kind,
+            BoundExpressionKind::Literal(_)
+                | BoundExpressionKind::Local(_)
+                | BoundExpressionKind::Parameter(_)
+        ) {
+            return None;
+        }
+        // `default(int?)` and `default(string)` are the constant `null` of
+        // their type.
+        if matches!(node.kind, BoundExpressionKind::Default(_)) {
+            let symbols = self.emitter.compilation.symbols();
+            if self.emitter.nullable_underlying(&node.ty).is_some()
+                || (!matches!(node.ty, Type::TypeParameter(_))
+                    && node.ty.is_reference_type(symbols))
+            {
+                return Some(ConstantValue::Null);
+            }
+        }
+        let primitive = matches!(
+            self.emitter.special_type_of(&node.ty),
+            Some(
+                SpecialType::Boolean
+                    | SpecialType::Char
+                    | SpecialType::SByte
+                    | SpecialType::Byte
+                    | SpecialType::Int16
+                    | SpecialType::UInt16
+                    | SpecialType::Int32
+                    | SpecialType::UInt32
+                    | SpecialType::Int64
+                    | SpecialType::UInt64
+                    | SpecialType::Single
+                    | SpecialType::Double
+                    | SpecialType::String
+            )
+        );
+        let enumeration = node.ty.symbol().is_some_and(|symbol| {
+            self.emitter.compilation.symbols().get(symbol).type_kind()
+                == Some(rustlyn_semantics::TypeKind::Enum)
+        });
+        if !primitive && !enumeration {
+            return None;
+        }
+        self.emitter.binder.folded(node)
+    }
+
+    /// Whether a node is a value the tree holds as it is although the
+    /// language does not fold it: `default(DateTime)`, which Roslyn writes as
+    /// the constant it is, and the `decimal` a literal such as `1.5m` was
+    /// bound to, made of its parts.
+    fn is_tree_value(&self, node: &BoundExpression) -> bool {
+        match &node.kind {
+            BoundExpressionKind::Default(ty) => {
+                !matches!(ty, Type::TypeParameter(_) | Type::Error)
+                    && self.emitter.nullable_underlying(ty).is_none()
+                    && !ty.is_reference_type(self.emitter.compilation.symbols())
+            }
+            BoundExpressionKind::ObjectCreation {
+                constructor: Some(_),
+                arguments,
+                initializers,
+            } => {
+                initializers.is_empty()
+                    && arguments.len() == 5
+                    && self.emitter.special_type_of(&node.ty) == Some(SpecialType::Decimal)
+                    && arguments
+                        .iter()
+                        .all(|argument| matches!(argument.kind, BoundExpressionKind::Literal(_)))
+            }
+            _ => false,
         }
     }
 
@@ -872,11 +1266,12 @@ impl BodyEmitter<'_, '_> {
         method: Token,
         declaring: &Type,
         arguments: &[BoundExpression],
+        parameters: &[Type],
         tree: &mut Tree,
     ) -> Result<(), EmitError> {
         self.emit_tree_receiver_as(instance, declaring, tree)?;
         self.push_method_info(method, declaring, "System.Reflection.MethodInfo")?;
-        self.emit_tree_array(arguments, tree)?;
+        self.emit_tree_arguments(arguments, parameters, tree)?;
         let call = self.tree_named("MethodCallExpression");
         let expression = self.tree_named("Expression");
         let method_info = self.reflection_named("System.Reflection.MethodInfo");
@@ -918,8 +1313,14 @@ impl BodyEmitter<'_, '_> {
             let object_type = self.object_type()?;
             for side in [left, right] {
                 self.emit_tree_node(side, tree)?;
-                // `Concat(object, object)` takes each side as an object.
-                if !both_strings {
+                // `Concat(object, object)` takes each side as an object: a
+                // value is boxed, which a tree says with a `Convert`, and a
+                // reference (a string among them) needs nothing.
+                if !both_strings
+                    && !side
+                        .ty
+                        .is_reference_type(self.emitter.compilation.symbols())
+                {
                     self.push_type(&object_type)?;
                     self.unary_type_factory("Convert", "UnaryExpression")?;
                 }
@@ -948,10 +1349,72 @@ impl BodyEmitter<'_, '_> {
             self.stream.call_effect(Instruction::Call(factory), 3, 1);
             return Ok(());
         }
+        if self.emit_tree_string_comparison(operator, left, right, tree)? {
+            return Ok(());
+        }
+        if self.emit_tree_enum_binary(operator, left, right, result, tree)? {
+            return Ok(());
+        }
+        // Operands narrower than `int` are `int`s to an operator, which a
+        // tree says with a `Convert`: `c == 'x'` is `Convert(c, Int32) ==
+        // 120`.
+        if !matches!(
+            operator,
+            BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr | BinaryOperator::Coalesce
+        ) && let Some(target) = self.small_integer_operation_type(left, right)
+        {
+            self.emit_tree_as(left, &target, tree)?;
+            if matches!(
+                operator,
+                BinaryOperator::LeftShift
+                    | BinaryOperator::RightShift
+                    | BinaryOperator::UnsignedRightShift
+            ) {
+                self.emit_tree_node(right, tree)?;
+            } else {
+                self.emit_tree_as(right, &target, tree)?;
+            }
+            let name = self.binary_factory_name(operator, &target);
+            return self.binary_factory(name);
+        }
+        // `x == null` on a reference holds the `null` as a constant of the
+        // type of `x`.
+        if matches!(
+            operator,
+            BinaryOperator::Equality | BinaryOperator::Inequality
+        ) {
+            let is_null = |operand: &BoundExpression| {
+                matches!(
+                    operand.kind,
+                    BoundExpressionKind::Literal(ConstantValue::Null)
+                ) && matches!(operand.ty, Type::Null)
+            };
+            for (operand, other) in [(left, right), (right, left)] {
+                if is_null(operand) && !is_null(other) && !other.ty.is_error() {
+                    let other_first = std::ptr::eq(operand, right);
+                    if other_first {
+                        self.emit_tree_node(other, tree)?;
+                        self.emit_tree_null(&other.ty)?;
+                    } else {
+                        self.emit_tree_null(&other.ty)?;
+                        self.emit_tree_node(other, tree)?;
+                    }
+                    let name = self.binary_factory_name(operator, result);
+                    return self.binary_factory(name);
+                }
+            }
+        }
         self.emit_tree_node(left, tree)?;
         self.emit_tree_node(right, tree)?;
-        let checked = self.checked;
-        let name = match operator {
+        let name = self.binary_factory_name(operator, result);
+        self.binary_factory(name)
+    }
+
+    /// The factory of a binary operator: `AddChecked` where the arithmetic
+    /// is on integers inside `checked`, which a `double` is never.
+    fn binary_factory_name(&self, operator: BinaryOperator, result: &Type) -> &'static str {
+        let checked = self.checked && !self.is_floating(result);
+        match operator {
             BinaryOperator::Add if checked => "AddChecked",
             BinaryOperator::Add => "Add",
             BinaryOperator::Subtract if checked => "SubtractChecked",
@@ -974,8 +1437,278 @@ impl BodyEmitter<'_, '_> {
             BinaryOperator::LessThanOrEqual => "LessThanOrEqual",
             BinaryOperator::GreaterThanOrEqual => "GreaterThanOrEqual",
             BinaryOperator::Coalesce => "Coalesce",
+        }
+    }
+
+    /// Whether a type is `float`, `double` or `decimal`, or a nullable of
+    /// one: arithmetic on them never overflows, so `checked` changes no
+    /// node of a tree.
+    fn is_floating(&self, ty: &Type) -> bool {
+        let ty = self
+            .emitter
+            .nullable_underlying(ty)
+            .unwrap_or_else(|| ty.clone());
+        matches!(
+            self.emitter.special_type_of(&ty),
+            Some(SpecialType::Single | SpecialType::Double | SpecialType::Decimal)
+        )
+    }
+
+    /// `Expression.Constant(null, type)`.
+    fn emit_tree_null(&mut self, ty: &Type) -> Result<(), EmitError> {
+        self.stream.emit(Instruction::LoadNull);
+        self.push_type(ty)?;
+        self.constant_factory(true)
+    }
+
+    /// An operator on two `string`s, or on one and `null`, is the
+    /// `op_Equality` or `op_Inequality` that `string` declares, as Roslyn
+    /// writes it, with `null` a constant of type `string`; false where the
+    /// operands are not those.
+    fn emit_tree_string_comparison(
+        &mut self,
+        operator: BinaryOperator,
+        left: &BoundExpression,
+        right: &BoundExpression,
+        tree: &mut Tree,
+    ) -> Result<bool, EmitError> {
+        let (factory, method) = match operator {
+            BinaryOperator::Equality => ("Equal", "op_Equality"),
+            BinaryOperator::Inequality => ("NotEqual", "op_Inequality"),
+            _ => return Ok(false),
         };
-        self.binary_factory(name)
+        let is_null = |operand: &BoundExpression| {
+            matches!(
+                operand.kind,
+                BoundExpressionKind::Literal(ConstantValue::Null)
+            ) && matches!(operand.ty, Type::Null)
+        };
+        let is_string = |emitter: &crate::emitter::Emitter, operand: &BoundExpression| {
+            emitter.special_type_of(&operand.ty) == Some(SpecialType::String)
+        };
+        let both = (is_string(self.emitter, left) || is_null(left))
+            && (is_string(self.emitter, right) || is_null(right));
+        if !both || (is_null(left) && is_null(right)) {
+            return Ok(false);
+        }
+        let Some(string_type) = self
+            .emitter
+            .compilation
+            .special_type(SpecialType::String)
+            .map(Type::named)
+        else {
+            return Ok(false);
+        };
+        for operand in [left, right] {
+            if is_null(operand) {
+                self.emit_tree_null(&string_type)?;
+            } else {
+                self.emit_tree_node(operand, tree)?;
+            }
+        }
+        let string = SigType::Primitive(ElementType::String);
+        let boolean = SigType::Primitive(ElementType::Boolean);
+        let operator_method = self.emitter.framework_member(
+            "System.String",
+            method,
+            false,
+            &boolean,
+            &[string.clone(), string],
+        );
+        self.stream.emit(Instruction::LoadInt32(0));
+        self.push_method_info(
+            operator_method,
+            &string_type,
+            "System.Reflection.MethodInfo",
+        )?;
+        let binary = self.tree_named("BinaryExpression");
+        let expression = self.tree_named("Expression");
+        let method_info = self.reflection_named("System.Reflection.MethodInfo");
+        let made = self.emitter.framework_member(
+            EXPRESSION,
+            factory,
+            false,
+            &binary,
+            &[expression.clone(), expression, boolean, method_info],
+        );
+        self.stream.call_effect(Instruction::Call(made), 4, 1);
+        Ok(true)
+    }
+
+    /// The enum an operand is, and the type its operator works in: a tree
+    /// has no operators on enums, so Roslyn writes `e == E.A` on the
+    /// underlying integers, `Convert(e, Int32) == 1`, and `e | E.A` as
+    /// `Convert(Convert(e, Int32) | 1, E)`. A type narrower than `int` is
+    /// promoted as the language does, and `T?` where an operand is one.
+    fn enum_operation_type(&self, operands: &[&BoundExpression]) -> Option<Type> {
+        let binder = &self.emitter.binder;
+        let mut nullable = false;
+        let mut underlying = None;
+        for operand in operands {
+            // `e == null` on an `E?` is a comparison of the values it holds.
+            if matches!(operand.ty, Type::Null)
+                || matches!(
+                    strip_nullable_wrap(operand).kind,
+                    BoundExpressionKind::Literal(ConstantValue::Null)
+                        | BoundExpressionKind::Default(_)
+                )
+            {
+                return None;
+            }
+            nullable |= self.emitter.nullable_underlying(&operand.ty).is_some();
+            let plain = strip_nullable_wrap(operand);
+            let plain = self
+                .emitter
+                .nullable_underlying(&plain.ty)
+                .unwrap_or_else(|| plain.ty.clone());
+            if underlying.is_none() {
+                underlying = binder.enum_underlying(&plain);
+            }
+        }
+        let underlying = underlying?;
+        let promoted = match self.emitter.special_type_of(&underlying) {
+            Some(
+                SpecialType::SByte
+                | SpecialType::Byte
+                | SpecialType::Int16
+                | SpecialType::UInt16
+                | SpecialType::Char,
+            ) => self
+                .emitter
+                .compilation
+                .special_type(SpecialType::Int32)
+                .map(Type::named)?,
+            _ => underlying,
+        };
+        if !nullable {
+            return Some(promoted);
+        }
+        let nullable = self
+            .emitter
+            .compilation
+            .type_by_metadata_name("System.Nullable`1")?;
+        Some(Type::Named {
+            symbol: nullable,
+            type_arguments: vec![promoted],
+        })
+    }
+
+    /// Whether a type is an enum, or a nullable one.
+    fn is_enum_type(&self, ty: &Type) -> bool {
+        let plain = self
+            .emitter
+            .nullable_underlying(ty)
+            .unwrap_or_else(|| ty.clone());
+        self.emitter.binder.enum_underlying(&plain).is_some()
+    }
+
+    /// `int` (or `int?`) where both operands of an operator are of one type
+    /// narrower than that: `char`, `byte`, `short` and the like.
+    fn small_integer_operation_type(
+        &self,
+        left: &BoundExpression,
+        right: &BoundExpression,
+    ) -> Option<Type> {
+        let small = |ty: &Type| {
+            let plain = self
+                .emitter
+                .nullable_underlying(ty)
+                .unwrap_or_else(|| ty.clone());
+            matches!(
+                self.emitter.special_type_of(&plain),
+                Some(
+                    SpecialType::SByte
+                        | SpecialType::Byte
+                        | SpecialType::Int16
+                        | SpecialType::UInt16
+                        | SpecialType::Char
+                )
+            )
+        };
+        let (left, right) = (strip_nullable_wrap(left), strip_nullable_wrap(right));
+        if !small(&left.ty) && !small(&right.ty) {
+            return None;
+        }
+        let int = self
+            .emitter
+            .compilation
+            .special_type(SpecialType::Int32)
+            .map(Type::named)?;
+        let nullable = self.emitter.nullable_underlying(&left.ty).is_some()
+            || self.emitter.nullable_underlying(&right.ty).is_some();
+        if !nullable {
+            return Some(int);
+        }
+        let wrapper = self
+            .emitter
+            .compilation
+            .type_by_metadata_name("System.Nullable`1")?;
+        Some(Type::Named {
+            symbol: wrapper,
+            type_arguments: vec![int],
+        })
+    }
+
+    /// An operand carried as `target`: a constant as the constant of that
+    /// type, anything else through a `Convert`.
+    fn emit_tree_as(
+        &mut self,
+        operand: &BoundExpression,
+        target: &Type,
+        tree: &mut Tree,
+    ) -> Result<(), EmitError> {
+        let operand = strip_nullable_wrap(operand);
+        if operand.ty == *target {
+            return self.emit_tree_node(operand, tree);
+        }
+        if self.emitter.nullable_underlying(target).is_none()
+            && let Some(value) = self.emitter.binder.folded(operand)
+        {
+            let value = self.emitter.binder.constant_as(value, target);
+            self.emit_constant(&value, target)?;
+            self.box_if_needed(target)?;
+            self.push_type(target)?;
+            return self.constant_factory(true);
+        }
+        self.emit_tree_node(operand, tree)?;
+        self.push_type(target)?;
+        self.unary_type_factory("Convert", "UnaryExpression")
+    }
+
+    /// `l op r` where an operand is an enum, written on the integers; false
+    /// where neither is one.
+    fn emit_tree_enum_binary(
+        &mut self,
+        operator: BinaryOperator,
+        left: &BoundExpression,
+        right: &BoundExpression,
+        result: &Type,
+        tree: &mut Tree,
+    ) -> Result<bool, EmitError> {
+        if matches!(
+            operator,
+            BinaryOperator::LeftShift
+                | BinaryOperator::RightShift
+                | BinaryOperator::UnsignedRightShift
+                | BinaryOperator::LogicalAnd
+                | BinaryOperator::LogicalOr
+                | BinaryOperator::Coalesce
+        ) {
+            return Ok(false);
+        }
+        let Some(target) = self.enum_operation_type(&[left, right]) else {
+            return Ok(false);
+        };
+        self.emit_tree_as(left, &target, tree)?;
+        self.emit_tree_as(right, &target, tree)?;
+        let name = self.binary_factory_name(operator, &target);
+        self.binary_factory(name)?;
+        // `e + 1` is an enum again.
+        if self.is_enum_type(result) {
+            self.push_type(result)?;
+            self.unary_type_factory("Convert", "UnaryExpression")?;
+        }
+        Ok(true)
     }
 
     /// The description of a captured variable: the field of the closure
@@ -1170,6 +1903,138 @@ impl BodyEmitter<'_, '_> {
             &[new, SigType::Array(Box::new(element_type))],
         );
         self.stream.call_effect(Instruction::Call(factory), 2, 1);
+        Ok(())
+    }
+
+    /// The method a call on `receiver` names: where the type of the receiver
+    /// overrides it, the override, as overload resolution finds the member
+    /// of the most derived type — `n.ToString()` on an `int` is
+    /// `Int32.ToString()`, not `Object.ToString()`.
+    fn tree_method_on(&self, method: SymbolId, receiver: Option<&Type>) -> SymbolId {
+        let symbols = self.emitter.compilation.symbols();
+        let detail = symbols.get(method);
+        let (Some(receiver), Some(owner)) = (receiver, detail.container) else {
+            return method;
+        };
+        if !detail
+            .modifiers
+            .contains(rustlyn_semantics::Modifiers::VIRTUAL)
+            && !detail
+                .modifiers
+                .contains(rustlyn_semantics::Modifiers::OVERRIDE)
+            && !detail
+                .modifiers
+                .contains(rustlyn_semantics::Modifiers::ABSTRACT)
+        {
+            return method;
+        }
+        let name = detail.name.clone();
+        let count = detail.as_method().map(|method| method.parameters.len());
+        let mut current = receiver.symbol();
+        while let Some(symbol) = current {
+            if symbol == owner {
+                break;
+            }
+            let found = symbols
+                .lookup(symbol, &name)
+                .iter()
+                .copied()
+                .find(|candidate| {
+                    let candidate = symbols.get(*candidate);
+                    candidate
+                        .modifiers
+                        .contains(rustlyn_semantics::Modifiers::OVERRIDE)
+                        && candidate.as_method().map(|method| method.parameters.len()) == count
+                });
+            if let Some(found) = found {
+                return found;
+            }
+            current = self
+                .emitter
+                .binder
+                .base_class_of(symbol)
+                .and_then(|base| base.symbol());
+        }
+        method
+    }
+
+    /// The types a method takes, as seen through the type it is called on.
+    fn tree_parameter_types(
+        &self,
+        method: SymbolId,
+        declaring: &Type,
+        type_arguments: &[Type],
+    ) -> Vec<Type> {
+        let mut substitution = self.emitter.binder.type_substitution(declaring);
+        let symbols = self.emitter.compilation.symbols();
+        let Some(detail) = symbols.get(method).as_method() else {
+            return Vec::new();
+        };
+        for (parameter, argument) in detail.type_parameters.iter().zip(type_arguments) {
+            substitution.insert(*parameter, argument.clone());
+        }
+        detail
+            .parameters
+            .iter()
+            .map(|parameter| {
+                let ty = self.emitter.type_of(*parameter).substitute(&substitution);
+                // An `in` or `ref readonly` parameter is its type here: the
+                // tree holds the value.
+                match ty {
+                    Type::ByRef(inner) => *inner,
+                    ty => ty,
+                }
+            })
+            .collect()
+    }
+
+    /// One argument of a call: `null` is the constant `null` of the type of
+    /// the parameter it is given to, which a tree checks it against.
+    fn emit_tree_argument(
+        &mut self,
+        argument: &BoundExpression,
+        parameter: Option<&Type>,
+        tree: &mut Tree,
+    ) -> Result<(), EmitError> {
+        let argument = match &argument.kind {
+            BoundExpressionKind::RefArgument { operand, .. } => operand,
+            _ => argument,
+        };
+        if matches!(
+            argument.kind,
+            BoundExpressionKind::Literal(ConstantValue::Null)
+        ) && matches!(argument.ty, Type::Null)
+            && let Some(parameter) = parameter
+            && !matches!(
+                parameter,
+                Type::TypeParameter(_) | Type::Error | Type::Null | Type::ByRef(_)
+            )
+        {
+            return self.emit_tree_null(parameter);
+        }
+        self.emit_tree_node(argument, tree)
+    }
+
+    /// `new Expression[] { ... }` of the descriptions of the arguments of a
+    /// call.
+    fn emit_tree_arguments(
+        &mut self,
+        items: &[BoundExpression],
+        parameters: &[Type],
+        tree: &mut Tree,
+    ) -> Result<(), EmitError> {
+        let element = self
+            .emitter
+            .references
+            .type_ref(&mut self.emitter.metadata, EXPRESSION);
+        self.stream.emit(Instruction::LoadInt32(items.len() as i32));
+        self.stream.emit(Instruction::NewArray(element));
+        for (position, item) in items.iter().enumerate() {
+            self.stream.emit(Instruction::Dup);
+            self.stream.emit(Instruction::LoadInt32(position as i32));
+            self.emit_tree_argument(item, parameters.get(position), tree)?;
+            self.stream.emit(Instruction::StoreElementRef);
+        }
         Ok(())
     }
 
@@ -1414,6 +2279,19 @@ impl BodyEmitter<'_, '_> {
     }
 }
 
+/// What a value carried into a `T?` was, before it was: `E.A` of `e == E.A`
+/// where `e` is an `E?`.
+fn strip_nullable_wrap(expression: &BoundExpression) -> &BoundExpression {
+    match &expression.kind {
+        BoundExpressionKind::Conversion {
+            operand,
+            conversion: ConversionKind::NullableWrap,
+            ..
+        } => strip_nullable_wrap(operand),
+        _ => expression,
+    }
+}
+
 /// The one expression a lambda's body is, where it is one: written after
 /// the arrow, or the only thing a block returns.
 fn tree_body(body: &rustlyn_semantics::BoundStatement) -> Option<BoundExpression> {
@@ -1487,13 +2365,18 @@ fn lifted_operator(steps: &[BoundExpression]) -> Option<BoundExpressionKind> {
 fn operator_factory(name: &str, arity: usize) -> Option<(&'static str, bool)> {
     Some(match (name, arity) {
         ("op_Implicit" | "op_Explicit", 1) => ("Convert", true),
+        ("op_CheckedExplicit", 1) => ("ConvertChecked", true),
         ("op_UnaryNegation", 1) => ("Negate", true),
+        ("op_CheckedUnaryNegation", 1) => ("NegateChecked", true),
         ("op_UnaryPlus", 1) => ("UnaryPlus", true),
         ("op_LogicalNot", 1) => ("Not", true),
         ("op_OnesComplement", 1) => ("OnesComplement", true),
         ("op_Addition", 2) => ("Add", false),
+        ("op_CheckedAddition", 2) => ("AddChecked", false),
         ("op_Subtraction", 2) => ("Subtract", false),
+        ("op_CheckedSubtraction", 2) => ("SubtractChecked", false),
         ("op_Multiply", 2) => ("Multiply", false),
+        ("op_CheckedMultiply", 2) => ("MultiplyChecked", false),
         ("op_Division", 2) => ("Divide", false),
         ("op_Modulus", 2) => ("Modulo", false),
         ("op_Equality", 2) => ("Equal", false),
