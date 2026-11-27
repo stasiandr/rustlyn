@@ -13877,6 +13877,435 @@ class C
     );
 }
 
+/// `lock` on a `System.Threading.Lock` is `using (l.EnterScope())`, in every
+/// place a statement can be: only a lock converted to another type is
+/// entered with `Monitor`. The expression was taken as the object it is and
+/// `Monitor` called, which `IsHeldByCurrentThread` does not see, and a null
+/// lock is a `NullReferenceException` from the call, not an
+/// `ArgumentNullException` from `Monitor`.
+#[test]
+fn lock_on_a_lock_enters_its_scope() {
+    check(
+        "LockScope",
+        r#"
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Collections.Generic;
+class P {
+  static Lock L = new();
+  static async Task A() { lock (L) { Console.WriteLine("a " + L.IsHeldByCurrentThread); } await Task.Yield(); lock (L) { Console.WriteLine("b " + L.IsHeldByCurrentThread); } }
+  static async Task B() { lock (await Get()) { Console.WriteLine("c " + L.IsHeldByCurrentThread); } }
+  static async Task<Lock> Get() { await Task.Yield(); return L; }
+  static IEnumerable<int> It() { yield return 1; lock (L) { Console.WriteLine("d " + L.IsHeldByCurrentThread); } yield return 2; }
+  static int R() { lock (L) { try { lock (L) { Console.WriteLine("f " + L.IsHeldByCurrentThread); return 5; } } finally { Console.WriteLine("fin " + L.IsHeldByCurrentThread); } } }
+  static void Main() {
+    Action a = () => { lock (L) { Console.WriteLine("e " + L.IsHeldByCurrentThread); } };
+    a();
+    A().Wait(); B().Wait();
+    foreach (var x in It()) Console.WriteLine(x);
+    try { Lock n = null; lock (n) { } } catch (NullReferenceException) { Console.WriteLine("npe"); }
+    Console.WriteLine(R());
+    Console.WriteLine(L.IsHeldByCurrentThread);
+  }
+}
+"#,
+        "e True\na True\nb True\nc True\n1\nd True\n2\nnpe\nf True\nfin True\n5\nFalse\n",
+    );
+}
+
+/// Which type is a `Lock` is decided by its name alone, and its own
+/// `EnterScope()` and its scope's `Dispose()` are the ones called, through
+/// the run-time type where they are virtual; a type of another name, or the
+/// lock as an `object`, is `Monitor`'s.
+#[test]
+fn lock_goes_by_the_name_and_the_members_the_type_declares() {
+    check(
+        "LockScopeMembers",
+        r#"
+using System;
+class Program
+{
+    static void Main()
+    {
+        System.Threading.Lock l = new System.Threading.LockDerived();
+        lock (l) { Console.Write("L"); }
+        try { lock ((System.Threading.Lock)null) { Console.Write("never"); } }
+        catch (NullReferenceException) { Console.Write(" null"); }
+        object o = l;
+        lock (o) { Console.Write(" monitor"); }
+        Console.WriteLine();
+    }
+}
+
+namespace System.Threading
+{
+    public class Lock
+    {
+        public virtual Scope EnterScope()
+        {
+            Console.Write("E");
+            return new();
+        }
+
+        public EnterScopeAlso EnterScope(int x) => default;
+        public struct EnterScopeAlso { }
+
+        public ref struct Scope
+        {
+            public void Dispose() => Console.Write("D");
+            public void Dispose(int x) => Console.Write("X");
+        }
+    }
+
+    public class LockDerived : Lock
+    {
+        public override Scope EnterScope()
+        {
+            Console.Write("O");
+            return new();
+        }
+    }
+}
+"#,
+        "OLD null monitor\n",
+    );
+    check(
+        "LockScopeInterface",
+        r#"
+using System;
+class Program
+{
+    static void Main()
+    {
+        System.Threading.Lock l = new System.Threading.MyLock();
+        lock (l) { Console.Write("L"); }
+        Console.WriteLine();
+    }
+}
+
+namespace System.Threading
+{
+    public interface Lock
+    {
+        Scope EnterScope();
+
+        public ref struct Scope
+        {
+            public void Dispose() => Console.Write("D");
+        }
+    }
+
+    public class MyLock : Lock
+    {
+        public Lock.Scope EnterScope()
+        {
+            Console.Write("E");
+            return new();
+        }
+    }
+}
+"#,
+        "ELD\n",
+    );
+}
+
+/// `Dispose` of an iterator ends the walk whatever state it was in: the
+/// locals it holds are let go, it hands itself out to the next
+/// `GetEnumerator` again, and a `try` that yields faults into the same when
+/// an exception leaves `MoveNext`; the locals of a block are cleared where
+/// the block ends, those of the body's own block by `Dispose`, and a
+/// `T : unmanaged` is never cleared. An `async` iterator names its hoisted
+/// locals as an iterator does, keeps them private, and clears them where
+/// its blocks end and the walk finishes. It was left holding them, and
+/// `GetEnumerator` after a `Dispose` gave a new object.
+#[test]
+fn an_iterator_that_is_disposed_is_finished_and_lets_go_of_its_locals() {
+    let optimized = rustlyn_semantics::CompilationOptions {
+        optimize: true,
+        ..Default::default()
+    };
+    check_with_options(
+        "IteratorDisposeCleanup",
+        rustlyn_syntax::LanguageVersion::CSharp11,
+        optimized,
+        r#"
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using System.Threading.Tasks;
+
+class C
+{
+    static IEnumerable<string> Words()
+    {
+        string s = "root";
+        yield return s;
+        {
+            string nested = "nested";
+            yield return nested;
+        }
+        yield return s;
+    }
+
+    static IEnumerable<int> Guarded()
+    {
+        try
+        {
+            yield return 1;
+            throw new Exception("boom");
+        }
+        finally
+        {
+            Console.Write("[finally]");
+        }
+    }
+
+    static IEnumerable<int> Plain()
+    {
+        yield return 1;
+        yield return 2;
+    }
+
+    static IEnumerable<int> Unmanaged<T>(T t) where T : unmanaged
+    {
+        {
+            T local = t;
+            yield return 1;
+            Console.Write(local);
+        }
+        yield return 2;
+    }
+
+    static async System.Collections.Generic.IAsyncEnumerable<int> Slow()
+    {
+        string kept = "kept";
+        await Task.Yield();
+        {
+            string inner = "inner";
+            yield return 1;
+            Console.Write(inner);
+        }
+        yield return 2;
+        Console.Write(kept);
+    }
+
+    static string Field(object machine, string name) =>
+        (string)machine.GetType().GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(machine) ?? "null";
+
+    static bool Same(IEnumerable<int> a) => ReferenceEquals(a, a.GetEnumerator());
+
+    static async Task Main()
+    {
+        var words = Words().GetEnumerator();
+        words.MoveNext();
+        words.MoveNext();
+        Console.WriteLine(Field(words, "<nested>5__3") + " " + Field(words, "<s>5__2"));
+        words.MoveNext();
+        Console.WriteLine(Field(words, "<nested>5__3") + " " + Field(words, "<s>5__2"));
+        words.MoveNext();
+        Console.WriteLine(Field(words, "<s>5__2"));
+        words.Dispose();
+        Console.WriteLine(Field(words, "<s>5__2"));
+
+        var plain = Plain();
+        var walk = plain.GetEnumerator();
+        walk.MoveNext();
+        Console.WriteLine(Same(plain));
+        walk.Dispose();
+        Console.WriteLine(walk.MoveNext() + " " + walk.Current + " " + Same(plain));
+
+        var guarded = Guarded();
+        var running = guarded.GetEnumerator();
+        running.MoveNext();
+        try { running.MoveNext(); } catch (Exception) { Console.WriteLine(" threw " + Same(guarded)); }
+        running.Dispose();
+
+        var numbers = Unmanaged(7).GetEnumerator();
+        numbers.MoveNext();
+        numbers.MoveNext();
+        Console.WriteLine(" " + numbers.GetType().GetField("<local>5__2", BindingFlags.NonPublic | BindingFlags.Instance).GetValue(numbers));
+
+        var slow = Slow();
+        var e = slow.GetAsyncEnumerator();
+        await e.MoveNextAsync();
+        Console.WriteLine(Field(e, "<kept>5__2") + " " + Field(e, "<inner>5__3"));
+        await e.MoveNextAsync();
+        Console.WriteLine(Field(e, "<kept>5__2") + " " + Field(e, "<inner>5__3"));
+        await e.MoveNextAsync();
+        await e.MoveNextAsync();
+        Console.WriteLine(Field(e, "<kept>5__2"));
+        await e.DisposeAsync();
+        var half = Slow().GetAsyncEnumerator();
+        await half.MoveNextAsync();
+        await half.DisposeAsync();
+        Console.WriteLine(Field(half, "<kept>5__2") + " " + Field(half, "<inner>5__3"));
+    }
+}
+"#,
+        "null root\nnull root\nroot\nnull\nFalse\nFalse 1 True\n[finally] threw True\n7 7\nkept inner\ninnerkept null\nkeptnull\nnull null\n",
+    );
+}
+
+/// A walk `Dispose` resumed to run a `finally` that throws is left as it
+/// was, and an exception leaving `MoveNext` from a `try` that yields
+/// finishes the walk: the second disposed the machine of what it had just
+/// thrown out of, so that the first kept nothing of what `Dispose` had not
+/// reached.
+#[test]
+fn a_finally_that_throws_in_dispose_leaves_the_iterator_as_it_was() {
+    let optimized = rustlyn_semantics::CompilationOptions {
+        optimize: true,
+        ..Default::default()
+    };
+    check_with_options(
+        "IteratorDisposeThrows",
+        rustlyn_syntax::LanguageVersion::CSharp11,
+        optimized,
+        r#"
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+
+class C
+{
+    public static IEnumerable<int> Produce()
+    {
+        try
+        {
+            string s = "value";
+            yield return 0;
+            s.ToString();
+        }
+        finally
+        {
+            throw new Exception("exception ");
+        }
+    }
+
+    public static IEnumerable<int> Throwing()
+    {
+        try
+        {
+            yield return 1;
+            throw new Exception("boom");
+        }
+        finally
+        {
+            Console.Write("finally ");
+        }
+    }
+
+    static void Main()
+    {
+        // A `finally` that throws while `Dispose` runs it leaves the machine
+        // as it was: its locals are kept and it is not finished.
+        var values = Produce();
+        var e = values.GetEnumerator();
+        e.MoveNext();
+        try { e.Dispose(); } catch (Exception x) { Console.Write(x.Message); }
+        Console.WriteLine(e.GetType().GetField("<s>5__2", BindingFlags.NonPublic | BindingFlags.Instance).GetValue(e)
+            + " " + !ReferenceEquals(values, values.GetEnumerator()));
+
+        // An exception leaving `MoveNext` finishes a walk that was in a `try`.
+        var thrown = Throwing();
+        var walk = thrown.GetEnumerator();
+        walk.MoveNext();
+        try { walk.MoveNext(); } catch (Exception x) { Console.Write(x.Message + " "); }
+        Console.WriteLine(ReferenceEquals(thrown, thrown.GetEnumerator()));
+    }
+}
+"#,
+        "exception value True\nfinally boom True\n",
+    );
+}
+
+/// The locals of nested `catch`es of an `async` method each have a field of
+/// their own: an `async` machine does not give a field back where a scope
+/// ends, since the `catch` bodies it rewrites no longer end where they were
+/// written. `ex` of an outer handler read what `ex2` of the one inside it
+/// held.
+#[test]
+fn nested_catch_locals_of_an_async_method_keep_their_own_fields() {
+    let optimized = rustlyn_semantics::CompilationOptions {
+        optimize: true,
+        ..Default::default()
+    };
+    check_with_options(
+        "AsyncNestedCatchLocals",
+        rustlyn_syntax::LanguageVersion::CSharp11,
+        optimized,
+        r#"
+using System;
+using System.Threading.Tasks;
+using static System.Console;
+
+class C
+{
+    static async Task Main()
+    {
+        foreach (var catchFirst1 in new[] { false, true })
+        {
+            foreach (var catchFirst2 in new[] { false, true })
+            {
+                WriteLine($"--- catchFirst1={catchFirst1}, catchFirst2={catchFirst2} ---");
+                await new C().M1(catchFirst1: catchFirst1, catchFirst2: catchFirst2);
+            }
+        }
+    }
+
+    bool F(string caller, Exception ex, bool result)
+    {
+        WriteLine($"F: {caller} {ex.Message}");
+        return result;
+    }
+
+    async Task M1(bool catchFirst1, bool catchFirst2)
+    {
+        try
+        {
+            throw new Exception("M1-try");
+        }
+        catch (Exception ex) when (F("M1-catch1", ex, catchFirst1))
+        {
+            await M2("M1-catch1", ex);
+        }
+        catch (Exception ex) when (F("M1-catch2", ex, true))
+        {
+            try
+            {
+                throw new Exception("M1-catch2");
+            }
+            catch (Exception ex2) when (F("M1-catch2-catch1", ex2, catchFirst2))
+            {
+                await M2("M1-catch2-catch1-ex", ex);
+                await M2("M1-catch2-catch1-ex2", ex2);
+            }
+            catch (Exception ex2) when (F("M1-catch2-catch2", ex2, true))
+            {
+                try
+                {
+                    throw new Exception("M1-catch2-catch1");
+                }
+                catch
+                {
+                    await M2("M1-catch2-catch2-catch-ex", ex);
+                    await M2("M1-catch2-catch2-catch-ex2", ex2);
+                }
+            }
+        }
+    }
+
+    async Task M2(string caller, Exception ex)
+    {
+        await Task.Yield();
+        WriteLine($"M2: {caller} {ex.Message}");
+    }
+}"#,
+        "--- catchFirst1=False, catchFirst2=False ---\nF: M1-catch1 M1-try\nF: M1-catch2 M1-try\nF: M1-catch2-catch1 M1-catch2\nF: M1-catch2-catch2 M1-catch2\nM2: M1-catch2-catch2-catch-ex M1-try\nM2: M1-catch2-catch2-catch-ex2 M1-catch2\n--- catchFirst1=False, catchFirst2=True ---\nF: M1-catch1 M1-try\nF: M1-catch2 M1-try\nF: M1-catch2-catch1 M1-catch2\nM2: M1-catch2-catch1-ex M1-try\nM2: M1-catch2-catch1-ex2 M1-catch2\n--- catchFirst1=True, catchFirst2=False ---\nF: M1-catch1 M1-try\nM2: M1-catch1 M1-try\n--- catchFirst1=True, catchFirst2=True ---\nF: M1-catch1 M1-try\nM2: M1-catch1 M1-try\n",
+    );
+}
+
 /// A method ending in `__arglist` is called another way than one without,
 /// so the two are no duplicates of each other, and a deconstruction, which
 /// passes no `__arglist`, takes the one without it.
@@ -14360,11 +14789,11 @@ class Program
 }
 
 #[test]
-fn a_state_machine_is_named_by_its_members_place_and_disposed_of_only_inside_a_try() {
+fn a_state_machine_is_named_by_its_members_place_and_ended_by_dispose() {
     // `<M>d__N` counts the members before `M`, and an explicit
     // implementation's name has its dots as `-`; a local function's machine
-    // is `<...>d`. `Dispose` of an iterator stopped outside every `try`
-    // leaves it as it was, as csc 8.0's does.
+    // is `<...>d`. `Dispose` of an iterator ends the walk wherever it
+    // stopped, as csc's does since 4.11: nothing more is given after it.
     check(
         "MachineNames",
         r#"
@@ -14413,8 +14842,8 @@ class Program
          <System-Collections-Generic-IEnumerable<System-Int32>-GetEnumerator>d__4\n\
          <System-Collections-IEnumerable-GetEnumerator>d__5\n\
          <<Main>g__Local|0_0>d\n\
-         0: True 0\n\
-         1: True 1\n\
+         0: False 0\n\
+         1: False 0\n\
          finally 2: False 1\n\
          finally r 3: False 2\n\
          finally r 4: False 3\n",

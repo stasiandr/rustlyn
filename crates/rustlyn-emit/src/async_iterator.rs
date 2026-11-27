@@ -1028,6 +1028,9 @@ impl BodyEmitter<'_, '_> {
         self.stream.emit(Instruction::LoadArgument(0));
         self.stream.emit(Instruction::LoadInt32(-2));
         self.stream.emit(Instruction::StoreField(plan.state));
+        // The locals nested blocks hold are let go too, as a `yield break`
+        // or an abandoned walk leaves their blocks without ending them.
+        self.clear_fields(&plan.finished_cleared, &plan.locals)?;
         // if (combinedTokens != null) { combinedTokens.Dispose(); combinedTokens = null; }
         if let Some(combined) = iterator.combined {
             let kept = self.stream.label();

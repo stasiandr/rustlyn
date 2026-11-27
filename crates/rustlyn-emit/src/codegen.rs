@@ -15,8 +15,8 @@ use rustlyn_semantics::{
     BinaryOperator, BoundBody, BoundCatch, BoundEnumeration, BoundExpression, BoundExpressionKind,
     BoundListPattern, BoundPattern, BoundPatternKind, BoundRecursivePattern, BoundStatement,
     BoundStatementKind, BoundSwitchArm, BoundSwitchLabel, BoundSwitchSection, BoundUsingResource,
-    ConstantValue, ConversionKind, IncrementOperator, LocalId, Modifiers, RefKind, SpecialType,
-    SymbolId, SymbolKind, Symbols, Type, TypeKind, UnaryOperator,
+    ConstantValue, ConversionKind, IncrementOperator, LocalId, LockScope, Modifiers, RefKind,
+    SpecialType, SymbolId, SymbolKind, Symbols, Type, TypeKind, UnaryOperator,
 };
 use rustlyn_syntax::SyntaxKind;
 use rustlyn_text::TextSpan;
@@ -801,6 +801,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 plan: iterator,
                 yielded,
                 done,
+                fault: None,
             });
         }
         // A constructor makes its display class once the object exists:
@@ -1078,7 +1079,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             MethodSource::EventAccessor { event, add } => this.emit_event_accessor(*event, *add)?,
             MethodSource::AsyncMoveNext(_) => {
                 let statements = this.take_statements();
-                for statement in &statements {
+                for statement in root_statements(&statements) {
                     this.emit_statement(statement)?;
                 }
                 this.end_async_move_next()?;
@@ -1093,7 +1094,10 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             MethodSource::IteratorDispose(owner) => this.emit_iterator_dispose(*owner)?,
             MethodSource::IteratorMoveNext(_) => {
                 let statements = this.take_statements();
-                for statement in &statements {
+                // The locals of the body's own block are let go by `Dispose`
+                // and not where the body ends: Roslyn clears a block's locals
+                // below the root only.
+                for statement in root_statements(&statements) {
                     this.emit_statement(statement)?;
                 }
                 this.end_iterator_move_next();
@@ -1908,10 +1912,12 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 value,
                 held,
                 taken,
+                scope,
                 body,
-            } => {
-                self.emit_lock(value, *held, *taken, body)?;
-            }
+            } => match scope {
+                Some(scope) => self.emit_lock_scope(value, *held, scope, body)?,
+                None => self.emit_lock(value, *held, *taken, body)?,
+            },
             BoundStatementKind::Fixed { declarations, body } => {
                 self.emit_fixed(declarations, body)?;
             }
@@ -4388,6 +4394,38 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         });
         self.stream.mark(end);
         Ok(())
+    }
+
+    /// `lock (l) { ... }` on a `System.Threading.Lock`, which C# spells out
+    /// as `using (l.EnterScope()) { ... }`: the scope is a `ref struct`
+    /// whose `Dispose` releases the lock, and `Monitor` is never called, so
+    /// that `l.IsHeldByCurrentThread` says what it should.
+    fn emit_lock_scope(
+        &mut self,
+        value: &BoundExpression,
+        held: LocalId,
+        scope: &LockScope,
+        body: &BoundStatement,
+    ) -> Result<(), EmitError> {
+        let entered = BoundExpression::new(
+            BoundExpressionKind::Call {
+                receiver: Some(Box::new(value.clone())),
+                method: scope.enter,
+                type_arguments: Vec::new(),
+                arguments: Vec::new(),
+                // `callvirt` checks the lock for `null`, as Roslyn's does.
+                virtual_call: true,
+            },
+            scope.ty.clone(),
+            value.span,
+        );
+        let resource = BoundUsingResource {
+            local: held,
+            value: entered,
+            dispose: Some(scope.dispose),
+            awaited: None,
+        };
+        self.emit_using(&[resource], body)
     }
 
     /// `lock (o) { ... }`, which C# spells out as a `try`/`finally` around
@@ -12369,4 +12407,18 @@ fn boxed_type_parameter(side: &BoundExpression) -> Option<&BoundExpression> {
         _ => side,
     };
     matches!(inner.ty, Type::TypeParameter(_)).then_some(inner)
+}
+
+/// The statements of a machine's body without the block that holds them all:
+/// what that block declares is let go where the machine finishes.
+fn root_statements(statements: &[BoundStatement]) -> &[BoundStatement] {
+    match statements {
+        [
+            BoundStatement {
+                kind: BoundStatementKind::Block(inner),
+                ..
+            },
+        ] => inner,
+        all => all,
+    }
 }

@@ -10,10 +10,10 @@ use crate::binder::Diagnostics;
 use crate::bound::{
     BoundCaseLabel, BoundCatch, BoundExpression, BoundExpressionKind, BoundPattern,
     BoundPatternKind, BoundStatement, BoundStatementKind, BoundSwitchLabel, BoundSwitchSection,
-    BoundUsingResource, ConstantValue,
+    BoundUsingResource, ConstantValue, LockScope,
 };
 use crate::corlib::SpecialType;
-use crate::symbol::{Modifiers, SymbolId, SymbolKind};
+use crate::symbol::{Accessibility, MethodKind, Modifiers, SymbolId, SymbolKind, TypeKind};
 use crate::types::Type;
 
 impl BodyBinder<'_> {
@@ -457,7 +457,11 @@ impl BodyBinder<'_> {
                 self.push_scope();
                 let object = self.special(SpecialType::Object);
                 let boolean = self.special(SpecialType::Boolean);
-                let held = self.declare_synthetic_local("lock", object);
+                // A `Lock` is entered for a scope that is disposed, and the
+                // local holds that scope instead of the object.
+                let scope = value.as_ref().and_then(|value| self.lock_scope(&value.ty));
+                let held_type = scope.as_ref().map_or(object, |scope| scope.ty.clone());
+                let held = self.declare_synthetic_local("lock", held_type);
                 let taken = self.declare_synthetic_local("taken", boolean);
                 let body = node
                     .children()
@@ -469,6 +473,7 @@ impl BodyBinder<'_> {
                         value,
                         held,
                         taken,
+                        scope,
                         body: Box::new(body),
                     },
                     _ => BoundStatementKind::Unsupported(node.kind()),
@@ -1421,6 +1426,95 @@ impl BodyBinder<'_> {
             Some(body) => BoundStatementKind::Using { resources, body },
             None => BoundStatementKind::Unsupported(node.kind()),
         }
+    }
+
+    /// What `lock` calls on a value of this type where it is the framework's
+    /// `System.Threading.Lock` (C# 13): `lock (l) { ... }` is `using
+    /// (l.EnterScope()) { ... }` then, and everything else is `Monitor`.
+    ///
+    /// Roslyn goes by the name alone: a `System.Threading.Lock` is the one of
+    /// any assembly, and its own members
+    /// are looked at, not inherited ones: a public, non-static `EnterScope()`
+    /// without type parameters that is the only such member and gives a value
+    /// (not a `ref`), of a public `ref struct Scope` it declares, whose own
+    /// public `Dispose()` that gives nothing is the only such member too. A
+    /// type that has not got them is an error there (CS0656) and is locked
+    /// as an object here.
+    fn lock_scope(&self, ty: &Type) -> Option<LockScope> {
+        let Type::Named {
+            symbol,
+            type_arguments,
+            ..
+        } = ty
+        else {
+            return None;
+        };
+        let symbols = self.binder.compilation().symbols();
+        if !type_arguments.is_empty() || symbols.qualified_name(*symbol) != "System.Threading.Lock"
+        {
+            return None;
+        }
+        // What is locked is an object: a struct of that name is not entered
+        // (and `callvirt` on it would be invalid).
+        if !matches!(
+            symbols.get(*symbol).type_kind(),
+            Some(TypeKind::Class | TypeKind::Interface)
+        ) {
+            return None;
+        }
+        let only_member = |owner: SymbolId, name: &str| {
+            let mut found = symbols
+                .lookup(owner, name)
+                .iter()
+                .copied()
+                .filter(|member| {
+                    let member = symbols.get(*member);
+                    member.kind == SymbolKind::Method
+                        && member.accessibility == Accessibility::Public
+                        && !member.modifiers.contains(Modifiers::STATIC)
+                        && member.as_method().is_some_and(|method| {
+                            method.parameters.is_empty()
+                                && method.arity == 0
+                                && method.method_kind == MethodKind::Ordinary
+                        })
+                });
+            let first = found.next()?;
+            found.next().is_none().then_some(first)
+        };
+        let enter = only_member(*symbol, "EnterScope")?;
+        let returned = self.binder.type_of(enter, &mut Diagnostics::new());
+        let Type::Named {
+            symbol: scope,
+            type_arguments,
+            ..
+        } = &returned
+        else {
+            return None;
+        };
+        let declared = symbols.get(*scope);
+        if !type_arguments.is_empty()
+            || declared.name != "Scope"
+            || declared.container != Some(*symbol)
+            || declared.accessibility != Accessibility::Public
+            || declared.type_kind() != Some(TypeKind::Struct)
+            || !declared
+                .as_named_type()
+                .is_some_and(|detail| detail.ref_like)
+        {
+            return None;
+        }
+        let dispose = only_member(*scope, "Dispose")?;
+        if !matches!(
+            self.binder.type_of(dispose, &mut Diagnostics::new()),
+            Type::Void
+        ) {
+            return None;
+        }
+        Some(LockScope {
+            enter,
+            ty: returned,
+            dispose,
+        })
     }
 
     fn bind_using_resources(&mut self, declaration: &SyntaxNode) -> Vec<BoundUsingResource> {

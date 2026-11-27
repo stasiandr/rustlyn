@@ -45,7 +45,8 @@ pub use bound::{
     BoundListSlice, BoundLocalFunction, BoundPattern, BoundPatternKind, BoundRecursivePattern,
     BoundStatement, BoundStatementKind, BoundSwitchArm, BoundSwitchLabel, BoundSwitchSection,
     BoundSymbol, BoundUsingResource, ConstantValue, ConversionKind, DynamicOperation, DynamicUnary,
-    IncrementOperator, LocalId, LocalSymbol, SpecialConstant, UnaryOperator, composite_clauses,
+    IncrementOperator, LocalId, LocalSymbol, LockScope, SpecialConstant, UnaryOperator,
+    composite_clauses,
 };
 pub use compilation::{Compilation, CompilationDiagnostic, CompilationOptions};
 pub use conversions::BinaryOperator;

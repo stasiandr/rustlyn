@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rustlyn_semantics::{LocalId, Modifiers, SymbolId, Type};
+use rustlyn_semantics::{BoundExpression, BoundExpressionKind, LocalId, Modifiers, SymbolId, Type};
 
 use crate::codegen::BodyEmitter;
 use crate::il::{Instruction, Label};
@@ -44,6 +44,7 @@ pub(crate) struct IteratorPlan {
     /// stopped in, so that their `finally`s run.
     pub(crate) disposing: Token,
     pub(crate) move_next: Token,
+    pub(crate) dispose: Token,
     pub(crate) this: Option<Token>,
     /// Every `yield return`, in the order `MoveNext` reaches them, with the
     /// protected regions around each, and how many regions there are.
@@ -53,8 +54,7 @@ pub(crate) struct IteratorPlan {
     pub(crate) locals: HashMap<LocalId, Token>,
     /// The hoisted locals no closure reads, of types that might hold
     /// references: cleared where their scope ends, so that the machine keeps
-    /// nothing alive it will not read again. (`csc` 8.0's `Dispose` clears
-    /// nothing, and neither does this one.)
+    /// nothing alive it will not read again, and all of them by `Dispose`.
     pub(crate) cleared: Vec<(LocalId, Type)>,
     /// The parameters as the walk reads them, in the order they were
     /// declared.
@@ -190,11 +190,12 @@ impl Emitter<'_> {
         }
         let symbols = self.compilation.symbols();
         match ty {
-            Type::Array { .. }
-            | Type::Dynamic
-            | Type::Null
-            | Type::TypeParameter(_)
-            | Type::Tuple(_) => true,
+            Type::Array { .. } | Type::Dynamic | Type::Null | Type::Tuple(_) => true,
+            // A `T : unmanaged` holds no reference whatever it is.
+            Type::TypeParameter(parameter) => !symbols
+                .get(*parameter)
+                .as_type_parameter()
+                .is_some_and(|detail| detail.unmanaged),
             Type::Named { symbol, .. } => {
                 let declared = symbols.get(*symbol);
                 match declared.type_kind() {
@@ -456,6 +457,7 @@ impl Emitter<'_> {
             &candidates,
             &captured,
             self.compilation.options().optimize,
+            true,
             &taken,
         );
         let mut tokens = Vec::with_capacity(hoisted.fields.len());
@@ -605,7 +607,7 @@ impl Emitter<'_> {
             Vec::new(),
             method_signature(true, &object, &[]),
         );
-        method(
+        let dispose = method(
             &mut methods,
             MethodSource::IteratorDispose(key),
             "Dispose",
@@ -655,6 +657,7 @@ impl Emitter<'_> {
                 thread,
                 disposing,
                 move_next,
+                dispose,
                 this,
                 sites,
                 regions,
@@ -807,6 +810,11 @@ pub(crate) struct IteratorRun {
     pub(crate) yielded: Label,
     /// Where the end of the walk goes: a `false`.
     pub(crate) done: Label,
+    /// Where the `fault` that disposes of the machine begins, where the walk
+    /// goes through a `try` that yields: an exception leaving `MoveNext` then
+    /// finishes the machine, as the `finally`s that ran have left it unfit
+    /// to go on with.
+    pub(crate) fault: Option<Label>,
 }
 
 impl BodyEmitter<'_, '_> {
@@ -822,6 +830,14 @@ impl BodyEmitter<'_, '_> {
         };
         let (state, done) = (run.plan.state, run.done);
         let (sites, regions) = (run.plan.sites.clone(), run.plan.regions);
+        if sites.iter().any(|site| !site.regions.is_empty()) {
+            let try_start = self.stream.label();
+            self.stream.mark(try_start);
+            self.protected += 1;
+            if let Some(run) = &mut self.iterator {
+                run.fault = Some(try_start);
+            }
+        }
         let start = self.stream.label();
         let slot = self.state_slot()?;
         self.stream.emit(Instruction::LoadArgument(0));
@@ -831,7 +847,7 @@ impl BodyEmitter<'_, '_> {
         self.stream.emit(Instruction::BranchIfFalse(start));
         self.begin_machine(state, slot, 1, None, sites, regions);
         self.emit_machine_dispatch(&[])?;
-        self.stream.emit(Instruction::Branch(done));
+        self.emit_jump(done, 0);
         self.stream.mark(start);
         self.set_state(-1);
         Ok(())
@@ -847,6 +863,35 @@ impl BodyEmitter<'_, '_> {
             return;
         };
         self.machine = None;
+        if let Some(try_start) = run.fault {
+            self.protected -= 1;
+            let (try_end, handler_start, handler_end) = (
+                self.stream.label(),
+                self.stream.label(),
+                self.stream.label(),
+            );
+            self.stream.mark(try_end);
+            self.stream.mark_handler(handler_start, 0);
+            // A walk that `Dispose` resumed to run its `finally`s and that
+            // threw from one leaves the machine as it is.
+            let skip = self.stream.label();
+            self.stream.emit(Instruction::LoadArgument(0));
+            self.stream.emit(Instruction::LoadField(run.plan.disposing));
+            self.stream.emit(Instruction::BranchIfTrue(skip));
+            self.stream.emit(Instruction::LoadArgument(0));
+            self.stream
+                .call_effect(Instruction::CallVirtual(run.plan.dispose), 1, 0);
+            self.stream.mark(skip);
+            self.stream.emit(Instruction::EndFinally);
+            self.stream.mark(handler_end);
+            self.stream.region(crate::il::ExceptionRegion {
+                kind: crate::il::HandlerKind::Fault,
+                try_start,
+                try_end,
+                handler_start,
+                handler_end,
+            });
+        }
         self.stream.mark(run.yielded);
         self.stream.emit(Instruction::LoadInt32(1));
         self.stream.emit(Instruction::Ret);
@@ -862,11 +907,11 @@ impl BodyEmitter<'_, '_> {
         let Some(plan) = self.emitter.iterators.get(&key).cloned() else {
             return Err(EmitError::new("a state machine with no plan"));
         };
-        // Only a machine that stopped at a `yield` inside a `try` has
-        // anything to do when disposed of: the `finally`s around it run, and
-        // then it is done. One stopped anywhere else is left as it was, and
-        // a `MoveNext` after carries on (Roslyn 4.11's `Dispose`, which is
-        // empty where no `finally` could be pending).
+        // A machine that stopped at a `yield` inside a `try` is resumed only
+        // to leave it, so that the `finally`s around it run. Whatever state
+        // it was in, it is done then: the locals it holds are let go, and a
+        // `GetEnumerator` after hands out the machine itself again (Roslyn's
+        // `Dispose` since 4.11).
         let protected: Vec<i32> = plan
             .sites
             .iter()
@@ -874,30 +919,58 @@ impl BodyEmitter<'_, '_> {
             .filter(|(_, site)| !site.regions.is_empty())
             .map(|(at, _)| at as i32 + 1)
             .collect();
-        if protected.is_empty() {
-            self.stream.emit(Instruction::Ret);
-            return Ok(());
-        }
-        let nothing = self.stream.label();
-        let resume = self.stream.label();
-        for state in protected {
+        let finish = self.stream.label();
+        if !protected.is_empty() {
+            let resume = self.stream.label();
+            for state in protected {
+                self.stream.emit(Instruction::LoadArgument(0));
+                self.stream.emit(Instruction::LoadField(plan.state));
+                self.stream.emit(Instruction::LoadInt32(state));
+                self.stream.emit(Instruction::CompareEqual);
+                self.stream.emit(Instruction::BranchIfTrue(resume));
+            }
+            self.stream.emit(Instruction::Branch(finish));
+            self.stream.mark(resume);
             self.stream.emit(Instruction::LoadArgument(0));
-            self.stream.emit(Instruction::LoadField(plan.state));
-            self.stream.emit(Instruction::LoadInt32(state));
-            self.stream.emit(Instruction::CompareEqual);
-            self.stream.emit(Instruction::BranchIfTrue(resume));
+            self.stream.emit(Instruction::LoadInt32(1));
+            self.stream.emit(Instruction::StoreField(plan.disposing));
+            self.stream.emit(Instruction::LoadArgument(0));
+            self.stream
+                .call_effect(Instruction::Call(plan.move_next), 1, 1);
+            self.stream.emit(Instruction::Pop);
+            self.stream.emit(Instruction::LoadArgument(0));
+            self.stream.emit(Instruction::LoadInt32(0));
+            self.stream.emit(Instruction::StoreField(plan.disposing));
         }
-        self.stream.emit(Instruction::Branch(nothing));
-        self.stream.mark(resume);
+        self.stream.mark(finish);
+        self.clear_fields(&plan.cleared, &plan.locals)?;
         self.stream.emit(Instruction::LoadArgument(0));
-        self.stream.emit(Instruction::LoadInt32(1));
-        self.stream.emit(Instruction::StoreField(plan.disposing));
-        self.stream.emit(Instruction::LoadArgument(0));
-        self.stream
-            .call_effect(Instruction::Call(plan.move_next), 1, 1);
-        self.stream.emit(Instruction::Pop);
-        self.stream.mark(nothing);
+        self.stream.emit(Instruction::LoadInt32(-2));
+        self.stream.emit(Instruction::StoreField(plan.state));
         self.stream.emit(Instruction::Ret);
+        Ok(())
+    }
+
+    /// Sets the fields of `cleared` to their defaults, in a method of the
+    /// machine that is not the walk itself.
+    pub(crate) fn clear_fields(
+        &mut self,
+        cleared: &[(LocalId, Type)],
+        locals: &HashMap<LocalId, Token>,
+    ) -> Result<(), EmitError> {
+        for (local, ty) in cleared {
+            let Some(field) = locals.get(local) else {
+                continue;
+            };
+            self.stream.emit(Instruction::LoadArgument(0));
+            let default = BoundExpression::new(
+                BoundExpressionKind::Default(ty.clone()),
+                ty.clone(),
+                rustlyn_text::TextSpan::new(0, 0),
+            );
+            self.emit_expression(&default, true)?;
+            self.stream.emit(Instruction::StoreField(*field));
+        }
         Ok(())
     }
 
@@ -1098,8 +1171,10 @@ impl BodyEmitter<'_, '_> {
         &mut self,
         statements: &[rustlyn_semantics::BoundStatement],
     ) -> Result<(), EmitError> {
-        let Some(run) = &self.iterator else {
-            return Ok(());
+        let plan_cleared = match (&self.iterator, &self.async_run) {
+            (Some(run), _) => run.plan.cleared.clone(),
+            (None, Some(run)) => run.plan.cleared.clone(),
+            (None, None) => return Ok(()),
         };
         if !self.stream.end_reachable() {
             return Ok(());
@@ -1107,12 +1182,12 @@ impl BodyEmitter<'_, '_> {
         let cleared: Vec<(LocalId, Type)> = statements
             .iter()
             .filter_map(|statement| match &statement.kind {
-                rustlyn_semantics::BoundStatementKind::LocalDeclaration { local, .. } => run
-                    .plan
-                    .cleared
-                    .iter()
-                    .find(|(cleared, _)| cleared == local)
-                    .cloned(),
+                rustlyn_semantics::BoundStatementKind::LocalDeclaration { local, .. } => {
+                    plan_cleared
+                        .iter()
+                        .find(|(cleared, _)| cleared == local)
+                        .cloned()
+                }
                 _ => None,
             })
             .collect();
@@ -1452,6 +1527,12 @@ impl Emitter<'_> {
                 let move_next =
                     self.references
                         .member_of_spec(&mut self.metadata, spec, "MoveNext", &moves);
+                let dispose = self.references.member_of_spec(
+                    &mut self.metadata,
+                    spec,
+                    "Dispose",
+                    &method_signature(true, &SigType::Primitive(ElementType::Void), &[]),
+                );
                 let state = self.display_field(spec, "<>1__state", &integer)?;
                 let current = self.display_field(spec, "<>2__current", &pending.element)?;
                 let thread = self.display_field(spec, "<>l__initialThreadId", &integer)?;
@@ -1482,7 +1563,7 @@ impl Emitter<'_> {
                     held,
                     order,
                     locals,
-                    (disposing, move_next, initial),
+                    (disposing, (move_next, dispose), initial),
                 ));
             }
             self.display_generics = Vec::new();
@@ -1506,7 +1587,7 @@ impl Emitter<'_> {
                 plan.order = inside.6;
                 plan.locals = inside.7;
                 plan.disposing = inside.8.0;
-                plan.move_next = inside.8.1;
+                (plan.move_next, plan.dispose) = inside.8.1;
                 plan.initial = inside.8.2;
             }
             // A member's machine is its lambdas' display class, and they

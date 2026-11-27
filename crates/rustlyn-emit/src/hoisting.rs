@@ -29,7 +29,7 @@ use rustlyn_semantics::{
     BoundStatementKind, BoundSwitchLabel, LocalId, LocalSymbol, RefKind, TupleElement, Type,
 };
 
-use crate::async_machine::children;
+use crate::async_machine::{children, contains_await, expressions_of};
 
 /// Where an iterator's hoisted locals live.
 #[derive(Default)]
@@ -51,6 +51,7 @@ pub(crate) fn hoist(
     candidates: &[(LocalId, LocalSymbol)],
     captured: &HashSet<LocalId>,
     optimize: bool,
+    reuse: bool,
     taken: &HashSet<String>,
 ) -> HoistedLocals {
     // The locals the machine's own statements use, as opposed to those of
@@ -98,6 +99,7 @@ pub(crate) fn hoist(
         wanted: wanted.clone(),
         declared: declared_by_statements(statements),
         optimize,
+        reuse,
         next: usize::from(optimize),
         free: Vec::new(),
         names: &mut names,
@@ -152,6 +154,10 @@ struct Allocation<'a> {
     /// expression declares (`out var`, a pattern), which belongs to the
     /// scope whose statements first mention it.
     declared: HashSet<LocalId>,
+    /// Whether a scope gives its fields back, in an optimized build. A machine
+    /// that rewrites the scopes of its body — an `async` one moves what a
+    /// `catch` holds — cannot say where one ends.
+    reuse: bool,
     /// Roslyn's `_nextHoistedFieldId`, which starts at one, in an optimized
     /// build; its next hoisted slot, from nought, in a debug one.
     next: usize,
@@ -177,7 +183,7 @@ impl Allocation<'_> {
                 .free
                 .iter()
                 .rposition(|(ty, _)| *ty == key)
-                .filter(|_| self.optimize);
+                .filter(|_| self.optimize && self.reuse);
             let field = match reused {
                 Some(at) => self.free.remove(at).1,
                 None => {
@@ -554,9 +560,11 @@ fn substatements(statement: &BoundStatement) -> Vec<&BoundStatement> {
     }
 }
 
-/// Whether a `yield return` sits anywhere in a statement.
+/// Whether a `yield return` or an `await` sits anywhere in a statement: a
+/// place the machine may stop at.
 fn yields(statement: &BoundStatement) -> bool {
     matches!(statement.kind, BoundStatementKind::YieldReturn(_))
+        || expressions_of(statement).into_iter().any(contains_await)
         || substatements(statement).into_iter().any(yields)
 }
 
@@ -912,6 +920,7 @@ impl<'a> Liveness<'a> {
                 held,
                 taken,
                 body,
+                ..
             } => {
                 self.expression(value, true);
                 self.write(*held);
@@ -1034,6 +1043,10 @@ impl<'a> Liveness<'a> {
                     self.statement(statement);
                 }
                 self.expression(value, sure);
+            }
+            K::Await { operand, .. } => {
+                self.expression(operand, sure);
+                self.suspend();
             }
             _ => {
                 for child in children(expression) {

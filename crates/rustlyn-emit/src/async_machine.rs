@@ -152,6 +152,15 @@ pub(crate) struct AsyncPlan {
     pub(crate) order: Vec<(SymbolId, Token)>,
     pub(crate) outer_order: Vec<(SymbolId, Token)>,
     pub(crate) locals: HashMap<LocalId, Token>,
+    /// The hoisted locals no closure reads, of types that might hold
+    /// references, that the body declares itself: cleared where their block
+    /// ends. A compiler's temporary is not, as the blocks the spiller writes
+    /// are not scopes. `root_cleared` are the ones the body's own block
+    /// declares, cleared where the machine finishes; `finished_cleared` is
+    /// every one, which an `async` iterator lets go of however it finishes.
+    pub(crate) cleared: Vec<(LocalId, Type)>,
+    pub(crate) root_cleared: Vec<(LocalId, Type)>,
+    pub(crate) finished_cleared: Vec<(LocalId, Type)>,
     /// The same fields as the method making the machine names them.
     pub(crate) outer_locals: HashMap<LocalId, Token>,
     /// A lambda's parameters, which are locals of the body and arrive as the
@@ -1000,15 +1009,111 @@ impl Emitter<'_> {
         }
         let held_locals = self.machine_locals(key, &body);
         let parameter_locals = self.machine_parameter_locals(key);
+        // What a closure of the body reads lives here for it: the machine is
+        // its display class. Where the body has closures, which reach the
+        // fields of machines of their own too, every field stays public;
+        // otherwise the locals are private, as Roslyn's are.
+        let closures = !body.lambdas.is_empty() || !body.local_functions.is_empty();
+        let captured: std::collections::HashSet<LocalId> = body
+            .lambdas
+            .iter()
+            .flat_map(|lambda| lambda.captured.iter().copied())
+            .chain(
+                body.local_functions
+                    .iter()
+                    .flat_map(|function| function.captured.iter().copied()),
+            )
+            .collect();
+        // The fields Roslyn gives the locals that outlast a suspension, by
+        // its names; any other local is a field of its own, named after its
+        // place in the body's table.
+        let candidates: Vec<(LocalId, LocalSymbol)> = held_locals
+            .iter()
+            .filter(|(_, local)| local.name != DISPOSE_MODE)
+            .cloned()
+            .collect();
+        let taken: std::collections::HashSet<String> =
+            fields.iter().map(|field| field.name.clone()).collect();
+        let hoisted = crate::hoisting::hoist(
+            &body,
+            &body.statements,
+            &candidates,
+            &captured,
+            self.compilation.options().optimize,
+            false,
+            &taken,
+        );
+        let mut tokens = Vec::with_capacity(hoisted.fields.len());
+        for (at, (name, ty)) in hoisted.fields.iter().enumerate() {
+            let token = field(&mut fields, name.clone(), ty.clone(), None);
+            let shared = hoisted
+                .field_of
+                .iter()
+                .any(|(local, field)| *field == at && captured.contains(local));
+            if !shared
+                && !closures
+                && let Some(plan) = fields.last_mut()
+            {
+                plan.flags = field_attributes::PRIVATE;
+            }
+            tokens.push(token);
+        }
+        let finished_cleared: Vec<(LocalId, Type)> = held_locals
+            .iter()
+            .filter(|(id, local)| {
+                !captured.contains(id)
+                    && local.name != DISPOSE_MODE
+                    && self.might_hold_references(&local.ty, 0)
+            })
+            .map(|(id, local)| (*id, local.ty.clone()))
+            .collect();
+        let cleared: Vec<(LocalId, Type)> = finished_cleared
+            .iter()
+            .filter(|(id, _)| {
+                body.locals
+                    .get(id.0 as usize)
+                    .is_some_and(|local| !local.name.starts_with('<'))
+            })
+            .cloned()
+            .collect();
+        let root: &[BoundStatement] = match &body.statements[..] {
+            [
+                BoundStatement {
+                    kind: BoundStatementKind::Block(inner),
+                    ..
+                },
+            ] => inner,
+            all => all,
+        };
+        let root_cleared: Vec<(LocalId, Type)> = root
+            .iter()
+            .filter_map(|statement| match &statement.kind {
+                BoundStatementKind::LocalDeclaration { local, .. } => {
+                    cleared.iter().find(|(id, _)| id == local).cloned()
+                }
+                _ => None,
+            })
+            .collect();
         let mut locals = HashMap::new();
+        let mut local_fields: Vec<(LocalId, String, Type)> = Vec::new();
         for (id, local) in &held_locals {
-            let token = field(
-                &mut fields,
-                hoisted_name(*id, local),
-                local.ty.clone(),
-                None,
-            );
+            if let Some(at) = hoisted.field_of.get(id) {
+                locals.insert(*id, tokens[*at]);
+                let (name, ty) = &hoisted.fields[*at];
+                local_fields.push((*id, name.clone(), ty.clone()));
+                continue;
+            }
+            let name = hoisted_name(*id, local);
+            let token = field(&mut fields, name.clone(), local.ty.clone(), None);
+            if !captured.contains(id)
+                && !closures
+                && local.name != DISPOSE_MODE
+                && let Some(plan) = fields.last_mut()
+            {
+                plan.flags = field_attributes::PRIVATE;
+            }
             locals.insert(*id, token);
+            local_fields.push((*id, name, local.ty.clone()));
         }
         // One field per awaiter type: two `await`s on a `Task<int>` share
         // `<>u__1`, since only one of them is ever pending.
@@ -1244,6 +1349,9 @@ impl Emitter<'_> {
         self.asyncs.insert(
             key,
             AsyncPlan {
+                cleared,
+                root_cleared,
+                finished_cleared,
                 kind,
                 builder_type: builder_type.clone(),
                 outer_sig,
@@ -1292,10 +1400,7 @@ impl Emitter<'_> {
                 this_sig: instance.then(|| host.hosted.clone()).flatten(),
                 class_level,
                 order: named,
-                locals: held_locals
-                    .iter()
-                    .map(|(id, local)| (*id, hoisted_name(*id, local), local.ty.clone()))
-                    .collect(),
+                locals: local_fields,
                 awaiters: awaiters
                     .iter()
                     .enumerate()
@@ -2100,6 +2205,7 @@ impl BodyEmitter<'_, '_> {
             self.stream.emit(Instruction::LoadArgument(0));
             self.stream.emit(Instruction::LoadInt32(-2));
             self.stream.emit(Instruction::StoreField(plan.state));
+            self.clear_fields(&plan.root_cleared, &plan.locals)?;
             self.stream.emit(Instruction::LoadArgument(0));
             self.stream
                 .emit(Instruction::LoadFieldAddress(plan.builder));
@@ -2135,6 +2241,7 @@ impl BodyEmitter<'_, '_> {
         self.stream.emit(Instruction::LoadArgument(0));
         self.stream.emit(Instruction::LoadInt32(-2));
         self.stream.emit(Instruction::StoreField(plan.state));
+        self.clear_fields(&plan.root_cleared, &plan.locals)?;
         self.stream.emit(Instruction::LoadArgument(0));
         self.stream
             .emit(Instruction::LoadFieldAddress(plan.builder));
@@ -3351,6 +3458,7 @@ impl Spiller<'_> {
                 mut value,
                 held,
                 taken,
+                scope,
                 body,
             } => {
                 self.expression(&mut value, &mut prelude)?;
@@ -3358,6 +3466,7 @@ impl Spiller<'_> {
                     value,
                     held,
                     taken,
+                    scope,
                     body: Box::new(self.nested(*body)?),
                 }
             }
@@ -5337,13 +5446,13 @@ fn contains_spill_sequence(expression: &BoundExpression) -> bool {
             .any(contains_spill_sequence)
 }
 
-fn contains_await(expression: &BoundExpression) -> bool {
+pub(crate) fn contains_await(expression: &BoundExpression) -> bool {
     matches!(expression.kind, BoundExpressionKind::Await { .. })
         || children(expression).into_iter().any(contains_await)
 }
 
 /// Every expression a statement holds directly, in the order they run.
-fn expressions_of(statement: &BoundStatement) -> Vec<&BoundExpression> {
+pub(crate) fn expressions_of(statement: &BoundStatement) -> Vec<&BoundExpression> {
     use BoundStatementKind as S;
     match &statement.kind {
         S::LocalDeclaration { initializer, .. } => initializer.iter().collect(),

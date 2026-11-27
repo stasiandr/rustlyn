@@ -845,6 +845,17 @@ pub struct BoundCaseLabel {
     pub when: Option<BoundExpression>,
 }
 
+/// What a `lock` on a `System.Threading.Lock` calls instead of `Monitor`.
+#[derive(Clone, Debug)]
+pub struct LockScope {
+    /// The lock's `EnterScope`.
+    pub enter: SymbolId,
+    /// The `Lock.Scope` it gives back: what `held` is.
+    pub ty: Type,
+    /// The scope's `Dispose`.
+    pub dispose: SymbolId,
+}
+
 /// One resource a `using` holds and then disposes.
 #[derive(Clone, Debug)]
 pub struct BoundUsingResource {
@@ -1047,10 +1058,15 @@ pub enum BoundStatementKind {
     /// holds what was locked, so the `finally` unlocks the same object even if
     /// the expression would now say something else, and one records whether
     /// the lock was actually taken.
+    ///
+    /// Where the expression is a `System.Threading.Lock` (C# 13) the statement
+    /// is `using (o.EnterScope()) { ... }` instead: `scope` says which members
+    /// that calls, and `held` is the local the scope lives in.
     Lock {
         value: BoundExpression,
         held: LocalId,
         taken: LocalId,
+        scope: Option<LockScope>,
         body: Box<BoundStatement>,
     },
     /// `fixed (T* p = e) body`: each declaration pins what `e` names for as

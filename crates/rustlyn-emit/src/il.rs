@@ -433,6 +433,8 @@ pub(crate) enum HandlerKind {
     Filter(Label),
     /// `finally`, which runs however the region is left.
     Finally,
+    /// `fault`, which runs only where an exception leaves the region.
+    Fault,
 }
 
 /// One protected region and the handler that guards it.
@@ -460,6 +462,7 @@ enum ResolvedKind {
     Catch(Token),
     Filter(u32),
     Finally,
+    Fault,
 }
 
 /// A method body under construction.
@@ -583,7 +586,7 @@ impl InstructionStream {
                 self.enter(filter, 1);
                 self.enter(region.handler_start, 1);
             }
-            HandlerKind::Finally => self.enter(region.handler_start, 0),
+            HandlerKind::Finally | HandlerKind::Fault => self.enter(region.handler_start, 0),
         }
         self.regions.push(region);
     }
@@ -703,6 +706,7 @@ impl InstructionStream {
                             ResolvedKind::Filter(self.target(filter, &offsets))
                         }
                         HandlerKind::Finally => ResolvedKind::Finally,
+                        HandlerKind::Fault => ResolvedKind::Fault,
                     },
                     try_offset,
                     try_length: self.target(region.try_end, &offsets) - try_offset,
@@ -1291,6 +1295,7 @@ pub(crate) fn method_body(
             ResolvedKind::Catch(token) => (0x0000u32, token.0),
             ResolvedKind::Filter(offset) => (0x0001, offset),
             ResolvedKind::Finally => (0x0002, 0),
+            ResolvedKind::Fault => (0x0004, 0),
         };
         body.extend_from_slice(&flags.to_le_bytes());
         body.extend_from_slice(&region.try_offset.to_le_bytes());
