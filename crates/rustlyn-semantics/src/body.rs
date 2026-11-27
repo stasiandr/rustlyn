@@ -102,6 +102,8 @@ pub struct BodyBinder<'a> {
     collection_types: HashMap<TextSpan, Vec<Type>>,
     /// What the elements noted in `collection_types` fold to.
     collection_constants: HashMap<TextSpan, Vec<Option<ConstantValue>>>,
+    /// What kind each of the elements noted in `collection_types` is.
+    collection_kinds: HashMap<TextSpan, Vec<ElementKind>>,
     /// The same with what nested collections suggest, which only inference
     /// reads.
     collection_hints: HashMap<TextSpan, Vec<inference::InferenceArgument>>,
@@ -272,9 +274,21 @@ struct Shape {
     from_function: bool,
 }
 
+/// What an element of a collection expression is, as far as overload
+/// resolution asks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ElementKind {
+    Plain,
+    /// A spread, whose type is that of what it walks.
+    Spread,
+    /// An interpolated string that is no constant, which a handler type
+    /// takes as well as a string (C# 10).
+    Interpolated,
+}
+
 /// An element of a collection expression as overload resolution sees it: its
-/// type, and what it folds to where it is a constant.
-type NotedElement = (Type, Option<ConstantValue>);
+/// type, what it folds to where it is a constant, and what kind it is.
+type NotedElement = (Type, Option<ConstantValue>, ElementKind);
 
 /// What a call says about its arguments beyond their types.
 ///
@@ -516,6 +530,7 @@ impl<'a> BodyBinder<'a> {
             branch_types: HashMap::new(),
             collection_types: HashMap::new(),
             collection_constants: HashMap::new(),
+            collection_kinds: HashMap::new(),
             collection_hints: HashMap::new(),
             in_finally_memo: HashMap::new(),
             typeless_memo: RefCell::new(HashMap::new()),

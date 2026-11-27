@@ -8,11 +8,13 @@ use rustlyn_syntax::{SyntaxKind, SyntaxNode};
 use rustlyn_text::TextSpan;
 
 use super::inference::InferenceArgument;
-use super::{BodyBinder, Resolved, identifier_text, member_parameters};
+use super::{BodyBinder, ElementKind, Resolved, identifier_text, member_parameters};
+use crate::binder::Diagnostics;
 use crate::bound::{
     BoundExpression, BoundExpressionKind, BoundStatement, BoundStatementKind, BoundSymbol,
     ConstantValue, DynamicOperation,
 };
+use crate::conversions::BinaryOperator;
 use crate::corlib::SpecialType;
 use crate::symbol::{Modifiers, SymbolId, SymbolKind, TypeKind};
 use crate::types::Type;
@@ -24,8 +26,9 @@ impl BodyBinder<'_> {
     /// nested collection, a conditional — leaves nothing noted, and the
     /// expression is a candidate for any collection.
     pub(super) fn note_collection_elements(&mut self, node: &SyntaxNode) {
-        if let Some((types, hints, constants)) = self.collection_evidence(node) {
+        if let Some((types, hints, constants, kinds)) = self.collection_evidence(node) {
             self.collection_types.insert(node.span(), types);
+            self.collection_kinds.insert(node.span(), kinds);
             self.collection_constants.insert(node.span(), constants);
             self.collection_hints.insert(node.span(), hints);
         }
@@ -45,6 +48,7 @@ impl BodyBinder<'_> {
         // What each element folds to, for the ones that are constants: `[0,
         // 1]` reaches a `byte[]` though an `int` does not.
         let mut constants = Vec::new();
+        let mut kinds = Vec::new();
         for element in node.children().filter(|child| {
             matches!(
                 child.kind(),
@@ -57,13 +61,14 @@ impl BodyBinder<'_> {
             let evidence = self.element_evidence(&expression)?;
             // A spread gives what walking it gives (§12.8.24).
             if element.kind() == SyntaxKind::SpreadElement {
-                let Evidenced::Typed(spread, _) = evidence else {
+                let Evidenced::Typed(spread, ..) = evidence else {
                     return None;
                 };
                 match self.collection_element(&spread) {
                     Some(element) if !element.is_error() => {
                         types.push(element.clone());
                         constants.push(None);
+                        kinds.push(ElementKind::Spread);
                         hints.push(InferenceArgument::Typed(element));
                     }
                     _ => return None,
@@ -71,9 +76,10 @@ impl BodyBinder<'_> {
                 continue;
             }
             match evidence {
-                Evidenced::Typed(ty, constant) => {
+                Evidenced::Typed(ty, constant, kind) => {
                     types.push(ty.clone());
                     constants.push(constant);
+                    kinds.push(kind);
                     hints.push(if matches!(ty, Type::Null) {
                         InferenceArgument::Untyped
                     } else {
@@ -84,7 +90,7 @@ impl BodyBinder<'_> {
                 Evidenced::Nothing => {}
             }
         }
-        Some((types, hints, constants))
+        Some((types, hints, constants, kinds))
     }
 
     /// What one element says about the element type, if it can be asked
@@ -93,7 +99,7 @@ impl BodyBinder<'_> {
         match expression.kind() {
             SyntaxKind::DefaultLiteralExpression => return Some(Evidenced::Nothing),
             SyntaxKind::CollectionExpression => {
-                let (_, inner, _) = self.collection_evidence(expression)?;
+                let (_, inner, _, _) = self.collection_evidence(expression)?;
                 return Some(Evidenced::Nested(inner));
             }
             SyntaxKind::TupleExpression => {
@@ -121,7 +127,12 @@ impl BodyBinder<'_> {
             return None;
         }
         let constant = self.binder.folded(&bound);
-        Some(Evidenced::Typed(bound.ty, constant))
+        let kind = if constant.is_none() && bound.is_interpolated_string() {
+            ElementKind::Interpolated
+        } else {
+            ElementKind::Plain
+        };
+        Some(Evidenced::Typed(bound.ty, constant, kind))
     }
 
     /// What `{ X = 1, Y = 2 }` or `{ 1, 2 }` does to the object just made.
@@ -614,8 +625,15 @@ impl BodyBinder<'_> {
                 && self.is_collection_initializer_type(target)
                 && let Some(construction) = self.collection_construction(node, target)
             {
+                // A `List<T>` is the one this does by its own rules: its
+                // elements go in converted, and a length every spread knows
+                // sizes it (see `bind_collection_through_add`).
+                let list_element = (Self::collection_arguments(node).is_none()
+                    && self.capacity_constructor(target).is_some())
+                .then(|| self.collection_element(target))
+                .flatten();
                 return self
-                    .bind_collection_through_add(node, target, construction, None)
+                    .bind_collection_through_add(node, target, construction, list_element.as_ref())
                     .unwrap_or_else(|| {
                         BoundExpression::new(
                             BoundExpressionKind::Unsupported(node.kind()),
@@ -789,12 +807,28 @@ impl BodyBinder<'_> {
                 span,
             );
         };
+        // A `List<T>` is made as big as the elements it is given.
+        let (constructor, arguments) = match self.capacity_constructor(target) {
+            Some(with_capacity)
+                if Self::collection_arguments(node).is_none() && !written.is_empty() =>
+            {
+                let count = BoundExpression::new(
+                    BoundExpressionKind::Literal(ConstantValue::Int32(written.len() as i32)),
+                    self.special(SpecialType::Int32),
+                    span,
+                );
+                (with_capacity, vec![count])
+            }
+            _ => (constructor, arguments),
+        };
         let mut initializers = Vec::new();
         for value in &written {
             let bound = self.bind_expression(value);
             let created =
                 BoundExpression::new(BoundExpressionKind::CreatedObject, target.clone(), span);
-            if let Some(call) = self.bind_add_call(target, created, bound, span) {
+            if let Some(call) = self.bind_add_call(target, created, bound, span)
+                && !self.is_conditioned_out(&call)
+            {
                 initializers.push(call);
             }
         }
@@ -960,7 +994,129 @@ impl BodyBinder<'_> {
         let span = node.span();
         let made = self.declare_synthetic_local("collection", target.clone());
         let read = BoundExpression::new(BoundExpressionKind::Local(made), target.clone(), span);
-        let mut steps = vec![BoundExpression::new(
+        // Every element is bound before any is walked, in the order written.
+        let mut parts: Vec<(SyntaxNode, bool, BoundExpression)> = Vec::new();
+        for child in node.children() {
+            let Some(value) = child.children().find(|inner| inner.kind().is_expression()) else {
+                continue;
+            };
+            let bound = self.bind_expression(&value);
+            let spread = child.kind() == SyntaxKind::SpreadElement;
+            parts.push((child, spread, bound));
+        }
+        // `[..xs]` is the list `new List<T>(xs)` makes (Roslyn calls
+        // `ToList`) where `xs` reaches `IEnumerable<T>` by reference, which
+        // copies a collection that knows its size at once.
+        if self.capacity_constructor(target).is_some()
+            && let Some(element) = element
+            && let [(_, true, value)] = &parts[..]
+            && let Some(enumerable) = self
+                .binder
+                .compilation()
+                .type_by_metadata_name("System.Collections.Generic.IEnumerable`1")
+        {
+            let wanted = Type::Named {
+                symbol: enumerable,
+                type_arguments: vec![element.clone()],
+            };
+            let symbols = self.binder.compilation().symbols();
+            if value.ty.is_reference_type(symbols)
+                && !matches!(value.ty, Type::Dynamic)
+                && !self.walks_by_struct_enumerator(&value.ty, element)
+                && self.binder.converts_implicitly(&value.ty, &wanted)
+                && let Some(copying) = self.enumerable_constructor(target, &wanted)
+            {
+                let arguments = vec![self.convert(value.clone(), &wanted)];
+                return Some(BoundExpression::new(
+                    BoundExpressionKind::ObjectCreation {
+                        constructor: Some(copying),
+                        arguments,
+                        initializers: Vec::new(),
+                    },
+                    target.clone(),
+                    span,
+                ));
+            }
+        }
+        let mut steps = Vec::new();
+        let mut constructor = constructor;
+        let mut arguments = arguments;
+        // Where the elements end up in an array or a list, and every spread
+        // can say how many it holds, the elements up to the last spread are
+        // all evaluated first, then the counts are read and the collection
+        // is made at its final size, and only then is anything added or
+        // walked (Roslyn's known length, which is used up to three elements).
+        let last = parts.iter().rposition(|part| part.1);
+        let with_capacity = if element.is_some() && last.is_some_and(|last| last < 3) {
+            self.capacity_constructor(target)
+        } else {
+            None
+        };
+        let mut counted = false;
+        if let (Some(with_capacity), Some(last), Some(element)) = (with_capacity, last, element) {
+            let int = self.special(SpecialType::Int32);
+            let mut held: Vec<BoundExpression> = Vec::new();
+            let mut lengths: Vec<BoundExpression> = Vec::new();
+            let mut countable = true;
+            // The counts are read from what was held, so a spread no one can
+            // count is found before anything is evaluated for nothing.
+            for (_, spread, bound) in parts.iter().take(last + 1) {
+                if *spread && self.spread_count(bound, span).is_none() {
+                    countable = false;
+                }
+            }
+            if countable {
+                for (_, spread, bound) in parts.iter_mut().take(last + 1) {
+                    let value = if *spread {
+                        bound.clone()
+                    } else {
+                        self.convert(bound.clone(), element)
+                    };
+                    let local = self.declare_synthetic_local("element", value.ty.clone());
+                    let held_read = BoundExpression::new(
+                        BoundExpressionKind::Local(local),
+                        value.ty.clone(),
+                        span,
+                    );
+                    steps.push(BoundExpression::new(
+                        BoundExpressionKind::Assignment {
+                            target: Box::new(held_read.clone()),
+                            value: Box::new(value),
+                        },
+                        held_read.ty.clone(),
+                        span,
+                    ));
+                    if *spread && let Some(count) = self.spread_count(&held_read, span) {
+                        lengths.push(count);
+                    }
+                    held.push(held_read.clone());
+                    *bound = held_read;
+                }
+                // What is not a spread is one element apiece, those after the
+                // last spread too.
+                let fixed = parts.iter().filter(|part| !part.1).count();
+                let mut total = BoundExpression::new(
+                    BoundExpressionKind::Literal(ConstantValue::Int32(fixed as i32)),
+                    int.clone(),
+                    span,
+                );
+                for count in lengths {
+                    total = BoundExpression::new(
+                        BoundExpressionKind::Binary {
+                            operator: BinaryOperator::Add,
+                            left: Box::new(total),
+                            right: Box::new(count),
+                        },
+                        int.clone(),
+                        span,
+                    );
+                }
+                constructor = with_capacity;
+                arguments = vec![total];
+                counted = true;
+            }
+        }
+        steps.push(BoundExpression::new(
             BoundExpressionKind::Assignment {
                 target: Box::new(read.clone()),
                 value: Box::new(BoundExpression::new(
@@ -975,13 +1131,9 @@ impl BodyBinder<'_> {
             },
             target.clone(),
             span,
-        )];
-        for child in node.children() {
-            let Some(value) = child.children().find(|inner| inner.kind().is_expression()) else {
-                continue;
-            };
-            let bound = self.bind_expression(&value);
-            if child.kind() == SyntaxKind::SpreadElement {
+        ));
+        for (child, spread, bound) in parts {
+            if spread {
                 let at = child.span();
                 let walk = self.foreach_over(bound, at, |this, item| {
                     let item = match element {
@@ -989,7 +1141,14 @@ impl BodyBinder<'_> {
                         None => item,
                     };
                     let add = this.bind_add_call(target, read.clone(), item, at)?;
-                    Some(BoundStatement::new(BoundStatementKind::Expression(add), at))
+                    // An `Add` marked `[Conditional]` for a symbol that is
+                    // not defined is no call: the walk still happens.
+                    let kind = if this.is_conditioned_out(&add) {
+                        BoundStatementKind::Empty
+                    } else {
+                        BoundStatementKind::Expression(add)
+                    };
+                    Some(BoundStatement::new(kind, at))
                 })?;
                 steps.push(BoundExpression::new(
                     BoundExpressionKind::SpillSequence {
@@ -1004,11 +1163,15 @@ impl BodyBinder<'_> {
                     at,
                 ));
             } else {
+                // What was held is converted already.
                 let bound = match element {
-                    Some(element) => self.convert(bound, element),
-                    None => bound,
+                    Some(element) if !counted => self.convert(bound, element),
+                    _ => bound,
                 };
-                steps.push(self.bind_add_call(target, read.clone(), bound, span)?);
+                let add = self.bind_add_call(target, read.clone(), bound, span)?;
+                if !self.is_conditioned_out(&add) {
+                    steps.push(add);
+                }
             }
         }
         steps.push(read);
@@ -1017,6 +1180,67 @@ impl BodyBinder<'_> {
             target.clone(),
             span,
         ))
+    }
+
+    /// Whether a type is walked by an enumerator that is a struct and it is
+    /// no `ICollection<T>`, which copying through `IEnumerable<T>` would
+    /// box where walking it by hand does not.
+    fn walks_by_struct_enumerator(&self, ty: &Type, element: &Type) -> bool {
+        let Some(symbol) = ty.symbol() else {
+            return false;
+        };
+        let symbols = self.binder.compilation().symbols();
+        let by_struct = self
+            .binder
+            .lookup_member(symbol, "GetEnumerator")
+            .into_iter()
+            .filter(|method| symbols.get(*method).kind == SymbolKind::Method)
+            .any(|method| !self.member_type(method, ty).is_reference_type(symbols));
+        if !by_struct {
+            return false;
+        }
+        let collection = self
+            .binder
+            .compilation()
+            .type_by_metadata_name("System.Collections.Generic.ICollection`1")
+            .map(|symbol| Type::Named {
+                symbol,
+                type_arguments: vec![element.clone()],
+            });
+        !collection.is_some_and(|collection| self.binder.converts_implicitly(ty, &collection))
+    }
+
+    /// How many elements a spread adds, where that is known before walking
+    /// it: an inline array's length is the attribute's, whatever a `Length`
+    /// of its own says; otherwise the `Length` or `Count` it carries.
+    fn spread_count(&mut self, value: &BoundExpression, span: TextSpan) -> Option<BoundExpression> {
+        if let Some((_, length)) = self.binder.inline_array_of(&value.ty) {
+            return Some(BoundExpression::new(
+                BoundExpressionKind::Literal(ConstantValue::Int32(length)),
+                self.special(SpecialType::Int32),
+                span,
+            ));
+        }
+        self.length_of(value, span)
+    }
+
+    /// The constructor of a `List<T>` that takes how many elements it will
+    /// hold.
+    fn capacity_constructor(&self, target: &Type) -> Option<SymbolId> {
+        let symbol = target.symbol()?;
+        let compilation = self.binder.compilation();
+        if compilation.type_by_metadata_name("System.Collections.Generic.List`1") != Some(symbol) {
+            return None;
+        }
+        let symbols = compilation.symbols();
+        let int = self.special(SpecialType::Int32);
+        symbols.lookup(symbol, ".ctor").iter().copied().find(|id| {
+            symbols.get(*id).as_method().is_some_and(|detail| {
+                let mut sink = Diagnostics::new();
+                detail.parameters.len() == 1
+                    && self.binder.type_of(detail.parameters[0], &mut sink) == int
+            })
+        })
     }
 
     /// A collection expression made by the builder its type names.
@@ -1103,7 +1327,7 @@ impl BodyBinder<'_> {
     /// The `typeof` is resolved where the attribute was written, since that
     /// is where its name means what the writer meant, not where the
     /// collection expression happens to be.
-    fn source_collection_builder(&self, symbol: SymbolId) -> Option<(SymbolId, String)> {
+    pub(super) fn source_collection_builder(&self, symbol: SymbolId) -> Option<(SymbolId, String)> {
         let compilation = self.binder.compilation();
         for &(tree, span) in compilation.declaration_nodes(symbol) {
             let Some(node) = compilation
@@ -1286,7 +1510,9 @@ impl BodyBinder<'_> {
         for value in elements {
             let created =
                 BoundExpression::new(BoundExpressionKind::CreatedObject, target.clone(), span);
-            if let Some(call) = self.bind_add_call(target, created, value, span) {
+            if let Some(call) = self.bind_add_call(target, created, value, span)
+                && !self.is_conditioned_out(&call)
+            {
                 initializers.push(call);
             }
         }
@@ -2000,6 +2226,7 @@ fn is_plain_element(expression: &SyntaxNode) -> bool {
     match expression.kind() {
         SyntaxKind::NumericLiteralExpression
         | SyntaxKind::StringLiteralExpression
+        | SyntaxKind::InterpolatedStringExpression
         | SyntaxKind::CharacterLiteralExpression
         | SyntaxKind::TrueLiteralExpression
         | SyntaxKind::FalseLiteralExpression
@@ -2073,19 +2300,20 @@ fn params_array_element(
 }
 
 /// The types a collection expression's elements give, what inference reads of
-/// them, and what each folds to.
+/// them, what each folds to, and what kind each is.
 type CollectionEvidence = (
     Vec<Type>,
     Vec<InferenceArgument>,
     Vec<Option<ConstantValue>>,
+    Vec<ElementKind>,
 );
 
 /// What an element of a collection expression says about the element type.
 enum Evidenced {
     /// Nothing: `null`, `default`, `[]`.
     Nothing,
-    /// Its own type, and what it folds to where it is a constant.
-    Typed(Type, Option<ConstantValue>),
+    /// Its own type, what it folds to where it is a constant, and its kind.
+    Typed(Type, Option<ConstantValue>, ElementKind),
     /// A nested collection, which inference reads element by element and
     /// which has no type of its own.
     Nested(Vec<InferenceArgument>),

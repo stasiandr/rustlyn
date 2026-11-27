@@ -23905,3 +23905,283 @@ Lambda Func`2
 "##,
     );
 }
+
+#[test]
+fn a_collection_expression_goes_to_the_collection_whose_elements_it_converts_to_better() {
+    // Two collection types with different element types are compared element by element
+    // (C# 13): the conversion of each element to one element type has to be at least as good as
+    // to the other, and better for one. An `int` is better taken as `int` than as `byte`, and
+    // `int?` is the better target than `ulong` (a nullable type counts as what it wraps, in the
+    // rule that prefers a signed type). Constant elements reach a `byte` since they fit, so both
+    // overloads applied and the first one declared won.
+    check(
+        "collection_expressions_prefer_the_better_element_conversion",
+        r#"using System;
+using System.Collections.Generic;
+class A {
+  static string F1(ReadOnlySpan<byte> a) => "ReadOnlySpan<byte>";
+  static string F1(Span<int> a) => "Span<int>";
+  static string F2(Span<int> a) => "Span<int>";
+  static string F2(ReadOnlySpan<byte> a) => "ReadOnlySpan<byte>";
+  static string G1(List<int?> a) => "List<int?>";
+  static string G1(List<ulong> a) => "List<ulong>";
+  static string G2(List<ulong> a) => "List<ulong>";
+  static string G2(List<int?> a) => "List<int?>";
+  static string H1(long[] a) => "long[]";
+  static string H1(List<int> a) => "List<int>";
+  static string H2(List<int> a) => "List<int>";
+  static string H2(long[] a) => "long[]";
+  static string I1(IEnumerable<object> a) => "IEnumerable<object>";
+  static string I1(List<int> a) => "List<int>";
+  static string J1(int[] a) => "int[]";
+  static string J1(ReadOnlySpan<long> a) => "ReadOnlySpan<long>";
+  static string J2(ReadOnlySpan<long> a) => "ReadOnlySpan<long>";
+  static string J2(int[] a) => "int[]";
+  static string K1(Span<long> a) => "Span<long>";
+  static string K1(ReadOnlySpan<int> a) => "ReadOnlySpan<int>";
+  static string L1(int?[] a) => "int?[]";
+  static string L1(long[] a) => "long[]";
+  static string L2(long[] a) => "long[]";
+  static string L2(int?[] a) => "int?[]";
+  static string M1(List<long> a) => "List<long>";
+  static string M1(List<double> a) => "List<double>";
+  static string M2(List<double> a) => "List<double>";
+  static string M2(List<long> a) => "List<long>";
+  static string P1(params List<int?> a) => "params List<int?>";
+  static string P1(params List<ulong> a) => "params List<ulong>";
+  static string P2(params List<ulong> a) => "params List<ulong>";
+  static string P2(params List<int?> a) => "params List<int?>";
+  static void Main() {
+    int x = 1; int[] xs = { 1, 2 }; byte b = 3; long[] ls = { 4 };
+    Console.WriteLine(F1([1, 2, 3]) + " " + F2([4, 5]));
+    Console.WriteLine(F1([b, b]) + " " + F2([(byte)1]));
+    Console.WriteLine(F1([x]) + " " + F2([..xs]));
+    Console.WriteLine(G1([1, 2, 3]) + " " + G2([4, 5]));
+    Console.WriteLine(H1([1, 2]) + " " + H2([3]));
+    Console.WriteLine(I1([1, 2]) + " " + I1([x]));
+    Console.WriteLine(J1([1]) + " " + J2([2]));
+    Console.WriteLine(K1([1L]) + " " + K1([x]));
+    Console.WriteLine(L1([1, null]) + " " + L2([2L]));
+    Console.WriteLine(M1([1]) + " " + M2([2]));
+    Console.WriteLine(P1(1, 2, 3) + " " + P2(4, 5));
+  }
+}
+"#,
+        "Span<int> Span<int>
+ReadOnlySpan<byte> ReadOnlySpan<byte>
+Span<int> Span<int>
+List<int?> List<int?>
+List<int> List<int>
+List<int> List<int>
+int[] int[]
+Span<long> ReadOnlySpan<int>
+int?[] long[]
+List<long> List<long>
+params List<int?> params List<int?>
+",
+    );
+}
+
+#[test]
+fn a_collection_expression_prefers_a_handler_element_and_an_element_type_of_object() {
+    // An interpolated string that is no constant is better taken by a handler than by a
+    // `string`, element by element; a collection with no element type of its own, only
+    // an `Add(object)`, is compared as one of `object`; a spread is compared by the element
+    // type it walks.
+    check(
+        "collection_expressions_prefer_handlers_and_nullable_elements",
+        r#"using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+[InterpolatedStringHandler]
+public class Handler {
+  public Handler(int literalLength, int formattedCount) { }
+  public void AppendLiteral(string s) { }
+  public void AppendFormatted<T>(T value) { }
+}
+class Plain : IEnumerable {
+  public void Add(object o) { }
+  IEnumerator IEnumerable.GetEnumerator() => throw null;
+}
+class A {
+  static string F(ReadOnlySpan<string> a) => "strings";
+  static string F(ReadOnlySpan<Handler> a) => "handlers";
+  static string G(Plain a) => "plain";
+  static string G(int?[] a) => "int?[]";
+  static string H(ulong a) => "ulong";
+  static string H(int? a) => "int?";
+  static string I(List<int?> a) => "List<int?>";
+  static string I(List<ulong> a) => "List<ulong>";
+  static void Main() {
+    int x = 3; int?[] ns = { 1 };
+    Console.WriteLine(F([$"{x}", $"{x}"]) + " " + F([$"a"]));
+    Console.WriteLine(G([1, null]) + " " + G([..ns]));
+    Console.WriteLine(H(1) + " " + I([1, 2]));
+  }
+}
+"#,
+        "handlers strings
+int?[] int?[]
+int? List<int?>
+",
+    );
+}
+
+#[test]
+fn overload_resolution_priority_applies_to_method_groups_lifted_operators_and_conditional_adds() {
+    // `[OverloadResolutionPriority]` puts out the lower of the methods a delegate's parameters
+    // reach, and of an operator written for `S` and the one written for `S?` that `S`'s lifts to.
+    // An `Add` marked `[Conditional]` is no call, and a type that is abstract is no collection
+    // a collection expression reaches.
+    check(
+        "priorities_conditional_add_and_abstract_collections",
+        r#"using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+namespace System.Runtime.CompilerServices {
+  [AttributeUsage(AttributeTargets.Method | AttributeTargets.Constructor | AttributeTargets.Property, AllowMultiple = false, Inherited = false)]
+  public sealed class OverloadResolutionPriorityAttribute(int priority) : Attribute { public int Priority => priority; }
+}
+struct S {
+  [OverloadResolutionPriority(1)]
+  public static S operator -(S x) { Console.Write("lifted-priority;"); return x; }
+  public static S? operator -(S? x) { Console.Write("nullable;"); return x; }
+}
+class P {
+  [OverloadResolutionPriority(1)]
+  public static void M(object o) => Console.Write("object;");
+  public static void M(string s) => Console.Write("string;");
+}
+class Conditional<U> : IEnumerable<object> {
+  List<object> items = new List<object>();
+  [Conditional("NEVER")] public void Add(object o) { items.Add(o); }
+  public void Add(U u) { items.Add(u); }
+  public IEnumerator<object> GetEnumerator() => items.GetEnumerator();
+  IEnumerator IEnumerable.GetEnumerator() => items.GetEnumerator();
+}
+abstract class Abstract : IEnumerable<int> {
+  public void Add(int i) { }
+  public IEnumerator<int> GetEnumerator() => null;
+  IEnumerator IEnumerable.GetEnumerator() => null;
+}
+class A {
+  static string F(Abstract a) => "abstract";
+  static string F(List<int> a) => "list";
+  static void Main() {
+    Action<string> d = P.M; d("x");
+    S? s = new S(); s = -s;
+    Console.WriteLine();
+    Conditional<string> c = [1, "2", 3];
+    var both = new string[] { "4" };
+    Conditional<string> w = [..both, ..new int[] { 5 }];
+    Console.WriteLine(string.Join(",", c) + " " + string.Join(",", w));
+    Console.WriteLine(F([]));
+  }
+}
+"#,
+        "object;lifted-priority;
+2 4
+list
+",
+    );
+}
+
+#[test]
+fn a_collection_expression_with_countable_spreads_evaluates_and_counts_them_first() {
+    // Where every spread of an array or a list can count what it holds and no more than three
+    // elements come before the last spread, the elements up to it are evaluated first, then the
+    // counts are read, and the collection is made at its size before anything is walked: `[..e,
+    // ..Pop(e)]` sees both spreads as they are after the call. Otherwise each is walked where it
+    // stands. A list made from a lone spread takes the collection's own size.
+    check(
+        "collection_expressions_count_their_spreads_first",
+        r#"using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+namespace System.Runtime.CompilerServices {
+  [AttributeUsage(AttributeTargets.Method | AttributeTargets.Constructor | AttributeTargets.Property, AllowMultiple = false, Inherited = false)]
+  public sealed class OverloadResolutionPriorityAttribute(int priority) : Attribute { public int Priority => priority; }
+}
+class Counted : IEnumerable<int> {
+  readonly string name; readonly int[] items;
+  public Counted(string name, params int[] items) { this.name = name; this.items = items; }
+  public int Count { get { Console.Write(name + ".Count;"); return items.Length; } }
+  public IEnumerator<int> GetEnumerator() { Console.Write(name + ".walk;"); return ((IEnumerable<int>)items).GetEnumerator(); }
+  IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+}
+class A {
+  static int Next(string name, int value) { Console.Write(name + ";"); return value; }
+  static List<int> Pop(List<int> l) { l.RemoveAt(l.Count - 1); return l; }
+  static void Main() {
+    var a = new Counted("a", 1, 2); var b = new Counted("b", 3);
+    int[] array = [Next("first", 0), ..a, Next("second", 9), ..b, Next("last", 10)];
+    Console.WriteLine(string.Join(",", array));
+    List<int> list = [..a, ..b];
+    Console.WriteLine(list.Capacity + " " + string.Join(",", list));
+    int[] head = [Next("x", 1), ..a, ..b, Next("y", 2)];
+    Console.WriteLine(string.Join(",", head));
+    List<int> small = [1, 2, 3];
+    Console.WriteLine(small.Capacity);
+    var shared = new List<int> { 1, 2, 3 };
+    List<int> viewed = [..shared, ..Pop(shared)];
+    Console.WriteLine(string.Join(",", viewed));
+    IEnumerable<int> items = [..a];
+    List<int> copy = [..items];
+    Console.WriteLine(copy.Capacity);
+  }
+}
+"#,
+        "first;a.walk;second;b.walk;last;0,1,2,9,3,10
+a.Count;b.Count;a.walk;b.walk;3 1,2,3
+x;a.Count;b.Count;a.walk;b.walk;y;1,1,2,3,2
+3
+1,2,1,2
+a.walk;2
+",
+    );
+}
+
+#[test]
+fn a_list_made_of_a_lone_spread_walks_what_it_cannot_copy_and_a_params_array_yields_to_by_value() {
+    // `[..xs]` for a list copies `xs` only where it reaches `IEnumerable<T>` by reference and is not
+    // walked by a struct enumerator; an inline array adds as many as its attribute says, whatever its
+    // own `Length` is; and an argument that goes in by value has chosen between two expanded `params`
+    // collections before their types are compared.
+    check(
+        "list_from_a_lone_spread_inline_array_and_params_by_value",
+        r#"using System;
+using System.Collections;
+using System.Collections.Generic;
+class Source : IEnumerable<int> {
+  public List<int>.Enumerator GetEnumerator() => new List<int> { 1, 2 }.GetEnumerator();
+  IEnumerator<int> IEnumerable<int>.GetEnumerator() => throw new Exception("boxed");
+  IEnumerator IEnumerable.GetEnumerator() => throw new Exception("boxed");
+}
+[System.Runtime.CompilerServices.InlineArray(3)]
+struct Three<T> {
+  T _e0;
+  public int Length => throw null;
+}
+class Program {
+  static string Pick(in int x, params string[] y) => "in";
+  static string Pick(int x, params object[] y) => "val";
+  static void Main() {
+    Three<int> three = new();
+    three[0] = 7; three[1] = 8; three[2] = 9;
+    List<int> a = [..three];
+    List<int> b = [..new Source()];
+    Console.WriteLine(string.Join(",", a) + " " + string.Join(",", b));
+    Console.WriteLine(Pick(1) + " " + Pick(1, "x"));
+  }
+}
+"#,
+        "7,8,9 1,2
+val in
+",
+    );
+}

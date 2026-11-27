@@ -2479,11 +2479,40 @@ impl BodyBinder<'_> {
                     .type_by_metadata_name("System.Collections.IEnumerable")
                     .is_some_and(|enumerable| {
                         enumerable == *symbol
-                            || self.binder.constructed_from(ty, enumerable).is_some()
+                            || (self.binder.constructed_from(ty, enumerable).is_some()
+                                && self.can_be_made_empty(*symbol))
                     })
             }
             _ => false,
         }
+    }
+
+    /// Whether a collection expression can make a type `symbol` stands for:
+    /// a class that is abstract, or whose constructors none of the code here
+    /// may call, is not one it reaches (what `with(...)` hands a constructor
+    /// is checked where it is bound). A builder names its own way in, and an
+    /// interface or a struct is not asked.
+    fn can_be_made_empty(&self, symbol: SymbolId) -> bool {
+        let symbols = self.binder.compilation().symbols();
+        let detail = symbols.get(symbol);
+        if detail.type_kind() != Some(TypeKind::Class)
+            || self
+                .binder
+                .compilation()
+                .collection_builder(symbol)
+                .is_some()
+            || self.source_collection_builder(symbol).is_some()
+        {
+            return true;
+        }
+        if detail.modifiers.contains(Modifiers::ABSTRACT) {
+            return false;
+        }
+        let constructors = symbols.lookup(symbol, ".ctor");
+        constructors.is_empty()
+            || constructors
+                .iter()
+                .any(|constructor| self.accessible(*constructor))
     }
 
     /// The value a parameter takes when the call site leaves it out.

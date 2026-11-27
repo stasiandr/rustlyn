@@ -260,6 +260,16 @@ impl BodyBinder<'_> {
                 }
             }
         }
+        // `[OverloadResolutionPriority]` puts out the lower ones of what the
+        // delegate's parameters reach, the exact and the widened alike.
+        let reached: Vec<SymbolId> = exact
+            .iter()
+            .map(|(method, _)| *method)
+            .chain(widened.iter().map(|(method, _, _)| *method))
+            .collect();
+        let reached = self.highest_priority(&reached);
+        exact.retain(|(method, _)| reached.contains(method));
+        widened.retain(|(method, _, _)| reached.contains(method));
         // Of several that take more than the delegate hands them, the one
         // taking the least (§12.6.4.5): `M(Derived1)` over `M(Base)` for a
         // delegate handing over a `Derived2`.

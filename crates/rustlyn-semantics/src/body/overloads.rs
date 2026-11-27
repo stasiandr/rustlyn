@@ -6,6 +6,7 @@ use rustlyn_diagnostics::ErrorCode;
 use rustlyn_syntax::{LanguageVersion, SyntaxKind, SyntaxNode};
 use rustlyn_text::TextSpan;
 
+use super::ElementKind;
 use super::inference::InferenceArgument;
 use super::{
     AddressOfGroup, Betterness, BodyBinder, Bound, BranchFunction, Evidence, Interpolated,
@@ -115,6 +116,7 @@ impl BodyBinder<'_> {
                     BoundExpressionKind::UnboundCollection(at) => {
                         self.collection_types.get(&at).map(|types| {
                             let constants = self.collection_constants.get(&at);
+                            let kinds = self.collection_kinds.get(&at);
                             types
                                 .iter()
                                 .enumerate()
@@ -125,6 +127,10 @@ impl BodyBinder<'_> {
                                             .and_then(|constants| constants.get(index))
                                             .cloned()
                                             .flatten(),
+                                        kinds
+                                            .and_then(|kinds| kinds.get(index))
+                                            .copied()
+                                            .unwrap_or(ElementKind::Plain),
                                     )
                                 })
                                 .collect()
@@ -468,8 +474,9 @@ impl BodyBinder<'_> {
             return true;
         };
         let symbols = self.binder.compilation().symbols();
-        types.iter().all(|(ty, constant)| {
+        types.iter().all(|(ty, constant, kind)| {
             ty.is_error()
+                || (*kind == ElementKind::Interpolated && self.is_handler_type(&element))
                 || (matches!(ty, Type::Null)
                     && (element.is_reference_type(symbols)
                         || self.binder.nullable_underlying(&element).is_some()))
@@ -2058,7 +2065,15 @@ impl BodyBinder<'_> {
         applicable_set
             .into_iter()
             .reduce(|best, candidate| {
-                if self.beats(&candidate, &best, arguments, &inference, refs, interpolated) {
+                if self.beats(
+                    &candidate,
+                    &best,
+                    arguments,
+                    &inference,
+                    refs,
+                    interpolated,
+                    elements,
+                ) {
                     candidate
                 } else {
                     best
@@ -2108,36 +2123,45 @@ impl BodyBinder<'_> {
     /// the highest `[OverloadResolutionPriority]` stay (Roslyn's
     /// `RemoveLowerPriorityMembers`), before any is compared with another.
     fn keep_highest_priority(&self, applicable: &mut Vec<(Betterness, Vec<Type>, Resolved)>) {
-        if applicable.len() < 2
+        let methods: Vec<SymbolId> = applicable
+            .iter()
+            .map(|(_, _, resolved)| resolved.method)
+            .collect();
+        let kept = self.highest_priority(&methods);
+        applicable.retain(|(_, _, resolved)| kept.contains(&resolved.method));
+    }
+
+    /// Those of the applicable `methods` that have the highest priority
+    /// among the ones their own type declares; all of them before C# 13.
+    pub(super) fn highest_priority(&self, methods: &[SymbolId]) -> Vec<SymbolId> {
+        if methods.len() < 2
             || !self
                 .language_version()
                 .at_least(rustlyn_syntax::LanguageVersion::CSharp13)
         {
-            return;
+            return methods.to_vec();
         }
         let compilation = self.binder.compilation();
-        let priorities: Vec<i32> = applicable
+        let priorities: Vec<i32> = methods
             .iter()
-            .map(|(_, _, resolved)| compilation.overload_resolution_priority(resolved.method))
+            .map(|method| compilation.overload_resolution_priority(*method))
             .collect();
         if priorities.iter().all(|priority| *priority == 0) {
-            return;
+            return methods.to_vec();
         }
         let symbols = compilation.symbols();
         let container = |method: SymbolId| symbols.get(method).container;
         let mut highest: HashMap<Option<SymbolId>, i32> = HashMap::new();
-        for ((_, _, resolved), priority) in applicable.iter().zip(&priorities) {
-            let entry = highest
-                .entry(container(resolved.method))
-                .or_insert(i32::MIN);
+        for (method, priority) in methods.iter().zip(&priorities) {
+            let entry = highest.entry(container(*method)).or_insert(i32::MIN);
             *entry = (*entry).max(*priority);
         }
-        let mut index = 0;
-        applicable.retain(|(_, _, resolved)| {
-            let keep = highest.get(&container(resolved.method)) == Some(&priorities[index]);
-            index += 1;
-            keep
-        });
+        methods
+            .iter()
+            .zip(&priorities)
+            .filter(|(method, priority)| highest.get(&container(**method)) == Some(priority))
+            .map(|(method, _)| *method)
+            .collect()
     }
 
     /// Whether one candidate that fits is the better fit of two (§12.6.4.5),
@@ -2150,6 +2174,7 @@ impl BodyBinder<'_> {
     /// taken by value over one taken by `in`, a method that is not generic,
     /// the normal form over the expanded one, more declared parameters, no
     /// defaults at all, and the more specific parameter types.
+    #[allow(clippy::too_many_arguments)]
     fn beats(
         &self,
         candidate: &(Betterness, Vec<Type>, Resolved),
@@ -2158,6 +2183,7 @@ impl BodyBinder<'_> {
         inference: &[InferenceArgument],
         refs: &[RefKind],
         interpolated: &[Option<Interpolated>],
+        collection_elements: &[Option<Vec<super::NotedElement>>],
     ) -> bool {
         // A candidate a lambda or a method group reaches as a delegate beats
         // one it reaches only through its natural type (C# 10).
@@ -2244,7 +2270,16 @@ impl BodyBinder<'_> {
                     }
                 }
                 (None, Some((RefKind::Ref, RefKind::Ref))) => (None, false),
-                _ => self.better_conversion_from(argument, inference.get(index), first, second),
+                _ => self.better_conversion_from(
+                    argument,
+                    inference.get(index),
+                    first,
+                    second,
+                    collection_elements
+                        .get(index)
+                        .and_then(Option::as_deref)
+                        .unwrap_or_default(),
+                ),
             };
             let Some(better) = better else {
                 continue;
@@ -2360,8 +2395,14 @@ impl BodyBinder<'_> {
         }
         // Two `params` collections of different types that take the same
         // elements: a span beats the array and the interfaces it stands for.
+        // An argument that goes in by value where the other takes it `in`
+        // has said which is better already (Roslyn decides that with the
+        // arguments).
         if !normal(candidate)
             && !normal(best)
+            && self
+                .prefers_value(arguments, candidate, &mine, best, &other)
+                .is_none()
             && let Some(better) = self.better_params_collection(candidate, best)
         {
             return better;
@@ -2385,13 +2426,15 @@ impl BodyBinder<'_> {
     }
 
     /// Which of two candidates, both taking their `params` collection
-    /// expanded, has the better collection type for the same elements (C# 13):
-    /// `ReadOnlySpan<T>` beats `Span<T>`, either beats an array and the
-    /// interfaces an array stands for (`IEnumerable<T>`, `IReadOnlyCollection<T>`,
+    /// expanded, has the better collection type (C# 13): `ReadOnlySpan<T>`
+    /// beats `Span<T>`, either beats an array and the interfaces an array
+    /// stands for (`IEnumerable<T>`, `IReadOnlyCollection<T>`,
     /// `IReadOnlyList<T>`, `ICollection<T>`, `IList<T>`), and otherwise the
     /// type that converts to the other and not back does, as it would for a
-    /// collection expression. `None` where the types are the same, the elements
-    /// are not, or neither is better.
+    /// collection expression. Where the element types differ there are no
+    /// elements to compare, and neither is better; the arguments, each taken
+    /// by the element type, have said what they had to. `None` where the
+    /// types are the same or neither is better.
     fn better_params_collection(
         &self,
         candidate: &(Betterness, Vec<Type>, Resolved),
@@ -2412,21 +2455,32 @@ impl BodyBinder<'_> {
                     .substitute(&resolved.substitution),
             )
         };
-        self.better_collection_type(&collection(&candidate.2)?, &collection(&best.2)?)
+        self.better_collection_type(&collection(&candidate.2)?, &collection(&best.2)?, &[])
     }
 
     /// Which of two collection types a collection expression (or the elements
-    /// of a `params` collection) reaches is the better, for the same
-    /// elements: see [`Self::better_params_collection`].
-    fn better_collection_type(&self, ours: &Type, theirs: &Type) -> Option<bool> {
-        if ours == theirs
-            || !self.identical(
-                &self.collection_element(ours)?,
-                &self.collection_element(theirs)?,
-            )
-        {
+    /// of a `params` collection) reaches is the better one (Roslyn's
+    /// `BetterCollectionExpressionConversion`): see
+    /// [`Self::better_params_collection`]. `elements` are those of the
+    /// expression, empty for a `params` collection.
+    ///
+    /// C# 13 asks, in this order: of two types that are no spans, the one
+    /// that converts to the other and not back; where the element types
+    /// differ, the one whose element type each element converts to better
+    /// (an `int` is better taken as `int` than as `byte`), which is the
+    /// whole answer; and where they are the same, the span rules.
+    /// C# 12 compared the element types by whether one converts to the other
+    /// instead, so `ReadOnlySpan<byte>` beat `Span<int>` there.
+    fn better_collection_type(
+        &self,
+        ours: &Type,
+        theirs: &Type,
+        elements: &[super::NotedElement],
+    ) -> Option<bool> {
+        if ours == theirs {
             return None;
         }
+        let (first, second) = (self.iteration_type(ours)?, self.iteration_type(theirs)?);
         let compilation = self.binder.compilation();
         let named = |ty: &Type, metadata: &str| {
             matches!(ty, Type::Named { symbol, .. }
@@ -2446,22 +2500,89 @@ impl BodyBinder<'_> {
                 .iter()
                 .any(|metadata| named(ty, metadata))
         };
-        if read_only(ours) && span(theirs) || (read_only(ours) || span(ours)) && array_like(theirs)
-        {
+        let spans = |ty: &Type| read_only(ty) || span(ty);
+        if !self.language_version().at_least(LanguageVersion::CSharp13) {
+            let reaches = |from: &Type, to: &Type| self.binder.converts_implicitly(from, to);
+            let better = |t1: &Type, e1: &Type, t2: &Type, e2: &Type| {
+                if read_only(t1) && span(t2) {
+                    reaches(e1, e2)
+                } else if spans(t1) {
+                    array_like(t2) && reaches(e1, e2)
+                } else {
+                    !spans(t2) && reaches(t1, t2)
+                }
+            };
+            return if better(ours, &first, theirs, &second) {
+                Some(true)
+            } else if better(theirs, &second, ours, &first) {
+                Some(false)
+            } else {
+                None
+            };
+        }
+        if !spans(ours) && !spans(theirs) {
+            let forward = self.binder.converts_implicitly(ours, theirs);
+            let backward = self.binder.converts_implicitly(theirs, ours);
+            match (forward, backward) {
+                (true, false) => return Some(true),
+                (false, true) => return Some(false),
+                _ => {}
+            }
+        }
+        if !self.identical(&first, &second) {
+            let mut result = None;
+            for (ty, _, kind) in elements {
+                // A spread is compared by the element type it walks alone;
+                // an interpolated string that is no constant goes to a
+                // handler rather than to what is not one.
+                let better = match kind {
+                    ElementKind::Spread => self.better_target_type(&first, &second),
+                    ElementKind::Interpolated
+                        if self.is_handler_type(&first) || self.is_handler_type(&second) =>
+                    {
+                        match (self.is_handler_type(&first), self.is_handler_type(&second)) {
+                            (true, false) => Some(true),
+                            (false, true) => Some(false),
+                            _ => None,
+                        }
+                    }
+                    _ => self.better_target(ty, &first, &second),
+                };
+                match (better, result) {
+                    (None, _) => {}
+                    (Some(found), None) => result = Some(found),
+                    (Some(found), Some(before)) if found != before => return None,
+                    _ => {}
+                }
+            }
+            return result;
+        }
+        if read_only(ours) && span(theirs) || spans(ours) && array_like(theirs) {
             return Some(true);
         }
-        if read_only(theirs) && span(ours)
-            || (read_only(theirs) || span(theirs)) && array_like(ours)
-        {
+        if read_only(theirs) && span(ours) || spans(theirs) && array_like(ours) {
             return Some(false);
         }
-        let forward = self.binder.converts_implicitly(ours, theirs);
-        let backward = self.binder.converts_implicitly(theirs, ours);
-        match (forward, backward) {
-            (true, false) => Some(true),
-            (false, true) => Some(false),
-            _ => None,
-        }
+        None
+    }
+
+    /// What a collection expression's elements are taken as for a target:
+    /// the element type of a generic collection, and `object` for a type
+    /// that is enumerable and nothing more (`Add(object)` fills it).
+    fn iteration_type(&self, target: &Type) -> Option<Type> {
+        self.collection_element(target).or_else(|| {
+            let enumerable = self
+                .binder
+                .compilation()
+                .type_by_metadata_name("System.Collections.IEnumerable")?;
+            let ty = Type::Named {
+                symbol: enumerable,
+                type_arguments: Vec::new(),
+            };
+            (matches!(target, Type::Named { .. }) && self.binder.converts_implicitly(target, &ty))
+                .then(|| self.binder.object_type())
+                .flatten()
+        })
     }
 
     /// Whether two types are one, as far as overload resolution cares:
@@ -2644,6 +2765,7 @@ impl BodyBinder<'_> {
         inference: Option<&InferenceArgument>,
         first: &Type,
         second: &Type,
+        elements: &[super::NotedElement],
     ) -> (Option<bool>, bool) {
         if self.identical(first, second) {
             return (None, false);
@@ -2664,9 +2786,10 @@ impl BodyBinder<'_> {
         // A collection expression goes to the better of two collection types
         // the way the elements of a `params` collection do (C# 12).
         if matches!(inference, Some(InferenceArgument::Collection(_)))
-            && let Some(better) = self.better_collection_type(first, second)
+            && self.iteration_type(first).is_some()
+            && self.iteration_type(second).is_some()
         {
-            return (Some(better), false);
+            return (self.better_collection_type(first, second, elements), false);
         }
         (self.better_target(argument, first, second), false)
     }
@@ -2923,10 +3046,17 @@ impl BodyBinder<'_> {
         // §12.6.4.7: where neither type reaches the other, a signed type is
         // the better target than the unsigned ones it cannot hold. That is
         // what sends `Console.WriteLine(width)` on a `ushort` to the `int`
-        // overload rather than to the `decimal` or `uint` ones.
+        // overload rather than to the `decimal` or `uint` ones. A nullable
+        // type counts as what it wraps: `int?` is the better target than
+        // `ulong`.
+        let underlying = |ty: &Type| {
+            self.binder
+                .nullable_underlying(ty)
+                .unwrap_or_else(|| ty.clone())
+        };
         let (Some(first), Some(second)) = (
-            self.binder.special_of(first),
-            self.binder.special_of(second),
+            self.binder.special_of(&underlying(first)),
+            self.binder.special_of(&underlying(second)),
         ) else {
             return None;
         };

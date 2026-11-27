@@ -1290,6 +1290,17 @@ impl<'a> Loader<'a> {
             if let Some(obsolete) = self.obsolete_of(index, table::PROPERTY, property) {
                 self.loaded.obsolete.insert(member, obsolete);
             }
+            // An indexer carries its `[OverloadResolutionPriority]` on the
+            // property, not on an accessor.
+            if let Some(priority) = self.attribute_int(
+                index,
+                table::PROPERTY,
+                property,
+                "System.Runtime.CompilerServices.OverloadResolutionPriorityAttribute",
+            ) && priority != 0
+            {
+                self.loaded.priorities.insert(member, priority);
+            }
             let ty = self.with_dynamic(index, table::PROPERTY, property, ty, false);
             let ty = self.with_tuple_names(index, table::PROPERTY, property, ty);
             self.loaded.types.insert(member, ty);

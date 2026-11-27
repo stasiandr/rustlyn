@@ -715,21 +715,34 @@ impl BodyBinder<'_> {
         if candidates.is_empty() {
             return None;
         }
-        if let Some(method) = self.resolve_overload(
+        let direct = self.resolve_overload(
             &candidates,
             std::slice::from_ref(&ty),
             &Evidence::default(),
             &declaring,
-        ) {
-            return Some(self.unary_call(method, operand.clone(), &declaring, span));
-        }
-        let inner = underlying?;
-        let method = self.resolve_overload(
-            &candidates,
-            std::slice::from_ref(&inner),
-            &Evidence::default(),
-            &declaring,
-        )?;
+        );
+        let lifted = underlying.and_then(|inner| {
+            self.resolve_overload(
+                &candidates,
+                std::slice::from_ref(&inner),
+                &Evidence::default(),
+                &declaring,
+            )
+        });
+        // The operator over the `T` lifted to `T?` is a candidate beside
+        // the one written for `T?`, and a higher `[OverloadResolutionPriority]`
+        // on it puts the other out.
+        let method = match (direct, lifted) {
+            (Some(direct), Some(lifted))
+                if direct != lifted && self.highest_priority(&[direct, lifted]) == [lifted] =>
+            {
+                lifted
+            }
+            (Some(direct), _) => {
+                return Some(self.unary_call(direct, operand.clone(), &declaring, span));
+            }
+            (None, lifted) => lifted?,
+        };
         let result = self.member_type(method, &declaring);
         let lifted = if self.wraps_in_nullable(&result) {
             self.nullable_of(result)
