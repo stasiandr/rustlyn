@@ -1976,6 +1976,10 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         self.load_local(array);
         self.load_local(index);
         self.load_element(&element, element_token);
+        // `foreach (long n in ints)` and `foreach (dynamic d in ints)` convert
+        // each element on the way into the variable, as a walk by enumerator
+        // does.
+        self.convert_iterated(&element, local)?;
         self.end_store(local);
 
         self.enter_loop(end, step);
@@ -2381,7 +2385,18 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             }
             (false, true) => self.box_if_needed(from)?,
             (false, false) => {
-                if self.numeric_kind(from).is_some() && self.numeric_kind(&to).is_some() {
+                let wrapped = self.emitter.nullable_underlying(&to);
+                if let Some(inner) = wrapped
+                    && self.emitter.nullable_underlying(from).is_none()
+                    && !matches!(from, Type::TypeParameter(_))
+                {
+                    // `foreach (int? n in ints)` wraps each element.
+                    if inner != *from {
+                        self.convert_number_from(from, &inner)?;
+                    }
+                    let token = self.emitter.nullable_constructor(&to)?;
+                    self.stream.call_effect(Instruction::NewObject(token), 1, 1);
+                } else if self.numeric_kind(from).is_some() && self.numeric_kind(&to).is_some() {
                     self.convert_number_from(from, &to)?;
                 } else if matches!(from, Type::TypeParameter(_))
                     || matches!(to, Type::TypeParameter(_))
@@ -3942,7 +3957,9 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         // A tuple is taken apart by reading its fields; anything else by
         // calling the `Deconstruct` the binder picked, with a slot per `out`.
         let Some(deconstruct) = pattern.deconstruct else {
-            let Type::Tuple(elements) = matched else {
+            // `ValueTuple<int, int>` is read the same way, whichever way it
+            // is spelled.
+            let Some(elements) = self.emitter.binder.tuple_elements(matched) else {
                 return Err(EmitError::new(
                     "a positional pattern on something with no `Deconstruct`",
                 ));
@@ -3950,14 +3967,14 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             let mut parts = Vec::with_capacity(elements.len());
             for (index, element) in elements.iter().enumerate() {
                 let chain = self.emitter.tuple_field(matched, index)?;
-                let held = self.read_part(slot, PathStep::Element(index), &element.ty, |this| {
+                let held = self.read_part(slot, PathStep::Element(index), element, |this| {
                     this.stream.emit(Instruction::LoadLocal(slot));
                     for token in chain {
                         this.stream.emit(Instruction::LoadField(token));
                     }
                     Ok(())
                 })?;
-                parts.push((held, element.ty.clone()));
+                parts.push((held, element.clone()));
             }
             return Ok(parts);
         };
@@ -4177,21 +4194,50 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         self.end_match(outer);
         // Falling off the end means no arm matched, which is what the runtime
         // has an exception for; `csc` throws the same one — the program's
-        // own, where it declares one, as for every type the language names.
-        let exception =
-            self.source_constructor("System.Runtime.CompilerServices.SwitchExpressionException")?;
-        let exception = match exception {
-            Some(token) => token,
-            None => self.emitter.framework_member(
-                "System.Runtime.CompilerServices.SwitchExpressionException",
-                ".ctor",
+        // own, where it declares one, as for every type the language names —
+        // and hands it the value that matched nothing, boxed. A ref struct or
+        // a pointer cannot be boxed, and the exception is made without one.
+        const NAME: &str = "System.Runtime.CompilerServices.SwitchExpressionException";
+        let boxable = !matches!(
+            governing.ty,
+            Type::Pointer(_) | Type::FunctionPointer(_) | Type::ByRef(_)
+        ) && !self.emitter.is_ref_like(&governing.ty);
+        let (exception, takes_value) = match (
+            self.source_constructor(NAME, boxable)?,
+            self.source_constructor(NAME, false)?,
+        ) {
+            (Some(token), _) if boxable => (token, true),
+            (_, Some(token)) => (token, false),
+            _ if boxable => (
+                self.emitter.framework_member(
+                    NAME,
+                    ".ctor",
+                    true,
+                    &SigType::Primitive(ElementType::Void),
+                    &[SigType::Primitive(ElementType::Object)],
+                ),
                 true,
-                &SigType::Primitive(ElementType::Void),
-                &[],
+            ),
+            _ => (
+                self.emitter.framework_member(
+                    NAME,
+                    ".ctor",
+                    true,
+                    &SigType::Primitive(ElementType::Void),
+                    &[],
+                ),
+                false,
             ),
         };
-        self.stream
-            .call_effect(Instruction::NewObject(exception), 0, 1);
+        if takes_value {
+            self.stream.emit(Instruction::LoadLocal(slot));
+            self.box_if_needed(&governing.ty)?;
+        }
+        self.stream.call_effect(
+            Instruction::NewObject(exception),
+            usize::from(takes_value),
+            1,
+        );
         self.stream.emit(Instruction::Throw);
 
         self.stream.mark(end);
@@ -4860,18 +4906,11 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             BoundExpressionKind::Property { receiver, property } => {
                 // `T.Zero` where `T : INumberBase<T>`: the interface's static
                 // abstract getter, reached through the type parameter.
-                let declared_getter = {
-                    let symbols = self.emitter.compilation.symbols();
-                    symbols
-                        .get(*property)
-                        .as_property()
-                        .and_then(|detail| detail.getter)
-                };
                 if receiver.as_deref().is_none_or(is_type_name)
-                    && let Some(getter) = declared_getter
-                    && let Some((parameter, construction)) = self.static_abstract_constraint(getter)
+                    && let Some((parameter, construction)) =
+                        self.static_abstract_property_constraint(*property)
                 {
-                    let token = self.constraint_member(getter, &construction)?;
+                    let token = self.constrained_accessor(*property, &construction, false)?;
                     let constraint = self.emitter.type_token(&Type::TypeParameter(parameter))?;
                     self.stream.emit(Instruction::Constrained(constraint));
                     self.stream.call_effect(Instruction::Call(token), 0, 1);
@@ -7897,16 +7936,30 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             operator,
             BinaryOperator::Equality | BinaryOperator::Inequality
         ) {
-            let null = |side: &BoundExpression| match &side.kind {
+            let written = |side: &BoundExpression| match &side.kind {
                 BoundExpressionKind::Conversion { operand, .. } => {
                     matches!(operand.ty, Type::Null)
                 }
                 BoundExpressionKind::Literal(ConstantValue::Null) => true,
-                // `null` given the type of the `T` it is compared with.
-                BoundExpressionKind::Default(Type::TypeParameter(_)) => true,
                 _ => matches!(side.ty, Type::Null),
             };
-            let operand = if null(right) && !null(left) {
+            // `null` given the type of the `T` it is compared with is a
+            // `default(T)` too. A `default(T)` the program wrote is a value
+            // like any other, null only where `T` is a reference type: so
+            // where the other side is a `null` as written, it is the one
+            // that is compared.
+            let null = |side: &BoundExpression| {
+                written(side)
+                    || matches!(
+                        side.kind,
+                        BoundExpressionKind::Default(Type::TypeParameter(_))
+                    )
+            };
+            let operand = if written(right) && !written(left) {
+                boxed_type_parameter(left)
+            } else if written(left) && !written(right) {
+                boxed_type_parameter(right)
+            } else if null(right) && !null(left) {
                 boxed_type_parameter(left)
             } else if null(left) && !null(right) {
                 boxed_type_parameter(right)
@@ -10312,6 +10365,19 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 extension_receiver,
                 ..
             } => {
+                // `T.Rw += 1`: the interface's static abstract accessor,
+                // reached through the type parameter like a read of it is.
+                if receiver.is_none()
+                    && through.is_none()
+                    && let Some((parameter, construction)) =
+                        self.static_abstract_property_constraint(*property)
+                {
+                    let token = self.constrained_accessor(*property, &construction, false)?;
+                    let constraint = self.emitter.type_token(&Type::TypeParameter(parameter))?;
+                    self.stream.emit(Instruction::Constrained(constraint));
+                    self.stream.call_effect(Instruction::Call(token), 0, 1);
+                    return Ok(());
+                }
                 let getter = self.emitter.place_accessor(
                     *property,
                     receiver_type.as_ref(),
@@ -10391,6 +10457,16 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             } => {
                 if let Some(kind) = through {
                     self.stream.emit(Instruction::StoreIndirect(*kind));
+                    return Ok(());
+                }
+                if receiver.is_none()
+                    && let Some((parameter, construction)) =
+                        self.static_abstract_property_constraint(*property)
+                {
+                    let token = self.constrained_accessor(*property, &construction, true)?;
+                    let constraint = self.emitter.type_token(&Type::TypeParameter(parameter))?;
+                    self.stream.emit(Instruction::Constrained(constraint));
+                    self.stream.call_effect(Instruction::Call(token), 1, 0);
                     return Ok(());
                 }
                 let setter = self.emitter.place_accessor(
@@ -11381,7 +11457,12 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 ))
             })?,
         };
-        let instruction = if instance {
+        // `base.E += h` means the base's accessor: dispatching it would land
+        // back on the override that asked.
+        let through_base = receiver.is_some_and(|receiver| {
+            matches!(receiver.kind, BoundExpressionKind::Base) || self.is_base_of(receiver)
+        });
+        let instruction = if instance && !through_base {
             Instruction::CallVirtual(token)
         } else {
             Instruction::Call(token)
@@ -11655,6 +11736,54 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         {
             return None;
         }
+        self.constraint_naming(container)
+    }
+
+    /// The same for a static abstract or virtual property, whose accessor
+    /// symbols exist only where the interface wrote a body for them: the
+    /// property itself says it is static and abstract, or its accessors do
+    /// where it was read from metadata.
+    fn static_abstract_property_constraint(&self, property: SymbolId) -> Option<(SymbolId, Type)> {
+        let symbols = self.emitter.compilation.symbols();
+        let symbol = symbols.get(property);
+        let container = symbol.container?;
+        let detail = symbol.as_property()?;
+        let has = |flag: Modifiers| {
+            symbol.modifiers.contains(flag)
+                || [detail.getter, detail.setter]
+                    .into_iter()
+                    .flatten()
+                    .any(|accessor| symbols.get(accessor).modifiers.contains(flag))
+        };
+        if symbols.get(container).type_kind() != Some(TypeKind::Interface)
+            || !has(Modifiers::STATIC)
+            || !(has(Modifiers::ABSTRACT) || has(Modifiers::VIRTUAL))
+        {
+            return None;
+        }
+        self.constraint_naming(container)
+    }
+
+    /// The accessor of a static abstract or virtual property as a
+    /// `constrained.` call reaches it: under the constraint's construction
+    /// where it is one.
+    fn constrained_accessor(
+        &mut self,
+        property: SymbolId,
+        construction: &Type,
+        setter: bool,
+    ) -> Result<Token, EmitError> {
+        let receiver = self
+            .emitter
+            .is_constructed(construction)
+            .then_some(construction);
+        self.emitter.property_accessor(property, receiver, setter)
+    }
+
+    /// The type parameter in scope whose constraints include `container`,
+    /// and the construction of it they name.
+    fn constraint_naming(&self, container: SymbolId) -> Option<(SymbolId, Type)> {
+        let symbols = self.emitter.compilation.symbols();
         let mut candidates: Vec<SymbolId> = self.emitter.method_generics.clone();
         if let Some(site) = self
             .owner
@@ -11774,9 +11903,14 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
     }
 
     /// The parameterless constructor of a type the language names by its
-    /// metadata name, where the program declares that type itself: Roslyn
-    /// looks for such a type in the compilation before the references.
-    fn source_constructor(&mut self, qualified: &str) -> Result<Option<Token>, EmitError> {
+    /// metadata name — or the one taking an `object`, with `taking_object` —
+    /// where the program declares that type itself: Roslyn looks for such a
+    /// type in the compilation before the references.
+    fn source_constructor(
+        &mut self,
+        qualified: &str,
+        taking_object: bool,
+    ) -> Result<Option<Token>, EmitError> {
         let compilation = self.emitter.compilation;
         let Some(ty) = compilation.type_by_metadata_name(qualified) else {
             return Ok(None);
@@ -11790,10 +11924,17 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             .iter()
             .copied()
             .find(|candidate| {
-                symbols
-                    .get(*candidate)
-                    .as_method()
-                    .is_some_and(|detail| detail.parameters.is_empty())
+                symbols.get(*candidate).as_method().is_some_and(|detail| {
+                    match detail.parameters[..] {
+                        [] => !taking_object,
+                        [only] => {
+                            taking_object
+                                && self.emitter.special_type_of(&self.emitter.type_of(only))
+                                    == Some(SpecialType::Object)
+                        }
+                        _ => false,
+                    }
+                })
             });
         match constructor {
             Some(constructor) => self.method_token(constructor).map(Some),

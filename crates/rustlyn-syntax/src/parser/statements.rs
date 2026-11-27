@@ -648,6 +648,10 @@ impl Parser {
                         | SyntaxKind::OutKeyword => {
                             p.eat_token();
                         }
+                        // `Local<[Tag] T>` puts an attribute on a type parameter.
+                        SyntaxKind::OpenBracketToken => {
+                            p.parse_attribute_lists();
+                        }
                         _ => return false,
                     }
                 }

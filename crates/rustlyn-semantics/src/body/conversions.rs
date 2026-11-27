@@ -342,6 +342,22 @@ impl BodyBinder<'_> {
             && !target.is_reference_type(self.binder.compilation().symbols())
         {
             self.body.types.insert(value.span, target.clone());
+            // A `null` compared with a `T` stays a `null` that was written:
+            // `default(T) == null` is a question about a value of `T`, and a
+            // `default(T)` standing for the `null` could not be told from the
+            // one the program wrote.
+            if matches!(target, Type::TypeParameter(_)) {
+                let span = value.span;
+                return BoundExpression::new(
+                    BoundExpressionKind::Conversion {
+                        operand: Box::new(value),
+                        conversion: ConversionKind::Identity,
+                        written: false,
+                    },
+                    target.clone(),
+                    span,
+                );
+            }
             return BoundExpression::new(
                 BoundExpressionKind::Default(target.clone()),
                 target.clone(),

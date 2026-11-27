@@ -18941,3 +18941,589 @@ outer.Act3 local.Baz3
 ",
     );
 }
+
+/// `base.E += h` in an overriding event's accessor calls the base's accessor
+/// itself. It was called through the slot, which is the override that asked,
+/// so adding a handler recursed until the stack ran out.
+#[test]
+fn base_event_accessors_are_called_without_dispatch() {
+    check(
+        "BaseEvents",
+        r#"
+using System;
+class B {
+  public virtual event EventHandler E;
+  public virtual event Action<int> F { add { Console.WriteLine("B.F.add"); f += value; } remove { Console.WriteLine("B.F.remove"); f -= value; } }
+  Action<int> f;
+  public void Fire() => E?.Invoke(this, EventArgs.Empty);
+  public void FireF(int n) => f?.Invoke(n);
+  public static event Action S;
+  public static void FireS() => S?.Invoke();
+}
+class D : B {
+  public override event EventHandler E {
+    add { Console.WriteLine("D.add"); base.E += value; }
+    remove { Console.WriteLine("D.remove"); base.E -= value; }
+  }
+  public override event Action<int> F {
+    add { Console.WriteLine("D.F.add"); base.F += value; }
+    remove { Console.WriteLine("D.F.remove"); base.F -= value; }
+  }
+  public void Both(EventHandler h) { base.E += h; base.E -= h; this.E += h; }
+}
+class G<T> where T : class {
+  public virtual event Action<T> Ev;
+  public void Fire(T t) => Ev?.Invoke(t);
+}
+class H : G<string> {
+  public override event Action<string> Ev {
+    add { Console.WriteLine("H.add"); base.Ev += value; }
+    remove { base.Ev -= value; }
+  }
+}
+class I : D {
+  public override event EventHandler E {
+    add { Console.WriteLine("I.add"); base.E += value; }
+    remove { Console.WriteLine("I.remove"); base.E -= value; }
+  }
+}
+class P {
+  static void Main() {
+    int n = 0;
+    EventHandler h = (s, e) => n++;
+    var d = new D();
+    d.E += h; d.E += (s, e) => n += 10; d.Fire(); Console.WriteLine(n);
+    d.E -= h; d.Fire(); Console.WriteLine(n);
+    d.F += x => Console.WriteLine("got " + x); d.FireF(3);
+    d.Both(h); d.Fire(); Console.WriteLine(n);
+    var hh = new H(); hh.Ev += s => Console.WriteLine("ev " + s); hh.Fire("z");
+    var i = new I(); i.E += h; i.Fire(); i.E -= h; i.Fire(); Console.WriteLine(n);
+    B.S += () => Console.WriteLine("S"); B.FireS();
+  }
+}
+"#,
+        r#"D.add
+D.add
+11
+D.remove
+21
+D.F.add
+B.F.add
+got 3
+D.add
+32
+H.add
+ev z
+I.add
+D.add
+I.remove
+D.remove
+33
+S
+"#,
+    );
+}
+
+/// A static abstract or virtual property of an interface this program wrote
+/// is answered by the accessors of the type's own static property, each
+/// through a `MethodImpl` row like a static abstract method's. The interface's
+/// accessors have no symbols until they are given a body, so the row was left
+/// out, and the runtime refused to load the type ("Virtual static method
+/// 'get_Zero' is not implemented") and `T.Zero` had no accessor to call.
+#[test]
+fn a_static_abstract_property_is_answered_through_a_method_impl_row() {
+    check(
+        "StaticAbstractProps",
+        r#"
+using System;
+interface INum<T> where T : INum<T> { static abstract int Zero { get; } static abstract int Rw { get; set; } static virtual int Def { get { return 7; } } static virtual int Def2 => 8; static abstract T Make { get; } }
+struct MyInt : INum<MyInt> {
+  public static int Zero => 5;
+  static int rw;
+  public static int Rw { get { return rw; } set { rw = value; } }
+  public static MyInt Make => new MyInt();
+}
+class K : INum<K> { public static int Zero { get; } = 3; public static int Rw { get; set; } = 4; public static int Def => 70; public static K Make => new K(); }
+class P {
+  static int Z<T>() where T : INum<T> => T.Zero;
+  static int R<T>() where T : INum<T> { T.Rw = T.Rw + 1; return T.Rw; }
+  static int D<T>() where T : INum<T> => T.Def + T.Def2;
+  static void Main() { Console.WriteLine(Z<MyInt>()); Console.WriteLine(Z<K>()); Console.WriteLine(R<MyInt>()); Console.WriteLine(R<K>()); Console.WriteLine(D<MyInt>()); Console.WriteLine(D<K>()); }
+}
+"#,
+        r#"5
+3
+1
+5
+15
+78
+"#,
+    );
+}
+
+/// Reading, writing, `++` and `+=` of `T.Count` on a `T : IC` call the
+/// interface's static accessors through `constrained.`, whether the
+/// implementation is an automatic property, written accessors, an explicit
+/// interface one, or the default body of a static virtual property.
+#[test]
+fn static_abstract_property_accessors_are_reached_through_the_type_parameter() {
+    check(
+        "StaticAbstractPropsRw",
+        r#"
+using System;
+interface IC { static abstract int Count { get; set; } static abstract string Name { get; } static virtual int Twice { get => 2; set { Console.WriteLine("default set " + value); } } static abstract int WriteOnly { set; } }
+class A : IC { public static int Count { get; set; } = 10; public static string Name => "A"; public static int WriteOnly { set { Console.WriteLine("wo " + value); } } }
+struct B : IC { static int c; public static int Count { get => c; set => c = value; } public static string Name { get { return "B"; } } public static int Twice { get => 22; set => Console.WriteLine("B twice " + value); } public static int WriteOnly { set { Console.WriteLine("bwo " + value); } } }
+class E : IC { static int IC.Count { get; set; } static string IC.Name => "E"; static int IC.WriteOnly { set { Console.WriteLine("ewo " + value); } } }
+class G<T> where T : IC {
+  public static int Run() { T.Count = 3; T.Count++; T.Count *= 5; var x = (T.Count = T.Count + 1); return x + T.Count; }
+  public string N() => T.Name + T.Twice;
+}
+class P {
+  static void Go<T>() where T : IC {
+    Console.WriteLine(T.Name);
+    T.Count = 1; T.Count += 4; int y = T.Count++; Console.WriteLine(y + " " + T.Count + " " + (T.Count = 100) + " " + T.Count);
+    Console.WriteLine(T.Twice); T.Twice = 5; T.Twice += 1; T.WriteOnly = 3;
+    Console.WriteLine(G<T>.Run()); Console.WriteLine(new G<T>().N());
+  }
+  static void Main() { Go<A>(); Go<B>(); Go<E>(); }
+}
+"#,
+        r#"A
+5 6 100 100
+2
+default set 5
+default set 3
+wo 3
+42
+A2
+B
+5 6 100 100
+22
+B twice 5
+B twice 23
+bwo 3
+42
+B22
+E
+5 6 100 100
+2
+default set 5
+default set 3
+ewo 3
+42
+E2
+"#,
+    );
+}
+
+/// `foreach (dynamic d in ints)`, `foreach (long n in ints)` and
+/// `foreach (int? n in ints)` convert each element on the way into the
+/// iteration variable. An array was walked with the element stored as it was,
+/// so the `dynamic` held an unboxed `int` and the first use threw.
+#[test]
+fn a_foreach_over_an_array_converts_each_element_to_the_variable() {
+    check(
+        "ForeachConverts",
+        r#"
+using System;
+using System.Collections;
+using System.Collections.Generic;
+class P {
+  static void Main() {
+    foreach (long x in new[] { 1, 2 }) Console.Write(x + 1L);
+    foreach (object o in new[] { 1, 2 }) Console.Write(o);
+    foreach (double d in new[] { 1, 2 }) Console.Write(d / 2);
+    foreach (int? n in new[] { 1, 2 }) Console.Write(n + 1);
+    foreach (IComparable c in new[] { 1, 2 }) Console.Write(c.CompareTo(1));
+    Console.WriteLine();
+    foreach (dynamic i in new[] { 1, 2, 3 }) Console.Write(i + 1);
+    foreach (dynamic s in new[] { "a", "b" }) Console.Write(s + "!");
+    foreach (dynamic s in new int?[] { 1, null }) Console.Write(s == null ? "N" : "V");
+    foreach (dynamic s in new double[] { 1.5 }) Console.Write(s * 2);
+    foreach (dynamic s in new DateTime[] { new DateTime(2020, 1, 2) }) Console.Write(s.Year);
+    foreach (dynamic s in new (int, string)[] { (1, "x") }) Console.Write(s.Item2);
+    foreach (dynamic s in new[,] { { 1, 2 }, { 3, 4 } }) Console.Write(s + 1);
+    foreach (dynamic s in new List<int> { 5, 6 }) Console.Write(s + 1);
+    IEnumerable e = new[] { 7, 8 };
+    foreach (dynamic s in e) Console.Write(s + 1);
+    foreach (dynamic s in new List<string> { "q" }) Console.Write(s.Length);
+    Console.WriteLine();
+    dynamic dv = new[] { 1, 2 };
+    foreach (dynamic x in dv) Console.Write(x * 3);
+    foreach (var x in dv) Console.Write(x * 4);
+    foreach (int x in dv) Console.Write(x * 5);
+    dynamic dl = new List<int> { 4, 5 };
+    foreach (dynamic x in dl) Console.Write(x * 3);
+    foreach (string s in (dynamic)new[] { "z" }) Console.Write(s.Length);
+    Console.WriteLine();
+    ReadOnlySpan<int> span = new int[] { 1, 2 };
+    foreach (dynamic x in new int[][] { new[] { 1 } }) Console.Write(x.Length);
+    Span<int> sp = new int[] { 9 };
+    foreach (object o in sp) Console.Write(o);
+    foreach (long o in span) Console.Write(o);
+    Console.WriteLine();
+  }
+}
+"#,
+        r#"23120.512301
+234a!b!VN32020x234567891
+364851012151
+1912
+"#,
+    );
+}
+
+/// `default(T) == null` is true only where `T`'s default is null: false for
+/// a non-nullable struct. The `null` given the type of `T` and the
+/// `default(T)` the program wrote were the same node, so a comparison of the
+/// two was taken for one of `null` with itself and answered true for every
+/// `T`.
+#[test]
+fn default_of_a_type_parameter_compared_with_null_is_a_question_about_a_value() {
+    check(
+        "GenericDefaultNull",
+        r#"
+using System;
+using System.Collections.Generic;
+struct SV { public int A; }
+interface I { }
+class C : I { }
+struct SI : I { }
+class P {
+  static string A<T>() => default(T) == null ? "null" : "nonnull";
+  static string A2<T>() => null == default(T) ? "null" : "nonnull";
+  static string A3<T>() => default(T) != null ? "nonnull" : "null";
+  static string A4<T>() => (null != default(T)) ? "nonnull" : "null";
+  static string A5<T>() => default(T) is null ? "null" : "nonnull";
+  static string A6<T>() => default(T) is not null ? "nonnull" : "null";
+  static string A7<T>() => default(T)?.ToString() ?? "null";
+  static string A8<T>() => (object)default(T) == null ? "null" : "nonnull";
+  static string A9<T>() { if (default(T) == null) return "null"; else return "nonnull"; }
+  static string A10<T>() { bool b = default(T) == null; return b ? "null" : "nonnull"; }
+  static string A11<T>() { var l = new List<T>(); l.Add(default); return l[0] == null ? "null" : "nonnull"; }
+  static string A12<T>(T t) => t == null || default(T) == null ? "null" : "nonnull";
+  static string A13<T>(T t) => t == null && default(T) == null ? "null" : "nonnull";
+  static string K<T>() where T : class => default(T) == null ? "null" : "nonnull";
+  static string K2<T>() where T : class => (null == default(T)) + "" + (default(T) is null) + default(T)?.ToString();
+  static string S<T>() where T : struct => (default(T) as object == null) + "";
+  static string J<T>() where T : I => default(T) == null ? "null" : "nonnull";
+  static string J2<T>() where T : I => (default(T) != null) + "" + (default(T) is null);
+  static string N<T>() where T : class? => default(T) == null ? "null" : "nonnull";
+  static void Show<T>() { Console.WriteLine(typeof(T).Name + ": " + A<T>() + A2<T>() + A3<T>() + A4<T>() + A5<T>() + A6<T>() + A7<T>() + A8<T>() + A9<T>() + A10<T>() + A11<T>() + A12(default(T)) + A13(default(T))); }
+  static void Main() {
+    Show<int>(); Show<SV>(); Show<string>(); Show<int?>(); Show<DateTime>(); Show<C>(); Show<SI>(); Show<I>(); Show<(int, int)>(); Show<object>(); Show<int[]>();
+    Console.WriteLine(K<C>() + K<string>() + K2<C>());
+    Console.WriteLine(S<int>() + S<SV>());
+    Console.WriteLine(J<C>() + J<SI>() + J<I>() + J2<C>() + J2<SI>());
+    Console.WriteLine(N<C>() + N<string>());
+  }
+}
+"#,
+        r#"Int32: nonnullnonnullnonnullnonnullnonnullnonnull0nonnullnonnullnonnullnonnullnonnullnonnull
+SV: nonnullnonnullnonnullnonnullnonnullnonnullSVnonnullnonnullnonnullnonnullnonnullnonnull
+String: nullnullnullnullnullnullnullnullnullnullnullnullnull
+Nullable`1: nullnullnullnullnullnullnullnullnullnullnullnullnull
+DateTime: nonnullnonnullnonnullnonnullnonnullnonnull01/01/0001 00:00:00nonnullnonnullnonnullnonnullnonnullnonnull
+C: nullnullnullnullnullnullnullnullnullnullnullnullnull
+SI: nonnullnonnullnonnullnonnullnonnullnonnullSInonnullnonnullnonnullnonnullnonnullnonnull
+I: nullnullnullnullnullnullnullnullnullnullnullnullnull
+ValueTuple`2: nonnullnonnullnonnullnonnullnonnullnonnull(0, 0)nonnullnonnullnonnullnonnullnonnullnonnull
+Object: nullnullnullnullnullnullnullnullnullnullnullnullnull
+Int32[]: nullnullnullnullnullnullnullnullnullnullnullnullnull
+nullnullTrueTrue
+FalseFalse
+nullnonnullnullFalseTrueTrueFalse
+nullnull
+"#,
+    );
+}
+
+/// `switch (span) { case "two": ... }` compares what the characters are,
+/// as `span is "two"` does. The label was bound as a `string` constant and
+/// tested by casting the span to `object`, which is not a program the runtime
+/// accepts.
+#[test]
+fn a_switch_statement_on_a_span_of_char_compares_the_characters() {
+    check(
+        "SpanSwitchStatement",
+        r#"
+using System;
+class P {
+  const string K = "kay";
+  static string A(ReadOnlySpan<char> s) {
+    switch (s) {
+      case "one": return "1";
+      case "two": case "deux": return "2";
+      case K: return "k";
+      case "": return "empty";
+      default: return "d";
+    }
+  }
+  static string B(Span<char> s) {
+    switch (s) {
+      case "one" when s.Length == 3: return "1w";
+      case "one": return "1";
+      case "two": return "2";
+    }
+    return "none";
+  }
+  static string C(ReadOnlySpan<char> s) {
+    var r = "";
+    switch (s) {
+      case "a": r += "a"; goto default;
+      case "b": r += "b"; break;
+      case "c": r += "c"; goto default;
+      default: r += "d"; break;
+    }
+    return r;
+  }
+  static string D(ReadOnlySpan<char> s) {
+    switch (s) {
+      case "x" or "y": return "xy";
+      case var t when t.Length > 3: return "long";
+      case "z": return "z";
+      default: return "def";
+    }
+  }
+  static string E(ReadOnlySpan<char> s, int n) {
+    switch (s) {
+      case "p" when n > 1: return "p>1";
+      case "p": return "p";
+      case "q": switch (s) { case "q": return "qq"; default: return "never"; }
+    }
+    return "-";
+  }
+  static void Main() {
+    foreach (var w in new[] { "one", "two", "deux", "kay", "", "zzz" }) Console.Write(A(w.AsSpan()) + " ");
+    Console.WriteLine();
+    foreach (var w in new[] { "one", "two", "x" }) Console.Write(B(w.ToCharArray()) + " ");
+    Console.WriteLine();
+    foreach (var w in new[] { "a", "b", "c", "e" }) Console.Write(C(w) + " ");
+    Console.WriteLine();
+    foreach (var w in new[] { "x", "y", "z", "long!", "q" }) Console.Write(D(w) + " ");
+    Console.WriteLine();
+    Console.WriteLine(E("p", 2) + E("p", 0) + E("q", 0) + E("r", 0));
+  }
+}
+"#,
+        r#"1 2 2 k empty d 
+1w 2 none 
+ad b cd d 
+xy xy z long def 
+p>1pqq-
+"#,
+    );
+}
+
+/// A switch expression no arm of which matches throws a
+/// `SwitchExpressionException` made with the value, boxed: `UnmatchedValue`
+/// holds it and the message says so. Only what cannot be boxed — a ref struct
+/// — or is null leaves it out. It was made with no value for every input.
+#[test]
+fn a_switch_expression_that_matches_nothing_throws_with_the_unmatched_value() {
+    check(
+        "SwitchExpressionValue",
+        r#"
+using System;
+using System.Runtime.CompilerServices;
+enum Sz { S, M }
+struct Pt { public int X, Y; }
+class Cls { public int V; }
+ref struct RS { public int A; public int Get() => A; }
+class P {
+  static void T(string name, Action a) {
+    try { a(); Console.WriteLine(name + ": no throw"); }
+    catch (SwitchExpressionException ex) { Console.WriteLine(name + ": " + ex.Message.Replace("\n", "\\n") + "|" + (ex.UnmatchedValue?.ToString() ?? "<null>") + "|" + (ex.UnmatchedValue?.GetType().Name ?? "-")); }
+  }
+  static int G<TT>(TT t) => t switch { string s => 1 };
+  static int Dyn(dynamic d) => d switch { 1 => 1 };
+  static int Sp(ReadOnlySpan<char> s) => s switch { "a" => 1 };
+  static int Rs(RS r) => r switch { { A: 1 } => 1 };
+  static void Main() {
+    T("int", () => { int i = 9; var r = i switch { 1 => 1 }; });
+    T("enum", () => { var r = (Sz)7 switch { Sz.S => 1 }; });
+    T("string", () => { var r = "zz" switch { "a" => 1 }; });
+    T("null string", () => { string s = null; var r = s switch { "a" => 1 }; });
+    T("object", () => { object o = 3.5; var r = o switch { int => 1 }; });
+    T("struct", () => { var p = new Pt { X = 1 }; var r = p switch { { X: 2 } => 1 }; });
+    T("class", () => { var c = new Cls(); var r = c switch { { V: 2 } => 1 }; });
+    T("nullable", () => { int? n = 5; var r = n switch { 1 => 1 }; });
+    T("nullable null", () => { int? n = null; var r = n switch { 1 => 1 }; });
+    T("tuple lit", () => { var r = (1, 2) switch { (0, _) => 1 }; });
+    T("tuple lit3", () => { var r = (1, "x", 3.0) switch { (0, _, _) => 1 }; });
+    T("tuple var", () => { var t = (1, 2); var r = t switch { (0, _) => 1 }; });
+    T("generic", () => G(5));
+    T("generic2", () => G<object>(5));
+    T("dyn", () => Dyn(5));
+    T("span", () => Sp("b".AsSpan()));
+    T("refstruct", () => Rs(new RS { A = 3 }));
+    T("char", () => { var r = 'q' switch { 'a' => 1 }; });
+    T("double", () => { var r = 2.5 switch { 1.0 => 1 }; });
+    T("bool", () => { var r = true switch { false => 1 }; });
+    T("array", () => { var a = new[] { 1, 2 }; var r = a switch { [1] => 1 }; });
+    T("when", () => { int i = 4; var r = i switch { var x when x > 10 => 1 }; });
+    T("expr", () => { var r = (Sz.M, true) switch { (Sz.S, _) => 1 }; });
+    T("long", () => { long l = 1L << 40; var r = l switch { 1 => 1 }; });
+    T("decimal", () => { var r = 1.5m switch { 1 => 1 }; });
+    T("typeof", () => { var r = typeof(int) switch { null => 1 }; });
+    T("func", () => { Func<int> f = () => 1; var r = f switch { null => 1 }; });
+  }
+}
+"#,
+        r#"int: Non-exhaustive switch expression failed to match its input.\nUnmatched value was 9.|9|Int32
+enum: Non-exhaustive switch expression failed to match its input.\nUnmatched value was 7.|7|Sz
+string: Non-exhaustive switch expression failed to match its input.\nUnmatched value was zz.|zz|String
+null string: Non-exhaustive switch expression failed to match its input.|<null>|-
+object: Non-exhaustive switch expression failed to match its input.\nUnmatched value was 3.5.|3.5|Double
+struct: Non-exhaustive switch expression failed to match its input.\nUnmatched value was Pt.|Pt|Pt
+class: Non-exhaustive switch expression failed to match its input.\nUnmatched value was Cls.|Cls|Cls
+nullable: Non-exhaustive switch expression failed to match its input.\nUnmatched value was 5.|5|Int32
+nullable null: Non-exhaustive switch expression failed to match its input.|<null>|-
+tuple lit: Non-exhaustive switch expression failed to match its input.\nUnmatched value was (1, 2).|(1, 2)|ValueTuple`2
+tuple lit3: Non-exhaustive switch expression failed to match its input.\nUnmatched value was (1, x, 3).|(1, x, 3)|ValueTuple`3
+tuple var: Non-exhaustive switch expression failed to match its input.\nUnmatched value was (1, 2).|(1, 2)|ValueTuple`2
+generic: Non-exhaustive switch expression failed to match its input.\nUnmatched value was 5.|5|Int32
+generic2: Non-exhaustive switch expression failed to match its input.\nUnmatched value was 5.|5|Int32
+dyn: Non-exhaustive switch expression failed to match its input.\nUnmatched value was 5.|5|Int32
+span: Non-exhaustive switch expression failed to match its input.|<null>|-
+refstruct: Non-exhaustive switch expression failed to match its input.|<null>|-
+char: Non-exhaustive switch expression failed to match its input.\nUnmatched value was q.|q|Char
+double: Non-exhaustive switch expression failed to match its input.\nUnmatched value was 2.5.|2.5|Double
+bool: Non-exhaustive switch expression failed to match its input.\nUnmatched value was True.|True|Boolean
+array: Non-exhaustive switch expression failed to match its input.\nUnmatched value was System.Int32[].|System.Int32[]|Int32[]
+when: Non-exhaustive switch expression failed to match its input.\nUnmatched value was 4.|4|Int32
+expr: Non-exhaustive switch expression failed to match its input.\nUnmatched value was (M, True).|(M, True)|ValueTuple`2
+long: Non-exhaustive switch expression failed to match its input.\nUnmatched value was 1099511627776.|1099511627776|Int64
+decimal: Non-exhaustive switch expression failed to match its input.\nUnmatched value was 1.5.|1.5|Decimal
+typeof: Non-exhaustive switch expression failed to match its input.\nUnmatched value was System.Int32.|System.Int32|RuntimeType
+func: Non-exhaustive switch expression failed to match its input.\nUnmatched value was System.Func`1[System.Int32].|System.Func`1[System.Int32]|Func`1
+"#,
+    );
+}
+
+/// Where the program declares `SwitchExpressionException` itself, the one
+/// that takes the value is the one made, and the parameterless one where that
+/// is all it has.
+#[test]
+fn a_switch_expression_uses_the_exception_the_program_declares_with_the_value() {
+    check(
+        "SwitchExpressionOwnException",
+        r#"
+using System;
+namespace System.Runtime.CompilerServices {
+  public class SwitchExpressionException : Exception {
+    public SwitchExpressionException(object v) : base("mine " + v) { }
+    public SwitchExpressionException() : base("mine none") { }
+  }
+}
+class P { static void Main() {
+  try { int i = 4; var r = i switch { 1 => 1 }; } catch (Exception e) { Console.WriteLine(e.GetType().Namespace + e.Message); }
+  try { var r = (1, 2) switch { (0, _) => 1 }; } catch (Exception e) { Console.WriteLine(e.Message); }
+} }
+"#,
+        r#"System.Runtime.CompilerServicesmine 4
+mine (1, 2)
+"#,
+    );
+}
+
+/// `o is ValueTuple<int, int>(var a, var b)` matches the tuple `(int, int)`
+/// is, and takes it apart by its fields: `ValueTuple` declares no
+/// `Deconstruct` to call, so the parts had no type and the locals they named
+/// could not be emitted. A `ValueTuple` input is no `ITuple` either, and its
+/// parts are typed (`x > 5` on one of them).
+#[test]
+fn a_positional_pattern_on_a_value_tuple_written_out_takes_it_apart() {
+    check(
+        "ValueTuplePatterns",
+        r#"
+using System;
+class P {
+  static string A(object o) => o is ValueTuple<int, int>(var a, var b) ? "t" + a + b : "o";
+  static string B(ValueTuple<int, string> t) => t is (var a, "x") ? "x" + a : t is (1, _) ? "one" : "no";
+  static string C(object o) => o is (int a, > 3) ? "c" + a : "no";
+  static string D(object o) => o is ValueTuple<(int, int), string>(var p, var q) ? "n2" + p + q : "no";
+  static string E(object o) => o is (var a, _, _, _, _, _, _, _, var i) ? "long" + a + i : "no";
+  static string F(object o) => o is ValueTuple<int, int, int, int, int, int, int, ValueTuple<int, int>>(1, _, _, _, _, _, _, 8, var z) ? "f" + z : "no";
+  static string G((int, int)? n) => n is (var a, var b) ? "g" + a + b : "none";
+  static string H(object o) => o switch { ValueTuple<int, int>(0, var y) => "z" + y, ValueTuple<int, int>(var x, 0) => "w" + x, ValueTuple<int, int> => "any", _ => "other" };
+  static string I(object o) => o is ValueTuple<int, int> { Item1: 1 } ? "item1" : "no";
+  static string J(object o) => o is ValueTuple<int, int>(var a, var b) t ? "j" + a + b + t.Item1 : "no";
+  static string K(ValueTuple<int, int> v) { var (a, b) = v; return v switch { (1, 2) => "12", (var x, _) when x > 5 => "big" + a, _ => "else" + b }; }
+  static string L(ValueTuple<int, int> v) => v is (1, var b) ? "l" + b : v is { Item2: 2 } ? "m" : "n";
+  static void Main() {
+    Console.WriteLine(A((3, 4)) + A("s") + B((5, "x")) + B((1, "y")) + B((7, "z")));
+    Console.WriteLine(C((1, 5)) + C((1, 2)) + D(((1, 2), "s")) + D(((3, 4), "t")) + D(5));
+    Console.WriteLine(E((1, 2, 3, 4, 5, 6, 7, 8, 9)) + E((1, 2)) + F((1, 2, 3, 4, 5, 6, 7, 8, 9)) + F((2, 2, 3, 4, 5, 6, 7, 8, 9)));
+    Console.WriteLine(G((1, 2)) + G(null) + H((0, 5)) + H((6, 0)) + H((1, 1)) + H("q"));
+    Console.WriteLine(I((1, 2)) + I((2, 2)) + J((8, 9)) + K((1, 2)) + K((9, 9)) + K((2, 3)) + L((1, 4)) + L((3, 2)) + L((3, 3)));
+  }
+}
+"#,
+        r#"t34ox5oneno
+c1non2(1, 2)sn2(3, 4)tno
+long19nof9no
+g12nonez5w6anyother
+item1noj89812big9else3l4mn
+"#,
+    );
+}
+
+/// `[Tag] void Local()`, `[return: Tag]` and `[Tag]` on its parameters and
+/// type parameters, on iterator, `async` and static local functions and on
+/// lambdas of every shape, are written on the methods they became. A local
+/// function's own and its return's were dropped; only its parameters kept
+/// theirs.
+#[test]
+fn attributes_on_local_functions_and_lambdas_are_emitted() {
+    check(
+        "LocalFunctionAttributes",
+        r#"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Threading.Tasks;
+[AttributeUsage(AttributeTargets.All, AllowMultiple = true)] class TagAttribute : Attribute { public string N; public TagAttribute(string n) { N = n; } public override string ToString() => "Tag(" + N + ")"; }
+class P {
+  static string Show(MethodInfo m) =>
+    m.Name.Substring(0, Math.Min(m.Name.Length, 6)) + ":" + string.Join(";", m.GetCustomAttributes().OfType<TagAttribute>().Select(a => a.ToString()))
+    + "|ret=" + string.Join(";", m.ReturnParameter.GetCustomAttributes().OfType<TagAttribute>().Select(a => a.ToString()))
+    + "|p=" + string.Join(";", m.GetParameters().Select(p => p.Name + "=" + string.Join(",", p.GetCustomAttributes().OfType<TagAttribute>().Select(a => a.ToString()))));
+  static int Outer(int seed) {
+    [Tag("a1"), Tag("a2")] int Cap(int x) => x + 1;
+    [return: Tag("r")] static int Ret(int q) => q;
+    [Tag("it")] IEnumerable<int> Iter([Tag("ip")] int n) { yield return n; }
+    [Tag("as")] [return: Tag("asr")] async Task<int> Asy([Tag("ap")] int n) { await Task.Yield(); return n; }
+    static void Generic<[Tag("tp")] T>([Tag("gp")] T t) { }
+    [Tag("ext")] static int WithDefault(int a, [Tag("dp")] int b = 3) => a + b;
+    Func<int, int> l1 = [Tag("l1")] [return: Tag("l1r")] ([Tag("l1p")] int a) => a + seed;
+    Func<int, Task<int>> l2 = [Tag("l2")] [return: Tag("l2r")] async ([Tag("l2p")] int a) => { await Task.Yield(); return a; };
+    Action<int> l3 = [Tag("l3")] static ([Tag("l3p")] int a) => { };
+    var l4 = [Tag("l4")] (int a, [Tag("l4b")] int b) => a + b;
+    return Cap(1) + Ret(2) + Iter(3).Sum() + Asy(4).Result + WithDefault(1) + l1(1) + l2(2).Result + l4(1, 2);
+  }
+  static void Main() {
+    Console.WriteLine(Outer(1));
+    var all = typeof(P).GetMethods(BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly).Where(m => m.Name.Contains("g__") || m.Name.Contains("<Outer>")).Select(Show).OrderBy(x => x);
+    foreach (var s in all) Console.WriteLine(s);
+    var nested = typeof(P).GetNestedTypes(BindingFlags.NonPublic).SelectMany(t => t.GetMethods(BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)).Where(m => m.Name.Contains("<Outer>")).Select(Show).OrderBy(x => x);
+    foreach (var s in nested) Console.WriteLine(s);
+  }
+}
+"#,
+        r#"22
+<Outer:|ret=|p=t=Tag(gp)
+<Outer:|ret=Tag(r)|p=q=
+<Outer:Tag(a1);Tag(a2)|ret=|p=x=
+<Outer:Tag(as)|ret=Tag(asr)|p=n=Tag(ap)
+<Outer:Tag(ext)|ret=|p=a=;b=Tag(dp)
+<Outer:Tag(it)|ret=|p=n=Tag(ip)
+<Outer:Tag(l1)|ret=Tag(l1r)|p=a=Tag(l1p)
+<Outer:Tag(l2)|ret=Tag(l2r)|p=a=Tag(l2p)
+<Outer:Tag(l3)|ret=|p=a=Tag(l3p)
+<Outer:Tag(l4)|ret=|p=a=;b=Tag(l4b)
+"#,
+    );
+}

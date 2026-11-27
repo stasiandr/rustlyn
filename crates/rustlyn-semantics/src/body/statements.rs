@@ -1238,10 +1238,15 @@ impl BodyBinder<'_> {
                                     _ => match self.union_constant_test(&input, value, part.span())
                                     {
                                         Ok(pattern) => pattern,
-                                        Err(value) => BoundPattern::new(
-                                            BoundPatternKind::Constant(*value),
-                                            part.span(),
-                                        ),
+                                        // `case "two":` on a span compares
+                                        // what the characters are, as `span is
+                                        // "two"` does.
+                                        Err(value) => {
+                                            let kind = self
+                                                .span_string_test(&value, &input, part.span())
+                                                .unwrap_or(BoundPatternKind::Constant(*value));
+                                            BoundPattern::new(kind, part.span())
+                                        }
                                     },
                                 };
                                 BoundSwitchLabel::Case(Box::new(BoundCaseLabel {

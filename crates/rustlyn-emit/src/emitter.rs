@@ -3124,12 +3124,32 @@ impl Emitter<'_> {
             }
             self.write_custom_attributes(parent, symbol, AttributeTarget::Method)?;
         }
+        // `[Tag] void Local() { }` says it on the method the function became.
+        if let Some(function) = self.local_function_of(&method.source) {
+            self.write_custom_attributes(parent, function, AttributeTarget::Method)?;
+        }
         if let MethodSource::Lambda { owner, index }
         | MethodSource::AsyncStart(MachineKey::Lambda { owner, index }) = method.source
         {
             self.write_lambda_attributes(token, owner, index)?;
         }
         Ok(())
+    }
+
+    /// The local function a method was made from, whether its body stayed
+    /// one or started a state machine.
+    fn local_function_of(&mut self, source: &MethodSource) -> Option<SymbolId> {
+        let (MethodSource::LocalFunction { owner, index }
+        | MethodSource::IteratorStart(MachineKey::Function { owner, index })
+        | MethodSource::AsyncStart(MachineKey::Function { owner, index })) = *source
+        else {
+            return None;
+        };
+        self.body_of(owner).and_then(|body| {
+            body.local_functions
+                .get(index)
+                .map(|function| function.symbol)
+        })
     }
 
     /// `[IteratorStateMachine(typeof(M))]`, `[AsyncStateMachine(...)]` or
@@ -7293,16 +7313,22 @@ impl Emitter<'_> {
                 continue;
             };
             // A property read from metadata says `static abstract` on its
-            // accessors, not on itself.
-            let Some(accessor) = symbols
-                .get(declared)
-                .as_property()
-                .and_then(|detail| if setter { detail.setter } else { detail.getter })
-            else {
+            // accessors, not on itself. One written in an interface has the
+            // accessor symbol only where it was given a body, so that the
+            // property says whether it has the accessor at all.
+            let Some(detail) = symbols.get(declared).as_property() else {
                 continue;
             };
+            if !(if setter {
+                detail.has_set
+            } else {
+                detail.has_get
+            }) {
+                continue;
+            }
+            let accessor = if setter { detail.setter } else { detail.getter };
             let has = |flag: Modifiers| {
-                symbols.get(accessor).modifiers.contains(flag)
+                accessor.is_some_and(|accessor| symbols.get(accessor).modifiers.contains(flag))
                     || symbols.get(declared).modifiers.contains(flag)
             };
             if !has(Modifiers::STATIC)
@@ -9152,11 +9178,14 @@ impl Emitter<'_> {
                     .filter(|shape| Self::nullable_needed(&shape.returns, shape.effective));
                 let return_attributes = match method.source {
                     MethodSource::Declared(symbol) => self.has_return_attributes(symbol),
-                    _ => None,
+                    _ => self
+                        .local_function_of(&method.source)
+                        .and_then(|function| self.has_return_attributes(function)),
                 };
                 // `[return: A] x => x` says it on the lambda.
                 let lambda_returns = match method.source {
-                    MethodSource::Lambda { owner, index } => {
+                    MethodSource::Lambda { owner, index }
+                    | MethodSource::AsyncStart(MachineKey::Lambda { owner, index }) => {
                         self.lambda_node(owner, index).filter(|(_, node)| {
                             !attributes_for(node, AttributeTarget::Return).is_empty()
                         })

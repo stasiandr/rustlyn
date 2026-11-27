@@ -683,7 +683,7 @@ impl BodyBinder<'_> {
     /// what the characters are is compared, with
     /// `MemoryExtensions.SequenceEqual(span, "str".AsSpan())`, as Roslyn
     /// lowers it. `None` for any other input or constant.
-    fn span_string_test(
+    pub(super) fn span_string_test(
         &mut self,
         value: &BoundExpression,
         input: &Type,
@@ -1020,7 +1020,7 @@ impl BodyBinder<'_> {
                 && node
                     .child_of_kind(SyntaxKind::SingleVariableDesignation)
                     .is_none()
-                && !matches!(matched, Type::Tuple(_))
+                && self.binder.tuple_elements(&matched).is_none()
                 && self.find_deconstruct(&matched, parts.len()).is_none()
                 && let Some(tuple) = self.ituple_for(&matched)
             {
@@ -1030,6 +1030,17 @@ impl BodyBinder<'_> {
             let types: Option<Vec<Type>> = match &matched {
                 Type::Tuple(elements) if elements.len() == parts.len() => {
                     Some(elements.iter().map(|element| element.ty.clone()).collect())
+                }
+                // `ValueTuple<int, int>` is the tuple `(int, int)`, and takes
+                // its parts apart the same way, though it declares no
+                // `Deconstruct` to call.
+                Type::Named { .. }
+                    if self
+                        .binder
+                        .tuple_elements(&matched)
+                        .is_some_and(|elements| elements.len() == parts.len()) =>
+                {
+                    self.binder.tuple_elements(&matched)
                 }
                 // An instance `Deconstruct`, or an extension one in scope
                 // that needs nothing from the parts to be chosen.
