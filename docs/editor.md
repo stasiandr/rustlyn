@@ -167,6 +167,18 @@ table format is not stable between builds.
   text, what type declaration reported (carried across the edit), and what binding each
   body finds. On the Roslyn compilers, the same 310 diagnostics as a full `bind` run, at
   15 ms per file.
+  Among the IDE analyzers are the thread diagnostics: RLN1001 (a field two threads touch
+  with nothing between them), RLN1002 (Unity's main-thread API off the main thread) and
+  RLN1003 (a local every `Parallel.For` iteration writes). They report only where two
+  accesses can overlap: a task or thread started and not waited for, an `async void`
+  method or an async call nobody awaits, two iterations of a parallel loop. The code
+  after an `await` is the same flow as the code before it. A wait (`await`, `Wait`,
+  `Result`, `Join`, `WaitAll`, `WhenAll`, a gate such as `ManualResetEventSlim` or a
+  `TaskCompletionSource`) orders what follows it; a lock held on both sides excludes
+  (`lock`, `Monitor`, `SemaphoreSlim`, `Mutex`, `SpinLock`, `ReaderWriterLockSlim`);
+  `arr[i]` with the loop's own index is an element of its own. What the analysis cannot
+  tell, such as a lock a caller holds or an ordering a protocol between methods gives, it
+  does not report.
 * `rln_signatures`: overloads of the call being typed, the matching one and the
   parameter under the cursor, including for a call that does not bind yet (then the
   methods are asked of the type left of the dot).

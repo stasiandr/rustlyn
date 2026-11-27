@@ -30,6 +30,23 @@ an item says otherwise.
 Thread-safety analysis (`RLN1001`–`RLN1003`) and the per-method failability
 pass are part of `rustlyn-ide`'s diagnostics; `blast` and `fail` use them.
 
+The thread diagnostics report a pair of accesses only where nothing can be shown to
+order or exclude them. Two accesses overlap when one is in code started and not waited
+for (`Task.Run`, `Task.Factory.StartNew`, a `Thread`, the thread pool, a timer, an
+`async void` method or an async call that is a statement of its own, a `ContinueWith`
+body) and the other is outside it, or when both are in the body of a `Parallel` call.
+They do not overlap when the code before and after an `await` is one flow, when the
+thread was waited for first (`await`, `Wait`, `Result`, `GetAwaiter().GetResult()`,
+`Join`, `Task.WaitAll`, `Task.WhenAll` awaited or waited, a signalled gate), when a
+`ContinueWith` body follows its antecedent, or when both hold the same lock (`lock`,
+`Monitor`, `SemaphoreSlim`, `Mutex`, `SpinLock`, `ReaderWriterLockSlim`). A lock on one
+side only, or two different locks, is still reported ("under different locks"). The
+operand of `lock` is not an access of the field. `arr[i]` in a `Parallel.For` body with
+the loop's own index is not a shared write; `arr[0]` and `arr[i % 2]` are. A lock held
+by a caller, and a protocol between methods (a flag set before a start message), are not
+judged. The module docs of `crates/rustlyn-ide/src/semantic/analyzers/threads.rs` list
+each rule.
+
 ## Command-line tools
 
 Build them with `cargo build --release -p rustlyn-analyzer`.
