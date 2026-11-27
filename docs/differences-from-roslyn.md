@@ -89,6 +89,12 @@ implements the behaviour.
   (CS8310), a target that is not a variable (CS1612 and CS1510 are not said either), and
   any compound assignment where an extension block (C# 14) declares an operator of that
   name.
+* An instance operator (C# 14: `void operator +=(int x)`, `void operator ++()`, each with its
+  `checked` form) is called in place on a variable of the type that declares it, as Roslyn
+  does, but only for the types it finds the operator on: one an extension block declares for a
+  type is not called, and what is wrong with a use or a declaration (an operator that is not
+  `void`, a regular and a checked operator that do not pair, an instance and a static `++`
+  that clash, an ambiguity between two operators) is not reported.
 * A `decimal` constant is folded as `System.Decimal` works it out, except for one corner
   of `%` that .NET sometimes refuses with an overflow and whose rule is not known: that
   expression is left unfolded, so a `const` made of it is not a compile-time constant to

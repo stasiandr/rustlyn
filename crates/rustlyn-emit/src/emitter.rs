@@ -8010,7 +8010,11 @@ impl Emitter<'_> {
                 | method_attributes::VIRTUAL
                 | method_attributes::NEW_SLOT
                 | method_attributes::HIDE_BY_SIG;
-        } else if !interface && instance && self.implements_an_interface_member(method) {
+        } else if !interface
+            && instance
+            && self.implements_an_interface_member(method)
+            && !self.needs_forwarder(method)
+        {
             flags |= implementing_flags(modifiers);
         }
         if synthesized && !instance {
@@ -12425,6 +12429,78 @@ impl Emitter<'_> {
         ty
     }
 
+    /// Whether two parameter lists differ in their `in` modifiers: one is
+    /// under a `modreq(InAttribute)` where the other is not, or each names
+    /// another assembly's `InAttribute`.
+    fn in_modifiers_differ(&self, left: &[SymbolId], right: &[SymbolId]) -> bool {
+        left.len() == right.len()
+            && left.iter().zip(right).any(|(left, right)| {
+                let (on_left, on_right) = (self.in_modifier(*left, 0), self.in_modifier(*right, 0));
+                on_left != on_right
+                    || (on_left && self.in_attribute_type(*left) != self.in_attribute_type(*right))
+            })
+    }
+
+    /// Whether two members return `ref readonly` under different
+    /// `InAttribute`s.
+    fn return_modifier_differs(&self, left: SymbolId, right: SymbolId) -> bool {
+        let symbols = self.compilation.symbols();
+        let readonly = |member: SymbolId| {
+            let symbol = symbols.get(member);
+            symbol
+                .as_method()
+                .is_some_and(|detail| detail.returns_readonly)
+                || symbol
+                    .as_property()
+                    .is_some_and(|detail| detail.returns_readonly)
+        };
+        readonly(left)
+            && readonly(right)
+            && self.in_attribute_type(left) != self.in_attribute_type(right)
+    }
+
+    /// Whether a method that implements an interface member implicitly is
+    /// answered through a forwarding method (see [`MethodSource::Forwarding`]):
+    /// it is then a method of its own and not the slot, as Roslyn writes it.
+    fn needs_forwarder(&self, method: SymbolId) -> bool {
+        let symbols = self.compilation.symbols();
+        let Some(class) = symbols.get(method).container else {
+            return false;
+        };
+        let Some(found) = symbols.get(method).as_method() else {
+            return false;
+        };
+        if !found.type_parameters.is_empty() {
+            return false;
+        }
+        let name = symbols.get(method).name.clone();
+        let explicit = format!(".{name}");
+        if symbols
+            .get(class)
+            .members
+            .iter()
+            .any(|other| symbols.get(*other).name.ends_with(&explicit))
+        {
+            return false;
+        }
+        self.implemented_interfaces(class)
+            .iter()
+            .filter_map(Type::symbol)
+            .any(|interface| {
+                symbols.get(interface).members.iter().any(|member| {
+                    let symbol = symbols.get(*member);
+                    symbol.kind == SymbolKind::Method
+                        && symbol.name == name
+                        && !symbol.modifiers.contains(Modifiers::STATIC)
+                        && self.same_signature(method, *member)
+                        && symbol.as_method().is_some_and(|wanted| {
+                            self.in_modifiers_differ(&wanted.parameters, &found.parameters)
+                                || self.return_modifier_differs(*member, method)
+                        })
+                })
+            })
+    }
+
     /// The methods that answer an interface member for the member of this
     /// type that implements it implicitly, where the two signatures differ
     /// in their `in` modifiers (see [`MethodSource::Forwarding`]).
@@ -12447,30 +12523,10 @@ impl Emitter<'_> {
         // `IIdx<!0>` under `R<T> : IDb<T>`, not `IDb`'s own `IIdx<T>`.
         let interfaces = self.implemented_interfaces(class);
         let differs = |this: &Self, left: &[SymbolId], right: &[SymbolId]| {
-            left.len() == right.len()
-                && left.iter().zip(right).any(|(left, right)| {
-                    let (on_left, on_right) =
-                        (this.in_modifier(*left, 0), this.in_modifier(*right, 0));
-                    on_left != on_right
-                        || (on_left
-                            && this.in_attribute_type(*left) != this.in_attribute_type(*right))
-                })
+            this.in_modifiers_differ(left, right)
         };
-        // A `ref readonly` return is under a `modreq(InAttribute)` on both
-        // sides, and the two may name different `InAttribute`s.
         let return_differs = |this: &Self, left: SymbolId, right: SymbolId| {
-            let readonly = |member: SymbolId| {
-                let symbol = symbols.get(member);
-                symbol
-                    .as_method()
-                    .is_some_and(|detail| detail.returns_readonly)
-                    || symbol
-                        .as_property()
-                        .is_some_and(|detail| detail.returns_readonly)
-            };
-            readonly(left)
-                && readonly(right)
-                && this.in_attribute_type(left) != this.in_attribute_type(right)
+            this.return_modifier_differs(left, right)
         };
         let mut plans = Vec::new();
         for interface in interfaces {

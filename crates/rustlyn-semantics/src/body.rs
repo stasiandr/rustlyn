@@ -37,6 +37,7 @@ mod elements;
 mod expressions;
 mod foreach;
 mod inference;
+mod instance_operators;
 mod interpolation;
 mod lambdas;
 mod members;

@@ -3044,6 +3044,9 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             // somewhere of its own as much as any other field is.
             BoundExpressionKind::Local(local) => self.captured_local(*local).is_some(),
             BoundExpressionKind::Parameter(symbol) => self.captured_parameter(*symbol).is_some(),
+            // The copy of a struct's `this` an `async` method's machine keeps
+            // is the one its calls change.
+            BoundExpressionKind::This => self.captured_this().is_some(),
             BoundExpressionKind::Assignment {
                 target,
                 value: from,

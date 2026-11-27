@@ -1262,6 +1262,12 @@ impl BodyBinder<'_> {
                     Some(operand) => {
                         let target = self.bind_expression(&operand);
                         let ty = target.ty.clone();
+                        // A type can change the variable itself (C# 14).
+                        if let Some(call) =
+                            self.bind_in_place_increment(node, operator, prefix, &target, span)
+                        {
+                            return call;
+                        }
                         // A type can say what `++` means on it, and then that
                         // is what it means.
                         let name = match operator {

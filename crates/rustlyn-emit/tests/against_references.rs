@@ -24185,3 +24185,560 @@ val in
 ",
     );
 }
+
+#[test]
+fn in_place_compound_assignment_and_increment_call_the_instance_operator() {
+    // C# 14: a type that declares `void operator +=(int x)` is changed in place where `x += y` is
+    // written on a variable, and the result of the expression, where it is used, is the variable:
+    // a struct is copied before the right operand runs and stored back after, and a postfix `x++`
+    // whose value is used keeps the static `++`. A class or struct property is no variable.
+    check(
+        "in_place_operators_on_variables",
+        r#"using System;
+public class K {
+  public int F;
+  public void operator +=(int x) { F += x; Console.Write("[K+=" + x + "]"); }
+  public void operator ++() { F += 100; Console.Write("[K++]"); }
+  public static K operator ++(K k) { Console.Write("[static K++]"); return k; }
+}
+public struct S {
+  public int F;
+  public void operator +=(int x) { F += x; Console.Write("[S+=" + x + "]"); }
+  public void operator ++() { F += 100; Console.Write("[S++]"); }
+  public static S operator ++(S k) { Console.Write("[static S++]"); k.F += 1000; return k; }
+}
+public class Holder {
+  public K KP { get; set; } = new K();
+  public S SP { get; set; }
+  public K KF = new K();
+  public S SF;
+  public K this[int i] { get => KF; set { Console.Write("[set]"); KF = value; } }
+  public readonly S RO;
+}
+public class P {
+  static S sf; static K kf = new K();
+  static void Main() {
+    var h = new Holder();
+    K k = new K(); S s = new S();
+    k += 1; s += 2; Console.WriteLine(k.F + " " + s.F);
+    h.KF += 4; Console.WriteLine(h.KF.F);
+    h.SF += 5; Console.WriteLine(h.SF.F);
+    sf += 7; kf += 8; Console.WriteLine(sf.F + " " + kf.F);
+    ++k; k++; ++s; s++; Console.WriteLine(k.F + " " + s.F);
+    var k2 = ++k; Console.WriteLine(k2.F + " " + (k2 == k));
+    var s2 = ++s; Console.WriteLine(s2.F + " " + s.F);
+    var s3 = s++; Console.WriteLine(s3.F + " " + s.F);
+    var k3 = k++; Console.WriteLine(k3.F + " " + k.F);
+    var k4 = (k += 5); Console.WriteLine(k4.F + " " + (k4 == k));
+    S? ns = new S();
+    int[] arr = {1};
+    S[] sa = new S[1]; sa[0] += 9; Console.WriteLine(sa[0].F);
+    Console.WriteLine((s += 1).F);
+  }
+}
+"#,
+        "[K+=1][S+=2]1 2
+[K+=4]4
+[S+=5]5
+[S+=7][K+=8]7 8
+[K++][K++][S++][S++]201 202
+[K++]301 True
+[S++]302 302
+[static S++]302 1302
+[static K++]301 301
+[K+=5]306 True
+[S+=9]9
+[S+=1]1303
+",
+    );
+}
+
+#[test]
+fn in_place_operators_work_in_lambdas_async_methods_and_through_places() {
+    // The same on the places a struct can be in: `this`, a `ref` local, a `ref` return, a field and
+    // an element, a pointer; in the body of a lambda and a `for` step, where the value is not used;
+    // and across an `await`, where what locates the variable is kept before the operand runs.
+    check(
+        "in_place_operators_in_every_place",
+        r#"using System;
+using System.Threading.Tasks;
+public class K {
+  public int F;
+  public void operator +=(int x) { F += x; Console.Write("[K+=" + x + "]"); }
+  public void operator ++() { F += 100; Console.Write("[K++]"); }
+  public static K operator ++(K k) { Console.Write("[static K++]"); return k; }
+}
+public struct S {
+  public int F;
+  public void operator +=(int x) { F += x; Console.Write("[S+=" + x + "]"); }
+  public void operator ++() { F += 100; Console.Write("[S++]"); }
+  public void Self() { this += 5; ++this; Console.WriteLine(F); var c = (this += 1); Console.WriteLine(c.F); }
+  public ref S Me(ref S s) => ref s;
+}
+public class P {
+  S fs; K fk = new K(); readonly S ro; static ref S RefS(ref S s) => ref s;
+  public S Ps { get; set; }
+  public K Pk { get; set; } = new K();
+  static async Task<int> Async() { await Task.Yield(); return 3; }
+  async Task Run() {
+    S s = new S();
+    s += await Async();
+    fs += await Async();
+    fk += await Async();
+    var x = (fk += await Async());
+    Console.WriteLine(s.F + " " + fs.F + " " + fk.F + " " + x.F);
+  }
+  static void Main() {
+    S s = new S(); K k = new K();
+    s.Self();
+    ref S rs = ref s; rs += 1; ++rs;
+    RefS(ref s) += 2;
+    Console.WriteLine(s.F);
+    Action a = () => k++;
+    a();
+    Action b = () => { s += 1; };
+    b();
+    Action c = () => s++;
+    c();
+    Func<S> d = () => ++s;
+    Console.WriteLine(d().F);
+    Func<K> e = () => k += 1;
+    Console.WriteLine(e().F);
+    for (int i = 0; i < 2; k += 1) { i++; }
+    for (K kk = new K(); kk.F < 2; ++kk) { Console.Write(kk.F); }
+    Console.WriteLine();
+    new P().Run().Wait();
+    var p = new P();
+    p.fs += 1; p.fk += 1; ++p.fs; p.fk++;
+    Console.WriteLine(p.fs.F + " " + p.fk.F);
+    S[,] md = new S[2,2]; md[1,1] += 3; ++md[0,0]; Console.WriteLine(md[1,1].F + " " + md[0,0].F);
+    var r = (md[1,1] += 4); Console.WriteLine(r.F + " " + md[1,1].F);
+    K[] nk = { new K() }; nk[0] += 1; Console.WriteLine(nk[0].F);
+    unsafe { S s2 = default; S* ps = &s2; *ps += 1; ps->F += 1; Console.WriteLine(s2.F); }
+  }
+}
+"#,
+        "[S+=5][S++]105
+[S+=1]106
+[S+=1][S++][S+=2]209
+[K++][S+=1][S++][S++]410
+[K+=1]101
+[K+=1][K+=1]0[K++]
+[S+=3][S+=3][K+=3][K+=3]3 3 6 6
+[S+=1][K+=1][S++][K++]101 101
+[S+=3][S++]3 100
+[S+=4]7 7
+[K+=1]1
+[S+=1]2
+",
+    );
+}
+
+#[test]
+fn in_place_operators_through_interfaces_and_type_parameters() {
+    // An interface may declare the operators, a class implement them explicitly, and a type
+    // parameter constrained to the interface call them; a struct is changed through its address and
+    // a class through its reference.
+    check(
+        "in_place_operators_through_interfaces",
+        r#"using System;
+interface I { void operator +=(int x); void operator ++(); void operator checked --(); void operator --(); }
+class C : I {
+  public int F;
+  void I.operator +=(int x) { F += x; Console.Write("[C I+=]"); }
+  void I.operator ++() { F += 1; Console.Write("[C I++]"); }
+  void I.operator checked --() { F -= 1; Console.Write("[C I checked --]"); }
+  void I.operator --() { F -= 1; Console.Write("[C I --]"); }
+}
+struct S : I {
+  public int F;
+  public void operator +=(int x) { F += x; Console.Write("[S+=]"); }
+  public void operator ++() { F += 1; Console.Write("[S++]"); }
+  public void operator checked --() { F -= 1; Console.Write("[S checked --]"); }
+  public void operator --() { F -= 1; Console.Write("[S --]"); }
+}
+class G<T> where T : I {
+  public T V;
+  public void Run() { V += 2; ++V; V--; checked { --V; } Console.WriteLine(); }
+}
+class P {
+  static void Main() {
+    I i = new C(); i += 1; ++i; i--; checked { --i; } Console.WriteLine();
+    I s = new S(); s += 1; ++s; --s; Console.WriteLine();
+    var g = new G<C>(); g.V = new C(); g.Run(); Console.WriteLine(g.V.F);
+    var g2 = new G<S>(); g2.Run(); Console.WriteLine(g2.V.F);
+    var g3 = new G<I>(); g3.V = new C(); g3.Run();
+    S st = default; st += 3; ++st; checked { --st; } Console.WriteLine(st.F);
+  }
+}
+"#,
+        "[C I+=][C I++][C I --][C I checked --]
+[S+=][S++][S --]
+[C I+=][C I++][C I --][C I checked --]
+1
+[S+=][S++][S --][S checked --]
+1
+[C I+=][C I++][C I --][C I checked --]
+[S+=][S++][S checked --]3
+",
+    );
+}
+
+#[test]
+fn in_place_operators_that_are_virtual_abstract_checked_and_declared_in_interfaces() {
+    // `abstract`, `virtual`, `override` and `sealed` instance operators, default interface
+    // implementations, and the checked forms (called in a `checked` context where there is one):
+    // all ten compound operators and `++`.
+    check(
+        "in_place_operators_virtual_and_checked",
+        r#"using System;
+public interface IAcc {
+  void operator +=(int x);
+  void operator checked -=(int x);
+  void operator -=(int x);
+  virtual void operator ++() { Console.Write("[IAcc default ++]"); }
+}
+public abstract class Base {
+  public int F;
+  public abstract void operator *=(int x);
+  public virtual void operator /=(int x) { Console.Write("[Base /=]"); F /= x; }
+  public virtual void operator checked ++() { Console.Write("[Base checked ++]"); F += 1000; }
+  public virtual void operator ++() { Console.Write("[Base ++]"); F += 1; }
+  public virtual void operator >>>=(int x) { Console.Write("[Base >>>=]"); F >>>= x; }
+}
+public class Derived : Base, IAcc {
+  public override void operator *=(int x) { Console.Write("[Derived *=]"); F *= x; }
+  public override void operator /=(int x) { Console.Write("[Derived /=]"); F /= x * 2; }
+  public sealed override void operator ++() { Console.Write("[Derived ++]"); F += 2; }
+  public void operator +=(int x) { Console.Write("[Derived +=]"); F += x; }
+  public void operator -=(int x) { Console.Write("[Derived -=]"); F -= x; }
+  public void operator checked -=(int x) { Console.Write("[Derived checked -=]"); F -= x; }
+  public void operator %=(int x) { F %= x; }
+  public void operator &=(int x) { F &= x; }
+  public void operator |=(int x) { F |= x; }
+  public void operator ^=(int x) { F ^= x; }
+  public void operator <<=(int x) { F <<= x; }
+  public void operator >>=(int x) { F >>= x; }
+}
+public struct SV : IAcc {
+  public int F;
+  public void operator +=(int x) { F += x; }
+  public void operator -=(int x) { F -= x; }
+  public void operator checked -=(int x) { F -= x; Console.Write("[SV checked]"); }
+}
+public class Client {
+  static void Gen<T>(T t) where T : IAcc { t += 5; t -= 1; checked { t -= 1; } ++t; }
+  static void Main() {
+    var d = new Derived { F = 10 };
+    d *= 2; d /= 2; ++d; d++; d += 3; d -= 1; d %= 7; d |= 8; d &= 15; d ^= 1; d <<= 2; d >>= 1;
+    Console.WriteLine(" " + d.F);
+    Base b = d;
+    b *= 3; b /= 3; ++b; b >>>= 1;
+    checked { ++b; b /= 1; }
+    Console.WriteLine(" " + b.F);
+    IAcc i = d; i += 1; i -= 1; ++i; checked { i -= 2; }
+    Console.WriteLine(" " + d.F);
+    var s = new SV();
+    s += 4; s -= 1; checked { s -= 1; }
+    Console.WriteLine(" " + s.F);
+    Gen(d); Gen(s); Gen<IAcc>(d);
+    Console.WriteLine(" " + d.F);
+    var r = (s += 1); Console.WriteLine(r.F + " " + s.F);
+    var r3 = (b *= 2); Console.WriteLine(r3.F);
+    var r4 = ++b; Console.WriteLine(r4.F);
+  }
+}
+"#,
+        "[Derived *=][Derived /=][Derived ++][Derived ++][Derived +=][Derived -=] 26
+[Derived *=][Derived /=][Derived ++][Base >>>=][Base checked ++][Derived /=] 503
+[Derived +=][Derived -=][Derived ++][Derived checked -=] 503
+[SV checked] 2
+[Derived +=][Derived -=][Derived checked -=][Derived ++][SV checked][IAcc default ++][Derived +=][Derived -=][Derived checked -=][Derived ++] 513
+3 3
+[Derived *=]1026
+[Derived ++]1028
+",
+    );
+}
+
+#[test]
+fn a_method_with_an_in_parameter_that_implements_an_interface_member_is_not_virtual() {
+    // The interface's `in` is under a `modreq(InAttribute)` and the class's is not, so the runtime
+    // would not match them and the class answers through a forwarding method: the method of the
+    // class stays the plain method it was written as, which is what a program that reads the
+    // assembly back needs to find it by (a virtual method with no `modreq` on an `in` is one no
+    // call can be bound to).
+    check(
+        "in_parameter_implementation_is_not_virtual",
+        r#"using System;
+public interface I3 { void M(in long x); long N(in long x); }
+public class C3 : I3 {
+  public void M(in long x) { Console.Write("[M]"); }
+  public long N(in long x) => x;
+  public void operator +=(in long x) { Console.Write("[+=]"); }
+}
+class P {
+  static void Main() {
+    foreach (var name in new[] { "M", "N", "op_AdditionAssignment" }) {
+      var m = typeof(C3).GetMethod(name);
+      Console.WriteLine(name + " " + m.IsVirtual + " " + m.IsFinal);
+    }
+    I3 i = new C3(); long l = 4; i.M(l); Console.WriteLine(i.N(l));
+    var c = new C3(); c += 5;
+  }
+}
+"#,
+        "M False False
+N False False
+op_AdditionAssignment False False
+[M]4
+[+=]",
+    );
+}
+
+#[test]
+fn instance_operators_are_special_names_of_instance_methods() {
+    // `+=` is `op_AdditionAssignment`, `++` without `static` is `op_IncrementAssignment`, and each
+    // `checked` form is `op_Checked…Assignment`: instance methods, `specialname`, beside the
+    // static `op_Increment` a `static` `++` still is.
+    check(
+        "instance_operator_names",
+        r#"using System;
+using System.Reflection;
+public class C {
+  public void operator +=(int x){}
+  public void operator checked +=(int x){}
+  public void operator -=(int x){}
+  public void operator checked -=(int x){}
+  public void operator *=(int x){}
+  public void operator checked *=(int x){}
+  public void operator /=(int x){}
+  public void operator checked /=(int x){}
+  public void operator %=(int x){}
+  public void operator &=(int x){}
+  public void operator |=(int x){}
+  public void operator ^=(int x){}
+  public void operator <<=(int x){}
+  public void operator >>=(int x){}
+  public void operator >>>=(int x){}
+  public void operator ++(){}
+  public void operator checked ++(){}
+  public void operator --(){}
+  public void operator checked --(){}
+  public static C operator ++(C c)=>c;
+  public static void Main(){
+    foreach (var m in typeof(C).GetMethods(BindingFlags.Public|BindingFlags.Instance|BindingFlags.Static|BindingFlags.DeclaredOnly)) Console.WriteLine(m.Name+" "+m.Attributes);
+  }
+}
+"#,
+        "op_AdditionAssignment Public, HideBySig, SpecialName
+op_CheckedAdditionAssignment Public, HideBySig, SpecialName
+op_SubtractionAssignment Public, HideBySig, SpecialName
+op_CheckedSubtractionAssignment Public, HideBySig, SpecialName
+op_MultiplicationAssignment Public, HideBySig, SpecialName
+op_CheckedMultiplicationAssignment Public, HideBySig, SpecialName
+op_DivisionAssignment Public, HideBySig, SpecialName
+op_CheckedDivisionAssignment Public, HideBySig, SpecialName
+op_ModulusAssignment Public, HideBySig, SpecialName
+op_BitwiseAndAssignment Public, HideBySig, SpecialName
+op_BitwiseOrAssignment Public, HideBySig, SpecialName
+op_ExclusiveOrAssignment Public, HideBySig, SpecialName
+op_LeftShiftAssignment Public, HideBySig, SpecialName
+op_RightShiftAssignment Public, HideBySig, SpecialName
+op_UnsignedRightShiftAssignment Public, HideBySig, SpecialName
+op_IncrementAssignment Public, HideBySig, SpecialName
+op_CheckedIncrementAssignment Public, HideBySig, SpecialName
+op_DecrementAssignment Public, HideBySig, SpecialName
+op_CheckedDecrementAssignment Public, HideBySig, SpecialName
+op_Increment Public, Static, HideBySig, SpecialName
+Main Public, Static, HideBySig
+",
+    );
+}
+
+#[test]
+fn a_call_on_this_in_an_async_struct_method_changes_the_copy_the_machine_keeps() {
+    // C# gives an `async` method of a struct a copy of `this`, which its machine keeps: what the
+    // method calls on `this` — a method, or an instance operator with an `await` among its
+    // arguments — changes that copy, and what the method reads afterwards is what it changed,
+    // while the variable the method was called on is not.
+    check(
+        "async_struct_this_calls",
+        r#"using System;
+using System.Threading.Tasks;
+struct S
+{
+    int i;
+    public void Add(int value) { this.i += value; }
+    async Task M0() { this.Add(1); await Task.Yield(); Console.Write(i); }
+    async Task M0b() { this.i += 5; await Task.Yield(); Console.Write(i); }
+    async Task M0c() { this.Add(1); Console.Write(i); }
+    async Task M0d() { await Task.Yield(); this.Add(1); Console.Write(i); }
+    async Task M0e() { await Task.Yield(); this.Add(1); await Task.Yield(); Console.Write(i); }
+    static async Task Main()
+    {
+        S s = default;
+        await s.M0(); Console.Write(" ");
+        await s.M0b(); Console.Write(" ");
+        await s.M0c(); Console.Write(" ");
+        await s.M0d(); Console.Write(" ");
+        await s.M0e(); Console.Write(" ");
+    }
+}
+"#,
+        "1 5 1 1 1 ",
+    );
+    check(
+        "async_struct_this_operators",
+        r#"using System;
+using System.Threading.Tasks;
+struct S
+{
+    int i;
+    public void Add(int value) { this.i += value; }
+    public void operator +=(int value) { this.i += value; }
+    async Task M1() { this.Add(await GetInt()); Console.Write(i); }
+    async Task M2() { this += await GetInt(); Console.Write(i); }
+    async Task M3() { var x = (this += await GetInt()); Console.Write(i); Console.Write(x.i); }
+    static async Task Main()
+    {
+        S s = default;
+        await s.M1(); Console.Write(s.i);
+        await s.M2(); Console.Write(s.i);
+        await s.M3(); Console.Write(s.i);
+    }
+    static Task<int> GetInt() => Task.FromResult(1);
+}
+"#,
+        "1010110",
+    );
+}
+
+#[test]
+fn in_place_operators_pick_an_overload_by_the_operand_and_work_on_nested_places() {
+    // Overload resolution among the instance operators of a type (and its constructed forms), on the
+    // places a struct sits in — a field of a field, a static field, an element of a field, a `ref`
+    // return — with the value of the expression used, as an argument, in a lambda and in an
+    // interpolated string, and in a `checked` context.
+    check(
+        "in_place_operators_overloads_and_places",
+        r#"using System;
+using System.Collections.Generic;
+interface IAdd { void operator +=(int x); void operator ++(); }
+class Box<T> {
+  public T Value; public int N;
+  public void operator +=(T x) { Console.Write("[Box+=" + x + "]"); Value = x; N++; }
+  public void operator +=(string s) { Console.Write("[Box+=str " + s + "]"); N += 10; }
+  public void operator ++() { N += 100; Console.Write("[Box++]"); }
+}
+struct V : IAdd {
+  public int F; public string Log;
+  public void operator +=(int x) { F += x; Log += "i"; }
+  public void operator +=(long x) { F += (int)x * 2; Log += "l"; }
+  public void operator +=(double x) { F += (int)x * 3; Log += "d"; }
+  public void operator ++() { F += 1000; Log += "+"; }
+}
+struct Outer { public V Inner; public V[] Arr; public Box<int> B; }
+class Holder {
+  public Outer O; public static Outer SO; public V F; public static V SF;
+  public Holder Next;
+  public ref V RefF() => ref F;
+}
+class P {
+  static int Idx() { Console.Write("[Idx]"); return 0; }
+  static void Gen<T>(T t) where T : struct, IAdd { T u = t; u += 1; ++u; var r = (u += 2); var q = ++u; Console.WriteLine(" gen " + ((V)(object)u).F + " " + ((V)(object)r).F + " " + ((V)(object)q).F); }
+  static void Gen2<T>(T t) where T : class, IAdd { t += 1; ++t; var r = (t += 2); var q = ++t; Console.WriteLine(" gen2 " + ((Box2)(object)r).F); }
+  static void Main() {
+    var b = new Box<int>(); b += 5; b += "x"; ++b; Console.WriteLine(" " + b.Value + " " + b.N);
+    var bs = new Box<string>(); bs += "a"; bs += (string)null; Console.WriteLine(" " + bs.N);
+    V v = default; v += 1; v += 2L; v += 3.5; v += 'c'; v += (short)2; v += 1u; Console.WriteLine(v.F + " " + v.Log);
+    var h = new Holder();
+    h.O.Inner += 1; h.O.Inner += 2L; Holder.SO.Inner += 3; Holder.SF += 4; h.F += 5;
+    Console.WriteLine(h.O.Inner.F + " " + Holder.SO.Inner.F + " " + Holder.SF.F + " " + h.F.F);
+    h.RefF() += 9; Console.WriteLine(h.F.F);
+    h.O.Arr = new V[2]; h.O.Arr[1] += 6; ++h.O.Arr[1]; Console.WriteLine(h.O.Arr[1].F);
+    var r1 = (h.O.Arr[Idx()] += 7); Console.WriteLine(" " + r1.F + " " + h.O.Arr[0].F);
+    var r2 = ++h.O.Inner; Console.WriteLine(r2.F + " " + h.O.Inner.F);
+    h.O.B = new Box<int>(); h.O.B += 3; var rb = ++h.O.B; Console.WriteLine(" " + rb.N);
+    Func<V, V> f = x => x += 1;
+    Console.WriteLine(f(v).F);
+    string s = $"{(v += 1).F}";
+    Console.WriteLine(s);
+    Console.WriteLine(M(ref v) + " " + v.F);
+    Gen(new V()); Gen2(new Box2());
+    int k = 0; var arr = new V[3];
+    arr[k++] += 1; Console.WriteLine(k + " " + arr[0].F);
+    var rr = (arr[k++] += 1); Console.WriteLine(k + " " + arr[1].F + " " + rr.F);
+    V? nv = new V();
+    Console.WriteLine(nv.Value.F);
+    checked { v += 1; ++v; v++; }
+    Console.WriteLine(v.F);
+  }
+  static int M(ref V v) { v += 100; return (v += 1).F; }
+}
+class Box2 : IAdd { public int F; public void operator +=(int x) { F += x; } public void operator ++() { F += 10; } public static implicit operator V(Box2 b) => new V { F = b.F }; }
+"#,
+        "[Box+=5][Box+=str x][Box++] 5 111
+[Box+=str a][Box+=str ] 20
+117 ildiil
+5 3 4 5
+14
+1006
+[Idx] 7 7
+1005 1005
+[Box+=3][Box++] 101
+118
+118
+219 219
+ gen 2003 1003 2003
+ gen2 23
+1 1
+2 1 1
+0
+2220
+",
+    );
+}
+
+#[test]
+fn in_place_operators_on_the_variables_a_member_hands_back_by_reference() {
+    // A `ref` indexer or property, an element of a `Span<T>` and a `ref` local are variables the
+    // operator is called on; where the value of the expression is used the variable is copied,
+    // changed and stored back.
+    check(
+        "in_place_operators_through_references",
+        r#"using System;
+struct V { public int F; public void operator +=(int x) { F += x; Console.Write("[+=]"); } public void operator ++() { F += 100; Console.Write("[++]"); } }
+class R {
+  V[] arr = new V[2];
+  public ref V this[int i] => ref arr[i];
+  public ref V First => ref arr[0];
+  public int Get(int i) => arr[i].F;
+}
+class P {
+  static void Main() {
+    Span<V> sp = new V[2];
+    sp[1] += 4; ++sp[1]; sp[0]++;
+    var u = (sp[1] += 1);
+    Console.WriteLine(" " + sp[0].F + " " + sp[1].F + " " + u.F);
+    var r = new R();
+    r[1] += 3; ++r[1]; r.First += 7; ++r.First;
+    var w = (r[0] += 1);
+    Console.WriteLine(" " + r.Get(0) + " " + r.Get(1) + " " + w.F);
+    ref V rv = ref sp[0]; rv += 50; var z = ++rv;
+    Console.WriteLine(" " + sp[0].F + " " + z.F);
+    foreach (ref V e in sp) { e += 1; }
+    Console.WriteLine(" " + sp[0].F + " " + sp[1].F);
+    ReadOnlySpan<V> ro = sp;
+    var cp = ro[0]; cp += 1; Console.WriteLine(" " + cp.F + " " + ro[0].F);
+  }
+}
+"#,
+        "[+=][++][++][+=] 100 105 105
+[+=][++][+=][++][+=] 108 103 108
+[+=][++] 250 250
+[+=][+=] 251 106
+[+=] 252 251
+",
+    );
+}

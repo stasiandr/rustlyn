@@ -2565,6 +2565,17 @@ impl<'a> Declarer<'a> {
                 |token| operator_metadata_name(token.text(), parameter_count).to_string(),
             )
         };
+        let (modifiers, accessibility) = modifiers_of(node);
+        // `void operator ++()` without `static` (C# 14) changes its receiver
+        // and is `op_IncrementAssignment`, as `+=` and the other compound
+        // operators are named for the assignment they stand for.
+        let name = if matches!(name.as_str(), "op_Increment" | "op_Decrement")
+            && !modifiers.contains(Modifiers::STATIC)
+        {
+            format!("{name}Assignment")
+        } else {
+            name
+        };
         // `operator checked -` (C# 11) is a method of its own beside the
         // regular `-`: `op_CheckedSubtraction`, which a checked context
         // prefers and everything else, the runtime binder of `dynamic`
@@ -2584,7 +2595,6 @@ impl<'a> Declarer<'a> {
             .children()
             .find(|child| child.kind().is_type_node())
             .map(|ty| self.type_ref(&ty));
-        let (modifiers, accessibility) = modifiers_of(node);
 
         let id = self.symbols.add(
             SymbolKind::Method,
@@ -3359,6 +3369,17 @@ fn operator_metadata_name(text: &str, parameters: usize) -> &'static str {
         ("~", _) => "op_OnesComplement",
         ("++", _) => "op_Increment",
         ("--", _) => "op_Decrement",
+        ("+=", _) => "op_AdditionAssignment",
+        ("-=", _) => "op_SubtractionAssignment",
+        ("*=", _) => "op_MultiplicationAssignment",
+        ("/=", _) => "op_DivisionAssignment",
+        ("%=", _) => "op_ModulusAssignment",
+        ("&=", _) => "op_BitwiseAndAssignment",
+        ("|=", _) => "op_BitwiseOrAssignment",
+        ("^=", _) => "op_ExclusiveOrAssignment",
+        ("<<=", _) => "op_LeftShiftAssignment",
+        (">>=", _) => "op_RightShiftAssignment",
+        (">>>=", _) => "op_UnsignedRightShiftAssignment",
         ("true", _) => "op_True",
         ("false", _) => "op_False",
         _ => "op_Unknown",
@@ -3378,6 +3399,12 @@ pub(crate) fn checked_operator_name(name: &str) -> Option<&'static str> {
         "op_UnaryNegation" => "op_CheckedUnaryNegation",
         "op_Increment" => "op_CheckedIncrement",
         "op_Decrement" => "op_CheckedDecrement",
+        "op_AdditionAssignment" => "op_CheckedAdditionAssignment",
+        "op_SubtractionAssignment" => "op_CheckedSubtractionAssignment",
+        "op_MultiplicationAssignment" => "op_CheckedMultiplicationAssignment",
+        "op_DivisionAssignment" => "op_CheckedDivisionAssignment",
+        "op_IncrementAssignment" => "op_CheckedIncrementAssignment",
+        "op_DecrementAssignment" => "op_CheckedDecrementAssignment",
         "op_Explicit" => "op_CheckedExplicit",
         _ => return None,
     })

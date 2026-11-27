@@ -645,3 +645,52 @@ fn a_switch_expression_on_the_right_of_a_compound_assignment_is_not_judged_by_it
         ["CS0266"]
     );
 }
+
+// MARK: - the target of a null-conditional assignment
+
+#[test]
+fn the_target_of_a_null_conditional_assignment_is_written_and_not_read() {
+    // `x?.F += 3;` has no value to hand back, so a `T` that cannot be made nullable is no
+    // trouble; where the value of the assignment is used (`var r = x?.F += 2;`) it is CS8978.
+    clean(
+        "interface I1 { void operator +=(int x); }
+         class C2<T> where T : I1 { public T F; }
+         class P {
+             static void M<T>(C2<T> x) where T : I1 { x?.F += 3; x?.F = default; }
+         }",
+    );
+    assert_eq!(
+        errors(
+            "interface I1 { void operator +=(int x); }
+             class C2<T> where T : I1 { public T F; }
+             class P {
+                 static void M<T>(C2<T> x) where T : I1 { var r = x?.F += 2; }
+             }"
+        ),
+        ["CS8978"]
+    );
+}
+
+// MARK: - instance operators
+
+#[test]
+fn an_instance_operator_is_called_on_a_variable_and_a_static_one_where_there_is_none() {
+    clean(
+        "class K {
+             public int F;
+             public void operator +=(int x) { F += x; }
+             public void operator ++() { F++; }
+             public void operator checked --() { F--; }
+             public void operator --() { F--; }
+         }
+         struct S {
+             public static S operator +(S a, int b) => a;
+             public void operator ++() { }
+             public void Self() { this += 1; ++this; }
+         }
+         class P {
+             K k = new K(); S s; K[] ks = new K[1];
+             void M(ref S r) { k += 1; ++k; k++; ks[0] += 2; s += 1; ++s; s++; r += 1; checked { --k; } var a = k += 1; var b = s += 2; }
+         }",
+    );
+}

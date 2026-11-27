@@ -864,6 +864,12 @@ impl BodyBinder<'_> {
         };
         if matches!(target.kind, BoundExpressionKind::ConditionalAccess { .. }) {
             return self.write_through(target, span, &mut |this, target| {
+                if operator != BinaryOperator::Coalesce
+                    && let Some(call) =
+                        this.bind_in_place_compound(node, operator, &target, &value, span)
+                {
+                    return call;
+                }
                 let stored = target.ty.clone();
                 let value = if operator == BinaryOperator::Coalesce {
                     this.convert(value.clone(), &stored)
@@ -921,6 +927,13 @@ impl BodyBinder<'_> {
                 stored,
                 span,
             );
+        }
+        // `x += y` on a variable whose type declares an instance `+=` calls
+        // it, and leaves the static `+` for where there is none (C# 14).
+        if operator != BinaryOperator::Coalesce
+            && let Some(call) = self.bind_in_place_compound(node, operator, &target, &value, span)
+        {
+            return call;
         }
         // `a += b` on predefined types is `a = (T)(a + b)` only where the
         // cast is one the language writes for the programmer (§12.21.4).

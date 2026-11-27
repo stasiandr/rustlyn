@@ -1416,7 +1416,7 @@ impl BodyBinder<'_> {
         // there is no value to hand back, and the expression is `void`:
         // allowed where nothing reads it, CS8978 where something would.
         let result = if self.cannot_be_made_nullable(&result) {
-            if self.conditional_result_used(node) {
+            if self.result_is_used(node) {
                 let symbols = self.binder.compilation().symbols();
                 let display = result.display(symbols);
                 self.report(ErrorCode::ErrCannotBeMadeNullable, access.span, &[&display]);
@@ -1456,16 +1456,37 @@ impl BodyBinder<'_> {
         }
     }
 
-    /// Whether what a `?.` gives is read: not where it is a statement of its
-    /// own, the body of a lambda or member returning nothing, or a `for`
-    /// loop's step.
-    fn conditional_result_used(&self, node: &SyntaxNode) -> bool {
+    /// Whether the value of the expression at `node` is read: not where it
+    /// is a statement of its own, the body of a lambda or member returning
+    /// nothing, or a `for` loop's step. What a `?.` gives, and what an
+    /// operator that changes its operand in place has to leave as its value,
+    /// are asked of it.
+    pub(super) fn result_is_used(&self, node: &SyntaxNode) -> bool {
         let Some(parent) = node.parent() else {
             return true;
         };
         let is_body = parent.children().last().is_some_and(|last| last == *node);
         match parent.kind() {
             SyntaxKind::ExpressionStatement => false,
+            // The target of `a?.b = c` and `a?.b += c` is written, not read:
+            // what is read is what the assignment gives, where that is.
+            SyntaxKind::SimpleAssignmentExpression
+            | SyntaxKind::AddAssignmentExpression
+            | SyntaxKind::SubtractAssignmentExpression
+            | SyntaxKind::MultiplyAssignmentExpression
+            | SyntaxKind::DivideAssignmentExpression
+            | SyntaxKind::ModuloAssignmentExpression
+            | SyntaxKind::AndAssignmentExpression
+            | SyntaxKind::OrAssignmentExpression
+            | SyntaxKind::ExclusiveOrAssignmentExpression
+            | SyntaxKind::LeftShiftAssignmentExpression
+            | SyntaxKind::RightShiftAssignmentExpression
+            | SyntaxKind::UnsignedRightShiftAssignmentExpression
+            | SyntaxKind::CoalesceAssignmentExpression
+                if parent.children().next().is_some_and(|first| first == *node) =>
+            {
+                self.result_is_used(parent)
+            }
             SyntaxKind::SimpleLambdaExpression | SyntaxKind::ParenthesizedLambdaExpression => {
                 !is_body
                     || self
