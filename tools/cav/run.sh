@@ -16,7 +16,8 @@
 # RESULTS and OUT (where to write, so that several runs can share the tests), FWVER, FW (the
 # assemblies to compile against, by default the runtime's own: a reference pack such as net8.0's
 # works too), ILASM, DOTNET (the host that runs the programs; the framework is looked up beside it)
-# and LANGVERSION (the language version a test is compiled with when its options do not name one).
+# and LANGVERSION (the language version a test is compiled with when its options do not name one:
+# `preview` by default, as the Roslyn tests of features not yet released are written for it).
 CAV_HOME=${CAV_HOME:-/home/user}
 CAV=${CAV:-$CAV_HOME/cav}
 CAV_TESTS=${CAV_TESTS:-$CAV/tests}
@@ -28,6 +29,7 @@ FW=${FW:-$(dirname $DOTNET)/shared/Microsoft.NETCore.App/$FWVER}
 TFM=net${FWVER%%.*}.0
 BUILD=${BUILD:-$CAV/build.bin}
 ILASM=${ILASM:-$CAV_HOME/ilasm/ilasm}
+LANGVERSION=${LANGVERSION:-preview}
 rm -rf $RESULTS $OUT; mkdir -p $RESULTS $OUT; touch $RESULTS/pass.txt $RESULTS/fail.txt
 # On macOS .NET 10 formats numbers by the region the system settings name (`1,5` under a
 # Georgian one) unless the environment names a locale; the expected output is en-US's.
