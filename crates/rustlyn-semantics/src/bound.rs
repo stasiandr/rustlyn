@@ -1154,6 +1154,11 @@ pub struct BoundBody {
     /// the innermost one around it trap on overflow or do not (§12.8.20);
     /// outside any, they do not.
     pub checked_regions: Vec<(TextSpan, bool)>,
+    /// The blocks the source wrote with braces, by span. Other `Block`
+    /// nodes are the binder's way of making one statement of several — the
+    /// declarators of `int a, b;`, a label and what it labels — and open no
+    /// scope: a variable a closure captures is declared in the block around.
+    pub blocks: std::collections::HashSet<TextSpan>,
     /// Where a `stackalloc` stands inside a larger expression — an argument,
     /// an operand — rather than as a local's whole initializer. `localloc`
     /// wants an empty stack, so a backend makes these ahead of the statement.

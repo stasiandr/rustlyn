@@ -29,7 +29,7 @@ use rustlyn_text::TextSpan;
 use crate::codegen::{BodyEmitter, DisplayAt};
 use crate::emitter::{
     Closure, ClosureHost, DisplayClass, DisplayView, EmitError, Emitter, FieldPlan, MachineKey,
-    MethodPlan, MethodSource, ParameterPlan, TypePlan, within,
+    MethodPlan, MethodSource, ParameterPlan, TypePlan,
 };
 use crate::il::{ExceptionRegion, HandlerKind, Instruction, Label, Token};
 use crate::metadata::{field_attributes, method_attributes, table, type_attributes};
@@ -178,10 +178,10 @@ pub(crate) struct AsyncPlan {
     pub(crate) sites: Vec<AwaitSite>,
     /// How many protected regions `MoveNext` enters, in the order it does.
     pub(crate) regions: usize,
-    /// The field holding the class a loop body makes each time round, by
-    /// the body's span: a local of `MoveNext` would not outlive an `await`
-    /// inside the loop.
-    pub(crate) scopes: HashMap<TextSpan, Token>,
+    /// The field holding the class a scope makes each time it is entered,
+    /// by the scope's span: a local of `MoveNext` would not outlive an
+    /// `await` inside the scope.
+    pub(crate) scopes: HashMap<Closure, Token>,
     /// What an `async` iterator's machine keeps beyond an `async` method's,
     /// where it is one.
     pub(crate) iterator: Option<AsyncIteratorPlan>,
@@ -266,7 +266,7 @@ pub(crate) struct PendingAsync {
     pub(crate) order: Vec<(SymbolId, String, Type)>,
     pub(crate) locals: Vec<(LocalId, String, Type)>,
     pub(crate) awaiters: Vec<(Type, String)>,
-    pub(crate) scopes: Vec<(TextSpan, String)>,
+    pub(crate) scopes: Vec<(Closure, String)>,
     /// An `async` iterator's own fields, by name and type: the promise, the
     /// element, the thread, the combined tokens and the parameter copies.
     pub(crate) iterator: Vec<(String, Type)>,
@@ -375,51 +375,28 @@ impl Emitter<'_> {
         })
     }
 
-    /// The loop bodies of a machine's own statements that get a class each
-    /// time round: the ones written directly in the member or closure the
-    /// machine is for, not inside another closure of it, whose method has
-    /// locals of its own to keep such a class in.
-    fn machine_scopes(&mut self, key: MachineKey) -> Vec<TextSpan> {
+    /// The scopes of a machine's own statements that get a class each time
+    /// they are entered: the ones written directly in the member or closure
+    /// the machine is for, not inside another closure of it, whose method
+    /// has locals of its own to keep such a class in.
+    pub(crate) fn machine_scopes(&mut self, key: MachineKey) -> Vec<Closure> {
         let owner = key.owner();
-        let Some(body) = self.body_of(owner) else {
-            return Vec::new();
-        };
-        let mut closures: Vec<(Option<MachineKey>, TextSpan)> = body
-            .lambdas
-            .iter()
-            .enumerate()
-            .map(|(index, lambda)| (Some(MachineKey::Lambda { owner, index }), lambda.span))
-            .collect();
-        for (index, function) in body.local_functions.iter().enumerate() {
-            if let Some(span) = self
-                .compilation
-                .declaration_node(function.symbol)
-                .map(|node| node.span())
-            {
-                closures.push((Some(MachineKey::Function { owner, index }), span));
-            }
-        }
+        let layout = self.closure_layout(owner);
         let wanted = match key {
             MachineKey::Member(_) => None,
-            other => Some(other),
+            MachineKey::Lambda { index, .. } => Some(Closure::Lambda(index)),
+            MachineKey::Function { index, .. } => Some(Closure::Function(index)),
         };
-        self.nested_display_owners(owner)
+        // A closure's own variables, where a closure inside it captures
+        // them, are the first scope: its class is made as the machine starts.
+        let mut scopes: Vec<Closure> = wanted
+            .filter(|closure| layout.position(*closure).is_some())
             .into_iter()
-            .filter_map(|closure| match closure {
-                Closure::Scope(span) => Some(span),
-                Closure::Lambda(_) | Closure::Function(_) => None,
-            })
-            .filter(|span| {
-                // The innermost closure around the loop, if any, is whose
-                // method the loop is written in.
-                let innermost = closures
-                    .iter()
-                    .filter(|(_, it)| *it != *span && within(*span, *it))
-                    .min_by_key(|(_, it)| it.length())
-                    .and_then(|(key, _)| *key);
-                innermost == wanted
-            })
-            .collect()
+            .collect();
+        scopes.extend(layout.owners().iter().copied().filter(|closure| {
+            matches!(closure, Closure::Scope(_)) && layout.maker(*closure) == wanted
+        }));
+        scopes
     }
 
     /// What the method a machine stands in for returns.
@@ -1129,21 +1106,21 @@ impl Emitter<'_> {
             );
             awaiters.push((ty.clone(), token));
         }
-        // A loop body with a class of its own keeps that class in a field
-        // here, named after where the body starts; what the class is called
-        // is filled in once it has been planned.
+        // A scope with a class of its own keeps that class in a field here,
+        // named after where the scope starts; what the class is called is
+        // filled in once it has been planned.
         let mut scopes = HashMap::new();
         let mut scope_names = Vec::new();
-        for span in self.machine_scopes(key) {
-            let name = format!("<>8__s{}", span.start());
+        for closure in self.machine_scopes(key) {
+            let name = closure.field_name();
             let token = field(
                 &mut fields,
                 name.clone(),
                 Type::Error,
                 Some(SigType::Primitive(ElementType::Object)),
             );
-            scopes.insert(span, token);
-            scope_names.push((span, name));
+            scopes.insert(closure, token);
+            scope_names.push((closure, name));
         }
         // An `async` iterator's own fields, after everything an `async`
         // method's machine keeps.
@@ -1440,7 +1417,6 @@ impl Emitter<'_> {
                 view,
                 inherited.len(),
                 own.len(),
-                next_field,
                 next_method,
             )?;
         }
@@ -1598,15 +1574,15 @@ impl Emitter<'_> {
                     awaiters.push((ty.clone(), self.display_field(spec, name, ty)?));
                 }
                 let mut scopes = HashMap::new();
-                for (span, name) in &pending.scopes {
+                for (closure, name) in &pending.scopes {
                     let Some(sig) = self
                         .nested_displays
-                        .get(&(pending.key.owner(), Closure::Scope(*span)))
+                        .get(&(pending.key.owner(), *closure))
                         .map(|display| display.inner_sig.clone())
                     else {
                         continue;
                     };
-                    scopes.insert(*span, self.display_field_sig(spec, name, &sig));
+                    scopes.insert(*closure, self.display_field_sig(spec, name, &sig));
                 }
                 views.push((
                     constructor,
@@ -1944,6 +1920,7 @@ impl BodyEmitter<'_, '_> {
         if iterating {
             self.set_machine_state(-1);
         }
+        self.enter_machine_closure(key)?;
         Ok(())
     }
 
@@ -5795,7 +5772,7 @@ fn continued(outward: usize) -> i32 {
     CONTINUED + 2 * i32::try_from(outward).unwrap_or(i32::MAX / 4)
 }
 
-fn statement_awaits(statement: &BoundStatement) -> bool {
+pub(crate) fn statement_awaits(statement: &BoundStatement) -> bool {
     expressions_of(statement).into_iter().any(contains_await)
         || substatements(statement).into_iter().any(statement_awaits)
 }

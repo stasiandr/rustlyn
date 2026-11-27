@@ -13,7 +13,7 @@ use crate::codegen::BodyEmitter;
 use crate::il::{Instruction, Label};
 
 use crate::emitter::{
-    DisplayView, EmitError, Emitter, FieldPlan, MachineKey, MethodPlan, MethodSource,
+    Closure, DisplayView, EmitError, Emitter, FieldPlan, MachineKey, MethodPlan, MethodSource,
     ParameterPlan, TypePlan,
 };
 use crate::il::Token;
@@ -71,6 +71,10 @@ pub(crate) struct IteratorPlan {
     pub(crate) outer_constructor: Token,
     pub(crate) outer_this: Option<Token>,
     pub(crate) outer_order: Vec<(SymbolId, Token)>,
+    /// The field holding the class a scope of the body makes each time it
+    /// is entered, by the scope's span: a local of `MoveNext` would not
+    /// outlive a `yield` inside the scope.
+    pub(crate) scopes: HashMap<Closure, Token>,
 }
 
 impl Emitter<'_> {
@@ -489,6 +493,23 @@ impl Emitter<'_> {
             .iter()
             .map(|(local, at)| (*local, tokens[*at]))
             .collect();
+        // A scope with a class of its own keeps that class in a field here,
+        // named after where the scope starts; what the class is called is
+        // filled in once it has been planned.
+        let mut scopes = HashMap::new();
+        let mut scope_names = Vec::new();
+        for closure in self.machine_scopes(key) {
+            let name = closure.field_name();
+            let token = field(
+                &mut fields,
+                name.clone(),
+                Type::Error,
+                Some(SigType::Primitive(ElementType::Object)),
+                private,
+            );
+            scopes.insert(closure, token);
+            scope_names.push((closure, name));
+        }
         // What is cleared as its scope ends: a hoisted local no closure
         // reads, of a type that might hold references.
         let mut cleared: Vec<(LocalId, Type)> = held_locals
@@ -672,6 +693,7 @@ impl Emitter<'_> {
                 // The method making the machine fills what it was called
                 // with: `<>3__p` where there is one.
                 outer_order: if enumerable { initial } else { order },
+                scopes,
             },
         );
         if !inherited.is_empty() || !own.is_empty() {
@@ -707,6 +729,7 @@ impl Emitter<'_> {
                 order: named,
                 initial,
                 locals: held_locals,
+                scopes: scope_names,
             });
         }
         self.iterator_impls.push(IteratorImpls {
@@ -761,7 +784,6 @@ impl Emitter<'_> {
                 view,
                 inherited.len(),
                 own.len(),
-                next_field,
                 next_method,
             )?;
         }
@@ -787,6 +809,7 @@ pub(crate) struct PendingIterator {
     pub(crate) order: Vec<(SymbolId, String, Type)>,
     pub(crate) initial: Vec<(SymbolId, String, Type)>,
     pub(crate) locals: Vec<(LocalId, String, Type)>,
+    pub(crate) scopes: Vec<(Closure, String)>,
 }
 
 /// The rows a state machine needs beyond its members: the interfaces it
@@ -804,6 +827,7 @@ pub(crate) struct IteratorImpls {
 
 /// How far through emitting a state machine's `MoveNext` the walk has got.
 pub(crate) struct IteratorRun {
+    pub(crate) key: MachineKey,
     pub(crate) plan: IteratorPlan,
     /// Where a `yield return` goes once the value is parked: a `true`,
     /// outside every protected region.
@@ -828,6 +852,7 @@ impl BodyEmitter<'_, '_> {
         let Some(run) = &self.iterator else {
             return Ok(());
         };
+        let key = run.key;
         let (state, done) = (run.plan.state, run.done);
         let (sites, regions) = (run.plan.sites.clone(), run.plan.regions);
         if sites.iter().any(|site| !site.regions.is_empty()) {
@@ -850,6 +875,7 @@ impl BodyEmitter<'_, '_> {
         self.emit_jump(done, 0);
         self.stream.mark(start);
         self.set_state(-1);
+        self.enter_machine_closure(key)?;
         Ok(())
     }
 
@@ -1554,6 +1580,17 @@ impl Emitter<'_> {
                 for (local, name, ty) in &pending.locals {
                     locals.insert(*local, self.display_field(spec, name, ty)?);
                 }
+                let mut scopes = HashMap::new();
+                for (closure, name) in &pending.scopes {
+                    let Some(sig) = self
+                        .nested_displays
+                        .get(&(pending.key.owner(), *closure))
+                        .map(|display| display.inner_sig.clone())
+                    else {
+                        continue;
+                    };
+                    scopes.insert(*closure, self.display_field_sig(spec, name, &sig));
+                }
                 views.push((
                     constructor,
                     get_enumerator,
@@ -1564,6 +1601,7 @@ impl Emitter<'_> {
                     order,
                     locals,
                     (disposing, (move_next, dispose), initial),
+                    scopes,
                 ));
             }
             self.display_generics = Vec::new();
@@ -1589,6 +1627,7 @@ impl Emitter<'_> {
                 plan.disposing = inside.8.0;
                 (plan.move_next, plan.dispose) = inside.8.1;
                 plan.initial = inside.8.2;
+                plan.scopes = inside.9;
             }
             // A member's machine is its lambdas' display class, and they
             // read the fields under the same names.

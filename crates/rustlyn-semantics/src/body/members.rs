@@ -381,7 +381,12 @@ impl<'a> BodyBinder<'a> {
         }
         for child in declaration.children() {
             match child.kind() {
-                SyntaxKind::Block => statements.push(body_binder.bind_block(&child)),
+                SyntaxKind::Block => {
+                    statements.push(body_binder.bind_block(&child));
+                    // The member's own block is the member's scope, not one
+                    // inside it.
+                    body_binder.body.blocks.remove(&child.span());
+                }
                 SyntaxKind::ArrowExpressionClause => {
                     if let Some(expression) = child.children().next() {
                         // `=> e` is `{ return e; }`, and a void member's is

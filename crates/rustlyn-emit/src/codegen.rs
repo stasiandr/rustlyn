@@ -249,6 +249,11 @@ pub(crate) struct BodyEmitter<'a, 'b> {
     /// inside such a body its class is where a variable is — before the
     /// body's own class, which a machine hoists every local into too.
     pub(crate) setup_captures: usize,
+    /// The slot holding the class this method makes for its own variables
+    /// when it starts, where it makes one: a lambda's or local function's.
+    owned_slot: Option<u16>,
+    /// The spans of the scopes entered and not yet left, innermost last.
+    entered: Vec<TextSpan>,
     /// Whether the display classes being set up leave `this` out for now:
     /// a constructor makes them before its initializer runs, when there is
     /// no object yet to put in them.
@@ -287,8 +292,8 @@ pub(crate) struct BodyEmitter<'a, 'b> {
 pub(crate) enum Holder {
     Display,
     Slot(u16),
-    /// A field of `this`: the class a loop body of an `async` machine makes
-    /// each time round, which `MoveNext` keeps on the machine.
+    /// A field of `this`: the class a scope of a state machine makes each
+    /// time it is entered, which `MoveNext` keeps on the machine.
     ThisField(Token),
 }
 
@@ -581,6 +586,8 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             owner,
             display: None,
             captures: Vec::new(),
+            owned_slot: None,
+            entered: Vec::new(),
             capture_loads: Vec::new(),
             iterator: None,
             async_run: None,
@@ -722,32 +729,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 .push((display.outside.clone(), Holder::Slot(slot)));
             owned = Some((display, slot));
         }
-        match &method.source {
-            MethodSource::AsyncMoveNext(MachineKey::Lambda { owner, index })
-                if this
-                    .emitter
-                    .nested_displays
-                    .contains_key(&(*owner, Closure::Lambda(*index))) =>
-            {
-                return Err(EmitError::new(
-                    "an `async` lambda whose variables a lambda inside it captures is not built \
-                     yet",
-                ));
-            }
-            MethodSource::AsyncMoveNext(MachineKey::Function { owner, index })
-            | MethodSource::IteratorMoveNext(MachineKey::Function { owner, index })
-                if this
-                    .emitter
-                    .nested_displays
-                    .contains_key(&(*owner, Closure::Function(*index))) =>
-            {
-                return Err(EmitError::new(
-                    "a local function machine whose variables a closure inside it captures is \
-                     not built yet",
-                ));
-            }
-            _ => {}
-        }
+        this.owned_slot = owned.as_ref().map(|(_, slot)| *slot);
         // A nested class's parent, and its parent's parent, up to the
         // member's class: each is loaded into a slot from the one below, so
         // that `z` in `x => y => z => x + y + z` reads `x` two classes up.
@@ -818,6 +800,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             let yielded = this.stream.label();
             let done = this.stream.label();
             this.iterator = Some(IteratorRun {
+                key: *key,
                 plan: iterator,
                 yielded,
                 done,
@@ -1710,6 +1693,12 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         }
         match &statement.kind {
             BoundStatementKind::Block(statements) => {
+                // A block the source wrote opens a scope; a block the binder
+                // made of several statements does not, and neither does the
+                // one that holds exactly what a block around it holds.
+                let scope = self.body.blocks.contains(&statement.span)
+                    && self.entered.last() != Some(&statement.span)
+                    && self.enter_scope(statement.span)?;
                 for inner in statements {
                     self.emit_statement(inner)?;
                 }
@@ -1723,6 +1712,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 if !declares_only {
                     self.clear_hoisted(statements)?;
                 }
+                self.leave_scope(scope);
             }
             BoundStatementKind::Empty => {}
             BoundStatementKind::LocalDeclaration { local, initializer } => {
@@ -1827,6 +1817,9 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 incrementors,
                 body,
             } => {
+                // What the initializers declare is one variable for the whole
+                // loop: its class is made once, before they run.
+                let whole = self.enter_scope(statement.span)?;
                 for initializer in initializers {
                     self.emit_statement(initializer)?;
                 }
@@ -1837,8 +1830,8 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 // What the condition and the incrementors declare is fresh
                 // each time round, as the body's variables are.
                 let scope = match crate::emitter::loop_scope(statement) {
-                    Some(span) => self.enter_scope(span)?,
-                    None => false,
+                    Some(span) if span != statement.span => self.enter_scope(span)?,
+                    _ => false,
                 };
                 if let Some(condition) = condition {
                     self.emit_branch_if_false(condition, end)?;
@@ -1853,6 +1846,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 self.leave_scope(scope);
                 self.stream.emit(Instruction::Branch(head));
                 self.stream.mark(end);
+                self.leave_scope(whole);
             }
             BoundStatementKind::ForEach {
                 local,
@@ -1980,14 +1974,20 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             BoundStatementKind::Switch {
                 governing,
                 sections,
-            } => self.emit_switch_statement(governing, sections)?,
+            } => {
+                let scope = self.enter_scope(statement.span)?;
+                self.emit_switch_statement(governing, sections)?;
+                self.leave_scope(scope);
+            }
             BoundStatementKind::Try {
                 body,
                 catches,
                 finally,
             } => self.emit_try(body, catches, finally.as_deref())?,
             BoundStatementKind::Using { resources, body } => {
+                let scope = self.enter_scope(crate::closures::using_scope(statement))?;
                 self.emit_using(resources, body)?;
+                self.leave_scope(scope);
             }
             BoundStatementKind::Lock {
                 value,
@@ -4751,6 +4751,28 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         Ok(())
     }
 
+    /// Where the exception waits while the class its variable lives in is
+    /// made, where the `catch` has one: in a slot of its own, since the
+    /// class is made and filled before the exception is written into it.
+    fn park_caught(
+        &mut self,
+        local: Option<LocalId>,
+        scope_span: TextSpan,
+        exception: &Type,
+    ) -> Result<Option<u16>, EmitError> {
+        let has_class = self.owner.is_some_and(|owner| {
+            self.emitter
+                .nested_displays
+                .contains_key(&(owner, Closure::Scope(scope_span)))
+        });
+        if local.is_none() || !has_class {
+            return Ok(None);
+        }
+        let slot = self.temporary(exception)?;
+        self.stream.emit(Instruction::StoreLocal(slot));
+        Ok(Some(slot))
+    }
+
     fn emit_catch(
         &mut self,
         catch: &BoundCatch,
@@ -4760,6 +4782,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
     ) -> Result<ExceptionRegion, EmitError> {
         let token = self.emitter.type_token(&catch.exception_type)?;
         let local = catch.local;
+        let scope_span = crate::closures::catch_scope(&self.body, catch);
 
         // A `when` clause becomes a filter, which the runtime runs with the
         // exception on the stack before it unwinds anything.
@@ -4778,11 +4801,20 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 self.stream.emit(Instruction::LoadInt32(0));
                 self.stream.emit(Instruction::Branch(decided));
                 self.stream.mark(keep);
-                match local {
-                    Some(local) => self.store_caught(local)?,
-                    None => self.stream.emit(Instruction::Pop),
+                // What the filter captures lives in a class of its own,
+                // made before the exception is stored in it.
+                let parked = self.park_caught(local, scope_span, &catch.exception_type)?;
+                let scope = self.enter_scope(scope_span)?;
+                match (local, parked) {
+                    (Some(local), Some(slot)) => {
+                        self.stream.emit(Instruction::LoadLocal(slot));
+                        self.store_caught(local)?;
+                    }
+                    (Some(local), None) => self.store_caught(local)?,
+                    (None, _) => self.stream.emit(Instruction::Pop),
                 }
                 self.emit_expression(condition, true)?;
+                self.leave_scope(scope);
                 self.stream.mark(decided);
                 self.stream.emit(Instruction::EndFilter);
                 HandlerKind::Filter(filter_start)
@@ -4794,14 +4826,28 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         self.stream.mark_handler(handler_start, 1);
         // The handler is entered with the exception pushed. A filter has
         // already stored it, so there it is only in the way.
-        match (local, &catch.filter) {
-            (_, Some(_)) => self.stream.emit(Instruction::Pop),
-            (Some(local), None) => self.store_caught(local)?,
-            (None, None) => self.stream.emit(Instruction::Pop),
+        // The filter has made the class and stored the exception in it, and
+        // the handler goes on with that variable; without a filter the
+        // handler makes it.
+        let (scope, parked) = if catch.filter.is_some() {
+            (self.reenter_scope(scope_span)?, None)
+        } else {
+            let parked = self.park_caught(local, scope_span, &catch.exception_type)?;
+            (self.enter_scope(scope_span)?, parked)
+        };
+        match (local, parked, &catch.filter) {
+            (Some(local), Some(slot), None) => {
+                self.stream.emit(Instruction::LoadLocal(slot));
+                self.store_caught(local)?;
+            }
+            (_, _, Some(_)) => self.stream.emit(Instruction::Pop),
+            (Some(local), None, None) => self.store_caught(local)?,
+            (None, _, None) => self.stream.emit(Instruction::Pop),
         }
         self.protected += 1;
         self.emit_statement(&catch.body)?;
         self.protected -= 1;
+        self.leave_scope(scope);
         self.stream.emit(Instruction::Leave(end));
         self.stream.mark(handler_end);
 
@@ -6933,21 +6979,98 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         Ok(())
     }
 
-    /// What a body does before its first statement: makes the display
-    /// class the method owns, if any, and loads what the closures capture.
-    /// The start of a loop body that has a class of its own: a fresh
-    /// instance, linked to the member's class where there is one, and its
-    /// fields in view for the body. `true` when there was such a class.
+    /// A machine for a lambda or a local function whose own variables a
+    /// closure inside it captures makes their class as it starts, and puts in
+    /// it the arguments the machine was made with: the closure's method took
+    /// them as parameters, and what reads them now reads them there.
+    pub(crate) fn enter_machine_closure(&mut self, key: MachineKey) -> Result<(), EmitError> {
+        let (closure, span) = match key {
+            MachineKey::Member(_) => return Ok(()),
+            MachineKey::Lambda { index, .. } => (
+                Closure::Lambda(index),
+                self.body.lambdas.get(index).map(|lambda| lambda.span),
+            ),
+            MachineKey::Function { index, .. } => (
+                Closure::Function(index),
+                self.body
+                    .local_functions
+                    .get(index)
+                    .map(|function| function.span),
+            ),
+        };
+        let (Some(span), Some(owner)) = (span, self.owner) else {
+            return Ok(());
+        };
+        let Some(display) = self.emitter.nested_displays.get(&(owner, closure)).cloned() else {
+            return Ok(());
+        };
+        if !self.enter_class(closure, span, true)? {
+            return Ok(());
+        }
+        let Some(holder) = self.captures.last().map(|(_, holder)| *holder) else {
+            return Ok(());
+        };
+        let (locals, parameters) = match (&self.async_run, &self.iterator) {
+            (Some(run), _) => (run.plan.locals.clone(), run.plan.parameters.clone()),
+            (None, Some(run)) => (run.plan.locals.clone(), run.plan.parameters.clone()),
+            (None, None) => return Ok(()),
+        };
+        let lambda_parameters: Vec<LocalId> = match key {
+            MachineKey::Lambda { index, .. } => self
+                .body
+                .lambdas
+                .get(index)
+                .map(|lambda| lambda.parameters.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        for local in lambda_parameters {
+            if let (Some(into), Some(from)) =
+                (display.outside.locals.get(&local), locals.get(&local))
+            {
+                self.push_holder(holder);
+                self.stream.emit(Instruction::LoadArgument(0));
+                self.stream.emit(Instruction::LoadField(*from));
+                self.stream.emit(Instruction::StoreField(*into));
+            }
+        }
+        for (parameter, into) in by_declaration(&display.outside.parameters) {
+            if let Some(from) = parameters.get(&parameter) {
+                self.push_holder(holder);
+                self.stream.emit(Instruction::LoadArgument(0));
+                self.stream.emit(Instruction::LoadField(*from));
+                self.stream.emit(Instruction::StoreField(into));
+            }
+        }
+        Ok(())
+    }
+
+    /// The start of a scope that has a class of its own: a fresh instance,
+    /// linked to the class of the scope around it, with its fields in view
+    /// for what follows. `true` when there was such a class.
     fn enter_scope(&mut self, span: TextSpan) -> Result<bool, EmitError> {
+        self.enter_class(Closure::Scope(span), span, true)
+    }
+
+    /// The same scope entered again by code that runs in the same
+    /// execution of it: a `catch` handler after its filter shares the
+    /// variable, and whatever the filter wrote to it.
+    fn reenter_scope(&mut self, span: TextSpan) -> Result<bool, EmitError> {
+        self.enter_class(Closure::Scope(span), span, false)
+    }
+
+    /// The start of a closure or scope that has a class of its own, which
+    /// `span` is where it was written. A `fresh` one makes the instance.
+    fn enter_class(
+        &mut self,
+        closure: Closure,
+        span: TextSpan,
+        fresh: bool,
+    ) -> Result<bool, EmitError> {
         let Some(owner) = self.owner else {
             return Ok(false);
         };
-        let Some(display) = self
-            .emitter
-            .nested_displays
-            .get(&(owner, Closure::Scope(span)))
-            .cloned()
-        else {
+        let Some(display) = self.emitter.nested_displays.get(&(owner, closure)).cloned() else {
             return Ok(false);
         };
         // In an `async` machine the class lives in a field of the machine,
@@ -6956,8 +7079,12 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         let held = match self
             .async_run
             .as_ref()
-            .and_then(|run| run.plan.scopes.get(&span).copied())
-        {
+            .and_then(|run| run.plan.scopes.get(&closure).copied())
+            .or_else(|| {
+                self.iterator
+                    .as_ref()
+                    .and_then(|run| run.plan.scopes.get(&closure).copied())
+            }) {
             Some(field) => Holder::ThisField(field),
             None => Holder::Slot(match self.scope_slots.get(&span) {
                 Some(slot) => *slot,
@@ -6970,33 +7097,67 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 }
             }),
         };
-        if let Holder::ThisField(_) = held {
-            self.stream.emit(Instruction::LoadArgument(0));
-        }
-        self.stream
-            .call_effect(Instruction::NewObject(display.outside.constructor), 0, 1);
-        match held {
-            Holder::ThisField(field) => self.stream.emit(Instruction::StoreField(field)),
-            Holder::Slot(slot) => self.stream.emit(Instruction::StoreLocal(slot)),
-            Holder::Display => unreachable!("a loop body's class is never the body's own"),
-        }
-        if let Some(field) = display.outside.parent {
-            self.push_holder(held);
-            self.push_display();
-            self.stream.emit(Instruction::StoreField(field));
-        }
-        if let Some(field) = display.outside.this {
-            self.push_holder(held);
-            self.push_this_value()?;
-            self.stream.emit(Instruction::StoreField(field));
+        if fresh {
+            if let Holder::ThisField(_) = held {
+                self.stream.emit(Instruction::LoadArgument(0));
+            }
+            self.stream
+                .call_effect(Instruction::NewObject(display.outside.constructor), 0, 1);
+            match held {
+                Holder::ThisField(field) => self.stream.emit(Instruction::StoreField(field)),
+                Holder::Slot(slot) => self.stream.emit(Instruction::StoreLocal(slot)),
+                Holder::Display => unreachable!("a scope's class is never the body's own"),
+            }
+            if let Some(field) = display.outside.parent {
+                let Some(parent) = self.enclosing_class() else {
+                    return Err(EmitError::new(
+                        "a scope's class whose parent is not in view",
+                    ));
+                };
+                self.push_holder(held);
+                self.push_holder(parent);
+                self.stream.emit(Instruction::StoreField(field));
+            }
+            if let Some(field) = display.outside.this {
+                self.push_holder(held);
+                self.push_this_value()?;
+                self.stream.emit(Instruction::StoreField(field));
+            }
         }
         self.captures.push((display.outside.clone(), held));
+        self.entered.push(span);
         Ok(true)
+    }
+
+    /// What holds the class of the innermost scope around the code being
+    /// emitted: the last scope entered, or else the class this method has
+    /// for itself (its own, or the one it is a method of), or else the one
+    /// a closure's machine loaded first.
+    fn enclosing_class(&self) -> Option<Holder> {
+        let (_, entered) = self.captures.split_at(self.setup_captures);
+        if let Some((_, holder)) = entered.last() {
+            return Some(*holder);
+        }
+        if let Some(slot) = self.owned_slot {
+            return Some(Holder::Slot(slot));
+        }
+        // A closure's machine is the display class of nothing but itself:
+        // the class around the closure is the one it loaded first.
+        let hosted = self.async_run.as_ref().is_some_and(|run| run.plan.hosted)
+            || self.iterator.as_ref().is_some_and(|run| run.plan.hosted);
+        if hosted && let Some((_, holder)) = self.captures.first() {
+            return Some(*holder);
+        }
+        if self.display.is_some() {
+            return Some(Holder::Display);
+        }
+        self.captures.first().map(|(_, holder)| *holder)
     }
 
     fn leave_scope(&mut self, entered: bool) {
         if entered {
             self.captures.pop();
+            self.entered.pop();
         }
     }
 
@@ -7134,7 +7295,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
     }
 
     /// The capture `find` names, looked for where the innermost variable
-    /// wins: the loop-body classes entered so far (innermost first), then
+    /// wins: the scope classes entered so far (innermost first), then
     /// the class the body has, then what was in view when the body started
     /// (the closest first).
     fn find_capture(&self, find: impl Fn(&DisplayView) -> Option<Token>) -> Option<Capture> {

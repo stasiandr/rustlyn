@@ -205,3 +205,4 @@ tree and byte offsets.
 | 148 | Project index and go to definition by the scope at the reference site | done |
 | 149 | Assembly surface immediately, method IL on demand | done |
 | 150 | C ABI and a header checked by a C program | done |
+| 151 | A captured variable is fresh each time the scope that declares it is entered: a closure class per block, loop iteration, `catch`, `using`, `switch` and lambda call, nested to any depth, in iterators and `async` methods and closures too | done |

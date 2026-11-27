@@ -11,6 +11,7 @@
 
 mod async_iterator;
 mod async_machine;
+mod closures;
 mod codegen;
 mod delegate_cache;
 mod dynamic;

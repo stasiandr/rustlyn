@@ -397,10 +397,23 @@ pub(crate) struct TypePlan {
 pub(crate) enum Closure {
     Lambda(usize),
     Function(usize),
-    /// The body of a loop, by the span the class covers: a fresh instance
-    /// each time round, which is what C# promises a variable declared in
-    /// the body and captured by a closure.
+    /// A scope written in the member — a block, an iteration of a loop, a
+    /// `catch`, a `using`, a `switch` — by the span it covers: a fresh
+    /// instance each time execution enters it, which is what C# promises a
+    /// variable the scope declares and a closure captures.
     Scope(TextSpan),
+}
+
+impl Closure {
+    /// What the field of a state machine that holds this closure's class is
+    /// called.
+    pub(crate) fn field_name(self) -> String {
+        match self {
+            Self::Lambda(index) => format!("<>8__l{index}"),
+            Self::Function(index) => format!("<>8__f{index}"),
+            Self::Scope(span) => format!("<>8__s{}", span.start()),
+        }
+    }
 }
 
 impl std::fmt::Display for Closure {
@@ -578,6 +591,10 @@ pub(crate) struct Emitter<'a> {
     pub(crate) extension_bodies: Option<(u32, u32)>,
     /// The lambdas of the type being planned that go to its `<>c`.
     pub(crate) singleton_candidates: Vec<(SymbolId, usize)>,
+    /// Every lambda that was a candidate, kept after the type's `<>c` was
+    /// planned: a closure class asks whether a lambda written inside it
+    /// went there instead.
+    pub(crate) static_lambdas: std::collections::HashSet<(SymbolId, usize)>,
     /// The parameters of `Invoke` each of a delegate's `BeginInvoke` and
     /// `EndInvoke` repeats, by the `MethodDef` token of the method, which
     /// carry the originals' attributes over.
@@ -628,6 +645,9 @@ pub(crate) struct Emitter<'a> {
     /// lambda: made when the lambda runs, for what closures inside it
     /// capture of its parameters and locals.
     pub(crate) nested_displays: HashMap<(SymbolId, Closure), DisplayClass>,
+    /// How each member's closures are laid out in classes, worked out on
+    /// the first ask.
+    pub(crate) layouts: HashMap<SymbolId, std::sync::Arc<crate::closures::ClosureLayout>>,
     /// The `FixedElementField` and element type of every `fixed` buffer
     /// field, by the field.
     pub(crate) fixed_buffers: HashMap<SymbolId, (Token, Type)>,
@@ -1275,6 +1295,7 @@ impl<'a> Emitter<'a> {
             singleton_types: HashMap::new(),
             extension_bodies: None,
             singleton_candidates: Vec::new(),
+            static_lambdas: std::collections::HashSet::new(),
             cloned_parameters: HashMap::new(),
             nullable_contexts: crate::nullable::contexts_of(compilation),
             nullable_on: false,
@@ -1304,6 +1325,7 @@ impl<'a> Emitter<'a> {
             display_pending: Vec::new(),
             closure_hosts: HashMap::new(),
             nested_displays: HashMap::new(),
+            layouts: HashMap::new(),
             fixed_buffers: HashMap::new(),
             fixed_buffer_types: HashMap::new(),
             async_closures: Vec::new(),
@@ -2143,6 +2165,9 @@ impl Emitter<'_> {
                         plans.push(plan);
                     }
                 }
+                // The machines of the closures keep classes of their own
+                // scopes too, planned before them.
+                self.name_scope_fields(member, &mut plans);
             }
             // The lambdas of the type that capture nothing share its `<>c`,
             // nested after everything else the type's members made.
@@ -4829,6 +4854,7 @@ impl Emitter<'_> {
             }
             if self.goes_to_singleton(&body, owner, index) {
                 self.singleton_candidates.push((owner, index));
+                self.static_lambdas.insert((owner, index));
                 continue;
             }
             let token = Token::new(table::METHOD_DEF, *next_method);
@@ -4975,7 +5001,6 @@ impl Emitter<'_> {
         view: DisplayView,
         arity: usize,
         own: usize,
-        next_field: &mut u32,
         next_method: &mut u32,
     ) -> Result<(), EmitError> {
         let Some(body) = self.body_of(owner) else {
@@ -4985,18 +5010,9 @@ impl Emitter<'_> {
             return Ok(());
         }
         let owner_name = self.compilation.symbols().get(owner).name.clone();
-        // A closure written inside a lambda that gets a class of its own
+        // A closure written inside a scope that gets a class of its own
         // lives there, not here.
-        let nested = self.nested_display_owners(owner);
-        let nested_spans: Vec<TextSpan> = nested
-            .iter()
-            .filter_map(|outer| self.closure_span(&body, *outer))
-            .collect();
-        let in_a_nested = |span: TextSpan| {
-            nested_spans
-                .iter()
-                .any(|outer| *outer != span && within(span, *outer))
-        };
+        let layout = self.closure_layout(owner);
         // A lambda's parameters are locals of the body too, and the machine
         // has a field for every local — but a parameter is what the lambda
         // is called with, not something kept across a suspension, and the
@@ -5007,25 +5023,10 @@ impl Emitter<'_> {
                 view.locals.remove(parameter);
             }
         }
-        // The machine holds the member's parameters; a parameter of a local
-        // function that a closure inside it captures — a function nested in
-        // the local function, a lambda in it — has to be held too, and gets
-        // a field of its own.
-        let mut foreign: Vec<SymbolId> = Vec::new();
-        let captured_parameters = body
-            .lambdas
-            .iter()
-            .flat_map(|lambda| lambda.captured_parameters.iter().copied())
-            .chain(
-                body.local_functions
-                    .iter()
-                    .flat_map(|function| function.captured_parameters.iter().copied()),
-            );
-        for parameter in captured_parameters {
-            if !view.parameters.contains_key(&parameter) && !foreign.contains(&parameter) {
-                foreign.push(parameter);
-            }
-        }
+        // What a scope with a class of its own declares lives in that class,
+        // not in the machine's field of the same name.
+        view.locals
+            .retain(|local, _| layout.local_owner(*local).is_none());
         let mut pending = PendingDisplay {
             owner,
             token: plan.token,
@@ -5041,26 +5042,6 @@ impl Emitter<'_> {
             methods: Vec::new(),
             functions: Vec::new(),
         };
-        for (number, parameter) in foreign.iter().enumerate() {
-            let name = format!(
-                "<{}>P__{number}",
-                self.compilation.symbols().get(*parameter).name
-            );
-            let ty = self.type_of(*parameter);
-            let token = Token::new(table::FIELD, *next_field);
-            *next_field += 1;
-            plan.fields.push(FieldPlan {
-                token,
-                name: name.clone(),
-                ty: ty.clone(),
-                flags: field_attributes::PUBLIC,
-                symbol: None,
-                constant: None,
-                sig: None,
-            });
-            view.parameters.insert(*parameter, token);
-            pending.parameters.push((*parameter, name, ty));
-        }
         let mut display = DisplayClass {
             inner_sig: sig.clone(),
             sig,
@@ -5070,7 +5051,7 @@ impl Emitter<'_> {
             generics: Vec::new(),
         };
         for (index, lambda) in body.lambdas.iter().enumerate() {
-            if in_a_nested(lambda.span) {
+            if layout.lambda_host(index).is_some() {
                 continue;
             }
             let method = Token::new(table::METHOD_DEF, *next_method);
@@ -5135,9 +5116,7 @@ impl Emitter<'_> {
             });
         }
         for (index, function) in body.local_functions.iter().enumerate() {
-            if self.function_span(function).is_some_and(in_a_nested)
-                || self.dll_import(function.symbol).is_some()
-            {
+            if layout.function_host(index).is_some() || self.dll_import(function.symbol).is_some() {
                 continue;
             }
             let method = Token::new(table::METHOD_DEF, *next_method);
@@ -5189,21 +5168,26 @@ impl Emitter<'_> {
     /// display class while it is planned, with definition tokens; inside a
     /// generic type those name nothing the runtime will load through, and
     /// the `MemberRef`s made afterwards have to take their place.
-    /// Gives the `<>8__s…` fields of the member's `async` machine their
-    /// types: the loop-body classes were planned after the machine, so the
-    /// machine's plan named them with a placeholder until now.
+    /// Gives the `<>8__s…` fields of the member's machine their types: the
+    /// scopes' classes were planned after the machine, so the machine's plan
+    /// named them with a placeholder until now.
     fn name_scope_fields(&mut self, member: SymbolId, plans: &mut [TypePlan]) {
         for plan in plans.iter_mut() {
             let Some(key) = plan.machine.filter(|key| key.owner() == member) else {
                 continue;
             };
-            let Some(scopes) = self.asyncs.get(&key).map(|plan| plan.scopes.clone()) else {
+            let Some(scopes) = self
+                .asyncs
+                .get(&key)
+                .map(|plan| plan.scopes.clone())
+                .or_else(|| self.iterators.get(&key).map(|plan| plan.scopes.clone()))
+            else {
                 continue;
             };
-            for (span, token) in scopes {
+            for (closure, token) in scopes {
                 let Some(sig) = self
                     .nested_displays
-                    .get(&(member, Closure::Scope(span)))
+                    .get(&(member, closure))
                     .map(|display| display.inner_sig.clone())
                 else {
                     continue;
@@ -5232,6 +5216,7 @@ impl Emitter<'_> {
                     .collect()
             })
             .unwrap_or_default();
+        let layout = self.closure_layout(owner);
         let Some(display) = self.displays.get_mut(&owner) else {
             return;
         };
@@ -5241,6 +5226,8 @@ impl Emitter<'_> {
             for parameter in &lambda_parameters {
                 view.locals.remove(parameter);
             }
+            view.locals
+                .retain(|local, _| layout.local_owner(*local).is_none());
             // A parameter of a local function that a closure captured has
             // a field the machine's plan knows nothing of: it stays.
             let mut merged = parameters.clone();
@@ -5293,12 +5280,13 @@ impl Emitter<'_> {
             .unwrap_or_default()
     }
 
-    /// The class that holds what a member's lambdas captured.
+    /// The class that holds what a member's own scope declares and its
+    /// closures captured.
     ///
-    /// One per member rather than one per scope, which is simpler and right
-    /// wherever C# shares the variable. It differs for a `foreach` variable,
-    /// which C# makes fresh each iteration; the interpreter shares its frame
-    /// and so agrees with this rather than with C#.
+    /// The member is the outermost scope, entered once per call; a scope
+    /// inside it that declares a captured variable has a class of its own
+    /// (see [`Self::plan_nested_display`]), made each time the scope is
+    /// entered, with this one as its root.
     fn plan_display_class(
         &mut self,
         owner: SymbolId,
@@ -5335,136 +5323,43 @@ impl Emitter<'_> {
         // Every lambda of the member becomes a method of the class, not only
         // the ones that captured: one that captured nothing is still written
         // inside a method whose locals now live here, and a lambda inside a
-        // local function reads them through the same fields. The exception
-        // is a closure written inside a lambda that gets a class of its own:
-        // that class is where it lives.
-        let nested = self.nested_display_owners(owner);
-        let nested_spans: Vec<TextSpan> = nested
-            .iter()
-            .filter_map(|outer| self.closure_span(&body, *outer))
-            .collect();
-        // Strictly inside: the owner of a nested class is not inside its
-        // own class.
-        let in_a_nested = |span: TextSpan| {
-            nested_spans
-                .iter()
-                .any(|outer| *outer != span && within(span, *outer))
-        };
-        let nested_functions: Vec<SymbolId> = nested
-            .iter()
-            .filter_map(|outer| match outer {
-                Closure::Function(index) => Some(body.local_functions[*index].symbol),
-                Closure::Lambda(_) | Closure::Scope(_) => None,
-            })
-            .collect();
-        // One that captures nothing at all goes to the type's `<>c`, as it
-        // would from a member with no class.
+        // local function reads them through the same fields. The exceptions
+        // are a closure written inside a scope that has a class of its own,
+        // which lives there, and one that captures nothing at all, which goes
+        // to the type's `<>c`, as it would from a member with no class.
+        let layout = self.closure_layout(owner);
         let mut capturing: Vec<usize> = Vec::new();
         for index in 0..body.lambdas.len() {
-            if in_a_nested(body.lambdas[index].span) {
-                continue;
-            }
             if self.goes_to_singleton(&body, owner, index) {
                 self.singleton_candidates.push((owner, index));
-            } else {
+                self.static_lambdas.insert((owner, index));
+            } else if layout.lambda_host(index).is_none() {
                 capturing.push(index);
             }
         }
         let functions: Vec<usize> = (0..body.local_functions.len())
             .filter(|index| {
-                !self
-                    .function_span(&body.local_functions[*index])
-                    .is_some_and(in_a_nested)
+                layout.function_host(*index).is_none()
                     && self
                         .dll_import(body.local_functions[*index].symbol)
                         .is_none()
             })
             .collect();
 
-        // Every capture of every lambda goes in one class, so that two lambdas
-        // over the same variable share it — which is what C# promises. A
-        // variable declared inside a lambda with a class of its own lives
-        // there instead.
-        let mut locals: Vec<LocalId> = Vec::new();
-        let mut parameters: Vec<SymbolId> = Vec::new();
-        let mut needs_this = false;
-        let mut take = |lambda_locals: &[LocalId],
-                        lambda_parameters: &[SymbolId],
-                        this: bool,
-                        locals: &mut Vec<LocalId>,
-                        parameters: &mut Vec<SymbolId>| {
-            for local in lambda_locals {
-                if !locals.contains(local) && !in_a_nested(body.locals[local.0 as usize].span) {
-                    locals.push(*local);
-                }
-            }
-            for parameter in lambda_parameters {
-                // A parameter of a local function with a class of its own
-                // lives in that class.
-                let of_nested = self
-                    .compilation
-                    .symbols()
-                    .get(*parameter)
-                    .container
-                    .is_some_and(|container| nested_functions.contains(&container));
-                if !parameters.contains(parameter) && !of_nested {
-                    parameters.push(*parameter);
-                }
-            }
-            needs_this |= this;
-        };
-        for index in &capturing {
-            let lambda = &body.lambdas[*index];
-            take(
-                &lambda.captured,
-                &lambda.captured_parameters,
-                lambda.captures_this,
-                &mut locals,
-                &mut parameters,
-            );
-        }
-        for index in &functions {
-            let function = &body.local_functions[*index];
-            take(
-                &function.captured,
-                &function.captured_parameters,
-                function.captures_this,
-                &mut locals,
-                &mut parameters,
-            );
-        }
-        // A closure inside a nested class may still read the member's
-        // variables and `this`: it reaches them through the class's parent,
-        // which is this one, so they have to be here too.
-        for span in nested_spans.iter().copied() {
-            for lambda in body
-                .lambdas
+        // What the member's own scope declares and a closure captured goes in
+        // one class, so that two lambdas over the same variable share it —
+        // which is what C# promises. A variable a nested scope declares lives
+        // in that scope's class instead. `this` is kept for every closure of
+        // the member, wherever its method is, since the classes nested here
+        // reach it through their parent.
+        let (root_locals, root_parameters) = layout.root();
+        let locals: Vec<LocalId> = root_locals.to_vec();
+        let parameters: Vec<SymbolId> = root_parameters.to_vec();
+        let needs_this = body.lambdas.iter().any(|lambda| lambda.captures_this)
+            || body
+                .local_functions
                 .iter()
-                .filter(|lambda| within(lambda.span, span))
-            {
-                take(
-                    &lambda.captured,
-                    &lambda.captured_parameters,
-                    lambda.captures_this,
-                    &mut locals,
-                    &mut parameters,
-                );
-            }
-            for function in &body.local_functions {
-                if self
-                    .function_span(function)
-                    .is_some_and(|it| within(it, span))
-                {
-                    take(
-                        &function.captured,
-                        &function.captured_parameters,
-                        function.captures_this,
-                        &mut locals,
-                        &mut parameters,
-                    );
-                }
-            }
-        }
+                .any(|function| function.captures_this);
 
         let token = Token::new(table::TYPE_DEF, *next_type);
         *next_type += 1;
@@ -5725,113 +5620,6 @@ impl Emitter<'_> {
             machine: None,
             nested: None,
         }))
-    }
-
-    /// The lambdas of a member whose parameters or locals a closure inside
-    /// them captures. `a => b => a + b` has the inner lambda reading `a`,
-    /// which the outer one is called with afresh each time: it needs a class
-    /// of its own, made when it runs, the way the member's is made when the
-    /// member runs.
-    pub(crate) fn nested_display_owners(&mut self, owner: SymbolId) -> Vec<Closure> {
-        let Some(body) = self.body_of(owner) else {
-            return Vec::new();
-        };
-        // An iterator's `MoveNext` keeps no local alive across a `yield`,
-        // and has no field for a class made each time round either; an
-        // `async` machine keeps one (`<>8__s…`), so its loops get theirs.
-        let is_iterator = self.iterated_element(MachineKey::Member(owner)).is_some()
-            && self.iterator_refusal(MachineKey::Member(owner)).is_none();
-        let symbols = self.compilation.symbols();
-        let declared_inside =
-            |local: &LocalId, span: TextSpan| within(body.locals[local.0 as usize].span, span);
-        // Whether any closure written inside `span`, other than the owner
-        // itself, captures a local declared there or a parameter of
-        // `function`.
-        let captured_inside = |span: TextSpan, function: Option<SymbolId>| {
-            body.lambdas.iter().any(|lambda| {
-                lambda.span != span
-                    && within(lambda.span, span)
-                    && (lambda
-                        .captured
-                        .iter()
-                        .any(|local| declared_inside(local, span))
-                        || lambda.captured_parameters.iter().any(|parameter| {
-                            function.is_some() && symbols.get(*parameter).container == function
-                        }))
-            }) || body.local_functions.iter().any(|inner| {
-                let inner_span = self.function_span(inner);
-                inner_span.is_some_and(|it| it != span && within(it, span))
-                    && (inner
-                        .captured
-                        .iter()
-                        .any(|local| declared_inside(local, span))
-                        || inner.captured_parameters.iter().any(|parameter| {
-                            function.is_some() && symbols.get(*parameter).container == function
-                        }))
-            })
-        };
-        let mut owners: Vec<Closure> = (0..body.lambdas.len())
-            .filter(|outer| captured_inside(body.lambdas[*outer].span, None))
-            .map(Closure::Lambda)
-            .collect();
-        // A local function whose own variables a closure inside it captures
-        // needs a class per call, the way a lambda does: it may be running
-        // several times at once — recursively — and each call's variables
-        // are its own.
-        owners.extend(
-            (0..body.local_functions.len())
-                .filter(|index| {
-                    let function = &body.local_functions[*index];
-                    self.function_span(function)
-                        .is_some_and(|span| captured_inside(span, Some(function.symbol)))
-                })
-                .map(Closure::Function),
-        );
-        // A loop body whose variables a closure captures gets a class made
-        // afresh each time round (§12.19.6 for `foreach`; a `for` shares its
-        // own variables and keeps only the body's here). One level only for
-        // now: a loop inside another owner, or holding one, keeps the
-        // member's class.
-        if !is_iterator {
-            let mut scopes = Vec::new();
-            for statement in &body.statements {
-                loop_scopes(statement, &mut scopes);
-            }
-            for lambda in &body.lambdas {
-                loop_scopes(&lambda.body, &mut scopes);
-            }
-            for function in &body.local_functions {
-                loop_scopes(&function.body, &mut scopes);
-            }
-            let other_spans: Vec<TextSpan> = owners
-                .iter()
-                .filter_map(|outer| self.closure_span(&body, *outer))
-                .collect();
-            let candidates: Vec<TextSpan> = scopes
-                .iter()
-                .copied()
-                .filter(|span| captured_inside(*span, None))
-                .collect();
-            for span in &candidates {
-                let overlaps = |other: &TextSpan| {
-                    *other != *span && (within(*other, *span) || within(*span, *other))
-                };
-                if other_spans.iter().any(overlaps) || candidates.iter().any(overlaps) {
-                    continue;
-                }
-                owners.push(Closure::Scope(*span));
-            }
-        }
-        // Outer closures first: a nested class is parented to the class of
-        // the closure around it, which has to be planned before it.
-        owners.sort_by_key(|closure| {
-            let span = self.closure_span(&body, *closure);
-            (
-                span.map_or(0, TextSpan::start),
-                std::cmp::Reverse(span.map_or(0, TextSpan::length)),
-            )
-        });
-        owners
     }
 
     /// Where a closure was written: a lambda's span, or a local function's.
@@ -6174,30 +5962,36 @@ impl Emitter<'_> {
     /// name: those its class declares, and those its method declares.
     ///
     /// A lambda's or a local function's class is made on entry to it; a
-    /// loop body's by the closure the loop is written in, or by the member
+    /// scope's by the closure the scope is written in, or by the member
     /// itself where it is written in none.
     fn maker_generics(
-        &self,
+        &mut self,
         owner: SymbolId,
         body: &rustlyn_semantics::BoundBody,
-        outer: Closure,
+        maker: Option<Closure>,
         enclosing: SymbolId,
         machine: bool,
     ) -> (Vec<SymbolId>, Vec<SymbolId>) {
-        let symbols = self.compilation.symbols();
-        let maker = match outer {
-            Closure::Lambda(_) | Closure::Function(_) => Some(outer),
-            Closure::Scope(span) => {
-                let lambdas = (0..body.lambdas.len()).map(Closure::Lambda);
-                let functions = (0..body.local_functions.len()).map(Closure::Function);
-                lambdas
-                    .chain(functions)
-                    .filter_map(|closure| Some((closure, self.closure_span(body, closure)?)))
-                    .filter(|(_, at)| *at != span && within(span, *at))
-                    .min_by_key(|(_, at)| at.length())
-                    .map(|(closure, _)| closure)
+        // A closure that became a state machine makes the class in its
+        // `MoveNext`, where the machine's own parameters are all there is.
+        let machine_key = match maker {
+            Some(Closure::Lambda(index)) => {
+                let key = MachineKey::Lambda { owner, index };
+                (self.is_async_closure(key) && self.async_refusal(key).is_none()).then_some(key)
             }
+            Some(Closure::Function(index)) => {
+                let key = MachineKey::Function { owner, index };
+                ((self.is_async_closure(key) && self.async_refusal(key).is_none())
+                    || (self.iterated_element(key).is_some()
+                        && self.iterator_refusal(key).is_none()))
+                .then_some(key)
+            }
+            _ => None,
         };
+        if let Some(key) = machine_key {
+            return (self.machine_generics(key), Vec::new());
+        }
+        let symbols = self.compilation.symbols();
         let type_generics = symbols
             .get(enclosing)
             .as_named_type()
@@ -6253,9 +6047,11 @@ impl Emitter<'_> {
         }
     }
 
-    /// Plans the display class of one lambda of a member: the class its
-    /// parameters and locals live in when a closure inside it captures them,
-    /// with the closures as its methods and the member's class as its parent.
+    /// Plans the class of one scope of a member: a lambda's or a local
+    /// function's call, a block, an iteration of a loop. It holds the
+    /// variables the scope declares and a closure captured, with the closures
+    /// written in the scope as its methods and the class of the scope around
+    /// it as its parent.
     #[allow(clippy::too_many_arguments)]
     fn plan_nested_display(
         &mut self,
@@ -6278,90 +6074,42 @@ impl Emitter<'_> {
             Closure::Function(index) => Some(body.local_functions[index].symbol),
             Closure::Lambda(_) | Closure::Scope(_) => None,
         };
+        let layout = self.closure_layout(owner);
+        let machine = self.becomes_machine(owner);
         // A closure inside this one that has a class of its own keeps its
         // variables and its closures there: `x => y => z => x + y + z`
         // holds `y` in the middle lambda's class alone, and `z` is a method
         // of that class, reaching `x` through its parent.
-        let inner: Vec<TextSpan> = self
-            .nested_display_owners(owner)
-            .into_iter()
-            .filter(|closure| *closure != outer)
-            .filter_map(|closure| self.closure_span(&body, closure))
-            .filter(|it| *it != span && within(*it, span))
+        let (hosted_lambdas, hosted_functions) = layout.hosted(outer);
+        let lambdas: Vec<usize> = hosted_lambdas
+            .iter()
+            .copied()
+            // One that captures nothing goes to the type's `<>c`.
+            .filter(|index| machine || !self.static_lambdas.contains(&(owner, *index)))
             .collect();
-        // Strictly inside: the inner closure itself is a method of this
-        // class, and only what it holds is not.
-        let in_inner = |at: TextSpan| inner.iter().any(|it| at != *it && within(at, *it));
-        let lambdas: Vec<usize> = (0..body.lambdas.len())
+        let functions: Vec<usize> = hosted_functions
+            .iter()
+            .copied()
             .filter(|index| {
-                outer != Closure::Lambda(*index)
-                    && within(body.lambdas[*index].span, span)
-                    && !in_inner(body.lambdas[*index].span)
+                self.dll_import(body.local_functions[*index].symbol)
+                    .is_none()
             })
             .collect();
-        let functions: Vec<usize> = (0..body.local_functions.len())
-            .filter(|index| {
-                outer != Closure::Function(*index)
-                    && self
-                        .function_span(&body.local_functions[*index])
-                        .is_some_and(|it| within(it, span) && !in_inner(it))
-                    && self
-                        .dll_import(body.local_functions[*index].symbol)
-                        .is_none()
-            })
-            .collect();
-        let mut locals: Vec<LocalId> = Vec::new();
-        let mut parameters: Vec<SymbolId> = Vec::new();
-        let mut captures_this = false;
-        {
-            let symbols = self.compilation.symbols();
-            let mut take = |captured: &[LocalId], captured_parameters: &[SymbolId], this: bool| {
-                for local in captured {
-                    let at = body.locals[local.0 as usize].span;
-                    if within(at, span) && !in_inner(at) && !locals.contains(local) {
-                        locals.push(*local);
-                    }
-                }
-                for parameter in captured_parameters {
-                    if owning_function.is_some()
-                        && symbols.get(*parameter).container == owning_function
-                        && !parameters.contains(parameter)
-                    {
-                        parameters.push(*parameter);
-                    }
-                }
-                captures_this |= this;
-            };
-            for index in &lambdas {
-                let lambda = &body.lambdas[*index];
-                take(
-                    &lambda.captured,
-                    &lambda.captured_parameters,
-                    lambda.captures_this,
-                );
-            }
-            for index in &functions {
-                let function = &body.local_functions[*index];
-                take(
-                    &function.captured,
-                    &function.captured_parameters,
-                    function.captures_this,
-                );
-            }
-        }
+        let (owned_locals, owned_parameters) = layout.owned(outer);
+        let locals: Vec<LocalId> = owned_locals.to_vec();
+        let parameters: Vec<SymbolId> = owned_parameters.to_vec();
+        let captures_this = lambdas
+            .iter()
+            .any(|index| body.lambdas[*index].captures_this)
+            || functions
+                .iter()
+                .any(|index| body.local_functions[*index].captures_this);
         // The parent is the class the closure around this one has, where it
         // has one — `x => y => z => x + y + z` keeps `y` in a class whose
         // parent holds `x` — and the member's class otherwise: the outer
         // lambda is a method of it, and what the closures read of the member
         // is there. Without either, `this` is kept here.
-        let enclosing_owner = self
-            .nested_display_owners(owner)
-            .into_iter()
-            .filter(|closure| *closure != outer)
-            .filter_map(|closure| self.closure_span(&body, closure).map(|it| (closure, it)))
-            .filter(|(_, it)| *it != span && within(span, *it))
-            .max_by_key(|(_, it)| it.start())
-            .map(|(closure, _)| closure);
+        let enclosing_owner = layout.parent(outer);
         // The member's class is the parent only where the outer closure is
         // a method of it: a lambda that captured nothing is a method of the
         // type, and has no class of the member's to hand down.
@@ -6438,13 +6186,13 @@ impl Emitter<'_> {
             }
         };
         // The class is made by the code of the closure it belongs to — for a
-        // loop body, of the closure the loop is written in, or the member —
+        // scope, of the closure the scope is written in, or the member —
         // and that code names each parameter the way its own method does:
         // one its class declares is `!n`, one the method declares is `!!n`.
         let hosted = parent.is_some();
         let machine = self.becomes_machine(owner);
         let (maker_class, maker_method) =
-            self.maker_generics(owner, &body, outer, enclosing, machine);
+            self.maker_generics(owner, &body, layout.maker(outer), enclosing, machine);
         let outer_arguments: Vec<SigType> = generics
             .iter()
             .map(|parameter| {
@@ -14508,60 +14256,6 @@ pub(crate) fn loop_scope(statement: &BoundStatement) -> Option<TextSpan> {
             Some(TextSpan::new(start, body.span.end() - start))
         }
         _ => None,
-    }
-}
-
-/// The spans every loop's per-iteration class would cover, as
-/// [`loop_scope`] says.
-fn loop_scopes(statement: &BoundStatement, out: &mut Vec<TextSpan>) {
-    use rustlyn_semantics::BoundStatementKind as S;
-    match &statement.kind {
-        S::ForEach { body, .. }
-        | S::While { body, .. }
-        | S::DoWhile { body, .. }
-        | S::For { body, .. } => {
-            out.extend(loop_scope(statement));
-            loop_scopes(body, out);
-        }
-        S::Block(statements) => {
-            for inner in statements {
-                loop_scopes(inner, out);
-            }
-        }
-        S::If {
-            consequence,
-            alternative,
-            ..
-        } => {
-            loop_scopes(consequence, out);
-            if let Some(alternative) = alternative {
-                loop_scopes(alternative, out);
-            }
-        }
-        S::Using { body, .. } | S::Lock { body, .. } | S::Fixed { body, .. } => {
-            loop_scopes(body, out);
-        }
-        S::Switch { sections, .. } => {
-            for section in sections {
-                for inner in &section.statements {
-                    loop_scopes(inner, out);
-                }
-            }
-        }
-        S::Try {
-            body,
-            catches,
-            finally,
-        } => {
-            loop_scopes(body, out);
-            for catch in catches {
-                loop_scopes(&catch.body, out);
-            }
-            if let Some(finally) = finally {
-                loop_scopes(finally, out);
-            }
-        }
-        _ => {}
     }
 }
 

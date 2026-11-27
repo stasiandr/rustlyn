@@ -59,11 +59,21 @@ implements the behaviour.
   Linux and macOS does not support varargs calls at all: a program built by Roslyn fails
   with `InvalidProgramException: Vararg calling convention not supported`. `__makeref`,
   `__refvalue` and `__reftype` work.
-* The closure class is made one per member, not one per scope. For a `for` variable
-  this is exactly what C# promises; for a `foreach` variable, which C# 5+ creates fresh
-  on every iteration, it is not (loops inside `async` methods are an exception and get a
-  class per iteration). The interpreter shares one frame and so agrees with the emitter
-  rather than with C#.
+* A captured variable is a field of a closure class made when execution enters the
+  scope that declares it, as C# requires: the member's own class when it is called, and
+  one of its own for a block, an iteration of a loop, a `catch`, a `using`, a `switch`
+  or a call of a lambda or local function, each holding the variables that scope
+  declares and a closure captures, and each pointing at the class of the scope around it
+  (`CS$<>8__locals`). A `foreach` variable is fresh each iteration; a `for` loop's
+  initializer variables are one for the whole loop, and what its condition, step and
+  body declare is fresh each time round. Where Roslyn differs: a scope that declares a
+  captured variable gets a class of its own even where a neighbour could share it
+  (Roslyn merges environments whose lifetimes cannot be told apart), the member's class
+  is made even where it holds nothing, a lambda is a method of the innermost class that
+  *encloses* it rather than of the innermost one whose variables it reads, and the
+  classes are numbered `<>c__DisplayClass{m}_{k}` outermost first. A `catch` whose
+  handler awaits, and an `await using`, are taken apart when the body becomes a state
+  machine, so what they declare lives in the scope around them.
 * Constant folding understands literals, arithmetic on them and references to other
   constants, which is exactly what a C# constant is. Anything else gives `None`, not a
   wrong value.
@@ -161,6 +171,12 @@ it is not a .NET runtime.
 * Integer widths are not distinguished (everything is computed as `i64`; narrowing
   applies only where the binder inserted a conversion), and recursion depth is capped so
   that runaway recursion is reported rather than crashing the process.
+* A variable is one slot of the call's frame for as long as the call runs, however
+  often its scope is entered, and a closure shares that frame. A closure made in a
+  loop body or by a `foreach` therefore sees the variable of the last iteration, where
+  C# (and the emitter) give each iteration its own; the interpreter agrees with C#
+  where the variable is shared (a `for` loop's own variable, a variable of the
+  method) and not where it is fresh.
 * An enumerator is drained completely before the loop starts rather than stepped: the
   loop body cannot influence what `MoveNext` returns later. Within the supported subset
   there is no visible difference, but IL behaves differently.

@@ -28298,3 +28298,1491 @@ True
 "#,
     );
 }
+
+/// A variable a loop declares is a new variable each time round, and one a
+/// closure captured is the one of the iteration it was made in: a `foreach`
+/// variable, what a `for` body declares, a `while` body's locals, pattern and
+/// `out` variables, tuple deconstruction, three loops deep. A `for` loop's own
+/// variable is one for the whole loop. Two closures of one iteration see each
+/// other's writes; those of another iteration do not. Only one loop level was
+/// right: the member had one class, and the inner loop's variables were shared
+/// by every iteration of the outer one.
+#[test]
+fn captured_variables_of_loops_are_fresh_for_each_iteration() {
+    check(
+        "ClosuresLoops",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+class P {
+  static void Show(string name, IEnumerable<Func<int>> fs) => Console.WriteLine(name + ": " + string.Join(",", fs.Select(f => f())));
+  static void Main() {
+    // 1 for loop variable is one variable
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) fs.Add(() => i); Show("for-shared", fs); }
+    // 2 for with body local
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { int c = i * 2; fs.Add(() => c); } Show("for-body", fs); }
+    // 3 for with both: loop var and body local, writes seen by sibling
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 2; i++) { int c = 0; fs.Add(() => ++c); fs.Add(() => c * 10 + i); } Show("for-sibling", fs); Show("for-sibling2", fs); }
+    // 4 foreach over array, list, enumerable
+    { var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 2, 3 }) fs.Add(() => x); Show("foreach-array", fs); }
+    { var fs = new List<Func<int>>(); foreach (var x in new List<int> { 4, 5, 6 }) fs.Add(() => x); Show("foreach-list", fs); }
+    { var fs = new List<Func<int>>(); foreach (var x in Enumerable.Range(7, 3)) fs.Add(() => x); Show("foreach-enum", fs); }
+    // 5 foreach with tuples
+    { var fs = new List<Func<int>>(); foreach (var (a, b) in new[] { (1, 2), (3, 4) }) fs.Add(() => a * 10 + b); Show("foreach-tuple", fs); }
+    // 6 while and do-while
+    { var fs = new List<Func<int>>(); int n = 0; while (n < 3) { int c = n; fs.Add(() => c); n++; } Show("while", fs); }
+    { var fs = new List<Func<int>>(); int n = 0; do { int c = n; fs.Add(() => c + 100); n++; } while (n < 3); Show("do-while", fs); }
+    // 7 three levels
+    { var fs = new List<Func<int>>(); foreach (var a in new[] { 1, 2 }) for (int b = 0; b < 2; b++) { int c = a * 10 + b; foreach (var d in new[] { 100, 200 }) fs.Add(() => a + b + c + d); } Show("three", fs); }
+    // 8 for with two variables
+    { var fs = new List<Func<int>>(); for (int i = 0, j = 10; i < 3; i++, j--) fs.Add(() => i * 100 + j); Show("for-two", fs); }
+    // 9 out var in condition and in body
+    { var fs = new List<Func<int>>(); var src = new[] { "1", "x", "3" }; foreach (var s in src) { if (int.TryParse(s, out var v)) fs.Add(() => v); } Show("outvar", fs); }
+    { var fs = new List<Func<int>>(); var q = new Queue<int>(new[] { 5, 6, 7 }); while (q.Count > 0 && q.Dequeue() is var z) fs.Add(() => z); Show("while-cond", fs); }
+    // 10 closures in one iteration share, across iterations do not
+    { var log = new List<string>(); var acts = new List<Action>(); foreach (var x in new[] { 1, 2 }) { int k = x; acts.Add(() => { k += 10; log.Add("a" + k); }); acts.Add(() => log.Add("b" + k)); } foreach (var a in acts) a(); foreach (var a in acts) a(); Console.WriteLine("share: " + string.Join(",", log)); }
+    // 11 closure of iteration 1 does not see iteration 2's writes
+    { Action get1 = null; Action set2 = null; int r1 = 0, r2 = 0; for (int i = 0; i < 2; i++) { int c = i; if (i == 0) get1 = () => r1 = c; else set2 = () => { c = 99; r2 = c; }; } set2(); get1(); Console.WriteLine("iso: " + r1 + "," + r2); }
+    // 12 break/continue
+    { var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 2, 3, 4, 5 }) { if (x == 2) continue; int c = x; fs.Add(() => c); if (x == 4) break; } Show("brk", fs); }
+    // 13 nested loops, inner captures outer var only
+    { var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) { foreach (var y in new[] { 10, 20 }) { fs.Add(() => x); } } Show("outer-only", fs); }
+    // 14 nested loops, middle scope variable
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 2; i++) { int mid = i + 5; for (int j = 0; j < 2; j++) { fs.Add(() => mid * 10 + j); } } Show("mid", fs); }
+  }
+}
+"####,
+        r####"for-shared: 3,3,3
+for-body: 0,2,4
+for-sibling: 1,12,1,12
+for-sibling2: 2,22,2,22
+foreach-array: 1,2,3
+foreach-list: 4,5,6
+foreach-enum: 7,8,9
+foreach-tuple: 12,34
+while: 0,1,2
+do-while: 100,101,102
+three: 113,213,114,214,124,224,125,225
+for-two: 307,307,307
+outvar: 1,3
+while-cond: 5,6,7
+share: a11,b11,a12,b12,a21,b21,a22,b22
+iso: 0,99
+brk: 1,3,4
+outer-only: 1,1,2,2
+mid: 52,52,62,62
+"####,
+    );
+}
+
+/// Every scope that declares a captured variable makes it afresh when it is
+/// entered: a block a `goto` re-enters, a `switch` (whose sections share one
+/// scope), a `catch` and its filter, a `using` statement and declaration,
+/// `lock`, `checked`, `try` and `finally` blocks, `if` and `else` blocks,
+/// deconstruction, nested blocks. A `goto` within one execution of a scope
+/// keeps its variable. A loop built from a backward `goto` shared the
+/// variable of every pass.
+#[test]
+fn captured_variables_of_blocks_are_fresh_each_time_the_block_is_entered() {
+    check(
+        "ClosuresScopes",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+class P {
+  static void Show(string name, IEnumerable<Func<int>> fs) => Console.WriteLine(name + ": " + string.Join(",", fs.Select(f => f())));
+  class D : IDisposable { public int Id; public D(int i) { Id = i; } public void Dispose() { } }
+  static void Main() {
+    // 1 plain blocks entered repeatedly by goto
+    { int cnt = 0; var fs = new List<Func<int>>(); lbl: { int v = cnt; fs.Add(() => v++); fs.Add(() => v); } if (++cnt < 3) goto lbl; Show("goto-block", fs); Show("goto-block2", fs); }
+    // 2 goto within one scope does not make a new instance
+    { var fs = new List<Func<int>>(); { int v = 0; again: fs.Add(() => v); v++; if (v < 3) goto again; } Show("goto-same", fs); }
+    // 3 switch sections
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 4; i++) { switch (i % 2) { case 0: int k = i * 10; fs.Add(() => k); break; case 1: fs.Add(() => i * 100); break; } } Show("switch", fs); }
+    { var fs = new List<Func<int>>(); foreach (object o in new object[] { 1, "ab", 3, "cde" }) { switch (o) { case int n: fs.Add(() => n); break; case string s: fs.Add(() => s.Length); break; } } Show("switch-pattern", fs); }
+    // 4 catch variable
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { try { throw new InvalidOperationException(i.ToString()); } catch (InvalidOperationException ex) { fs.Add(() => int.Parse(ex.Message) * 10); } } Show("catch", fs); }
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { try { throw new InvalidOperationException(i.ToString()); } catch (InvalidOperationException ex) when (Check(ex, () => ex.Message.Length)) { fs.Add(() => int.Parse(ex.Message) + 5); } } Show("catch-filter", fs); }
+    // 4b the handler goes on with the variable the filter wrote
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 2; i++) { try { throw new Exception("e" + i); } catch (Exception ex) when (Check(ex, () => { ex = new Exception("w" + i); return 1; })) { fs.Add(() => ex.Message.Length * 100 + ex.Message[1]); } } Show("filter-writes", fs); }
+    // 5 using
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { using (var d = new D(i)) { fs.Add(() => d.Id + 1000); } } Show("using", fs); }
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { using var d = new D(i); int w = d.Id * 2; fs.Add(() => d.Id + w); } Show("using-decl", fs); }
+    // 6 lock and checked
+    { var fs = new List<Func<int>>(); var gate = new object(); for (int i = 0; i < 3; i++) { lock (gate) { int c = i + 1; fs.Add(() => c); } } Show("lock", fs); }
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { checked { int c = i + 1; fs.Add(() => c * 3); } } Show("checked", fs); }
+    // 7 if/else blocks
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 4; i++) { if (i % 2 == 0) { int a = i; fs.Add(() => a); } else { int b = -i; fs.Add(() => b); } } Show("ifelse", fs); }
+    // 8 try/finally
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { try { int a = i; fs.Add(() => a); } finally { int b = i * 7; fs.Add(() => b); } } Show("tryfinally", fs); }
+    // 9 is-pattern and deconstruction
+    { var fs = new List<Func<int>>(); foreach (object o in new object[] { 1, "x", 2 }) { if (o is int n && n > 0) fs.Add(() => n); } Show("is-pattern", fs); }
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { var (p, q) = (i, i * 3); fs.Add(() => p + q); } Show("deconstruct", fs); }
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { (int p, int q) = (i, i * 4); fs.Add(() => p * 100 + q); } Show("deconstruct2", fs); }
+    // 10 switch with goto case and locals in sections shared across sections
+    { var fs = new List<Func<int>>(); int sel = 0; switch (sel) { case 0: int shared = 5; fs.Add(() => shared); goto case 1; case 1: shared = 8; fs.Add(() => shared); break; } Show("switch-shared", fs); }
+    // 11 nested blocks
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 2; i++) { int a = i; { int b = a * 2; { int c = b * 2; fs.Add(() => a + b + c); } } } Show("nested-blocks", fs); }
+  }
+  static bool Check(Exception e, Func<int> f) => f() > 0;
+}
+"####,
+        r####"goto-block: 0,1,1,2,2,3
+goto-block2: 1,2,2,3,3,4
+goto-same: 3,3,3
+switch: 0,400,20,400
+switch-pattern: 1,2,3,3
+catch: 0,10,20
+catch-filter: 5,6,7
+filter-writes: 248,249
+using: 1000,1001,1002
+using-decl: 0,3,6
+lock: 1,2,3
+checked: 3,6,9
+ifelse: 0,-1,2,-3
+tryfinally: 0,0,1,7,2,14
+is-pattern: 1,2
+deconstruct: 0,4,8
+deconstruct2: 0,104,208
+switch-shared: 8,8
+nested-blocks: 0,7
+"####,
+    );
+}
+
+/// A local function and a lambda inside a loop, inside another lambda or
+/// function, a recursive one that makes a frame per call, one that reads
+/// variables of two scopes, a static one, a generic one, a captured variable
+/// passed by reference, and a lambda that captures nothing, which stays one
+/// cached delegate however many scopes have classes.
+#[test]
+fn local_functions_and_nested_lambdas_capture_the_variables_of_their_own_scopes() {
+    check(
+        "ClosuresFunctions",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+class P {
+  static void Show(string name, IEnumerable<Func<int>> fs) => Console.WriteLine(name + ": " + string.Join(",", fs.Select(f => f())));
+  static T Id<T>(T t) => t;
+  static List<Func<T>> Gen<T>(IEnumerable<T> xs) { var r = new List<Func<T>>(); foreach (var x in xs) { var y = x; r.Add(() => y); } return r; }
+  static void Main() {
+    // 1 local function declared in a loop capturing the loop variable, converted to delegates
+    { var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 2, 3 }) { int Local() => x * 2; fs.Add(Local); } Show("local-func-delegate", fs); }
+    // 2 local function capturing variables of two scopes
+    { var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) { foreach (var y in new[] { 10, 20 }) { int Both() => x * 100 + y; fs.Add(Both); } } Show("local-func-two-scopes", fs); }
+    // 3 local function called directly in loop, with state
+    { var acc = new List<int>(); for (int i = 0; i < 3; i++) { int c = i; void Bump() { c += 10; acc.Add(c); } Bump(); Bump(); } Console.WriteLine("local-call: " + string.Join(",", acc)); }
+    // 4 recursion creating separate frames
+    { Func<int, Func<int>> f = null; f = n => { int local = n * 3; return n == 0 ? (() => local) : (() => local + f(n - 1)()); }; Console.WriteLine("rec-lambda: " + f(3)()); }
+    { int Fact(int n) { int copy = n; Func<int> g = () => copy; return n <= 1 ? g() : g() * Fact(n - 1); } Console.WriteLine("rec-local: " + Fact(5)); }
+    // 5 recursive local function leaving closures per frame
+    { var fs = new List<Func<int>>(); void Walk(int depth) { int d = depth; fs.Add(() => d); if (depth < 3) Walk(depth + 1); } Walk(0); Show("rec-frames", fs); }
+    // 6 lambda in lambda in loop
+    { var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) { Func<Func<int>> mk = () => { int y = x * 10; return () => y + x; }; fs.Add(mk()); fs.Add(mk()); } Show("lambda-lambda", fs); }
+    { var fs = new List<Func<int>>(); Func<int, Func<int, Func<int>>> curry = a => b => () => a * 100 + b; foreach (var x in new[] { 1, 2 }) fs.Add(curry(x)(x + 5)); Show("curry", fs); }
+    // 7 loops inside lambdas
+    { Func<List<Func<int>>> mk = () => { var r = new List<Func<int>>(); foreach (var x in new[] { 1, 2, 3 }) r.Add(() => x * 3); return r; }; Show("loop-in-lambda", mk()); }
+    { Func<int, List<Func<int>>> mk = n => { var r = new List<Func<int>>(); for (int i = 0; i < n; i++) { int cp = i; r.Add(() => cp + n); } return r; }; Show("for-in-lambda", mk(3)); }
+    // 8 loops inside local functions
+    { List<Func<int>> Mk(int n) { var r = new List<Func<int>>(); foreach (var x in Enumerable.Range(0, n)) { int sq = x * x; r.Add(() => sq); } return r; } Show("loop-in-local", Mk(4)); }
+    // 9 static local function
+    { var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) { static int Sq(int v) => v * v; int c = x; fs.Add(() => Sq(c)); } Show("static-local", fs); }
+    // 10 generic local function in a loop
+    { var fs = new List<Func<string>>(); foreach (var x in new[] { 1, 2 }) { T Echo<T>(T v) => v; string s = "s" + x; fs.Add(() => Echo(s) + Echo(x)); } Console.WriteLine("generic-local: " + string.Join(",", fs.Select(f => f()))); }
+    // 11 generic method with loops
+    { var a = Gen(new[] { 1, 2, 3 }); var b = Gen(new[] { "a", "b" }); Console.WriteLine("generic-method: " + string.Join(",", a.Select(f => f())) + string.Join(",", b.Select(f => f()))); }
+    // 12 delegates from the same iteration observe each other's writes through a local function
+    { var log = new List<string>(); var acts = new List<Action>(); foreach (var x in new[] { 1, 2 }) { int n = x; void Inc() { n++; } acts.Add(Inc); acts.Add(() => log.Add("n" + n)); } foreach (var a in acts) a(); foreach (var a in acts) a(); Console.WriteLine("local-share: " + string.Join(",", log)); }
+    // 13 captured variable passed by ref and out
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { int v = i; Bump(ref v); fs.Add(() => v); } Show("ref-captured", fs); }
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { int.TryParse(i.ToString(), out int v); fs.Add(() => v + 7); } Show("out-captured", fs); }
+    // 14 static lambdas are cached even when the scope has a class
+    { Func<int> first = null; bool same = true; for (int i = 0; i < 3; i++) { int c = i; Func<int> f = () => 5; Func<int> g = () => c; if (first == null) first = f; else same &= ReferenceEquals(first, f); g(); } Console.WriteLine("static-cache: " + same); }
+    // 15 identity checks
+    { Func<int> a = null; Func<int> b = null; for (int i = 0; i < 2; i++) { int c = i; Func<int> f = () => c; if (i == 0) a = f; else b = f; } Console.WriteLine("identity: " + (a() + "," + b() + "," + ReferenceEquals(a.Target, b.Target))); }
+  }
+  static void Bump(ref int x) => x += 100;
+}
+"####,
+        r####"local-func-delegate: 2,4,6
+local-func-two-scopes: 110,120,210,220
+local-call: 10,20,11,21,12,22
+rec-lambda: 18
+rec-local: 120
+rec-frames: 0,1,2,3
+lambda-lambda: 11,11,22,22
+curry: 106,207
+loop-in-lambda: 3,6,9
+for-in-lambda: 3,4,5
+loop-in-local: 0,1,4,9
+static-local: 1,4
+generic-local: s11,s22
+generic-method: 1,2,3a,b
+local-share: n2,n3,n3,n4
+ref-captured: 100,101,102
+out-captured: 7,8,9
+static-cache: True
+identity: 0,1,False
+"####,
+    );
+}
+
+/// A closure over `this` and a loop variable, a lambda that reads only
+/// `this`, a field initializer, a struct's copy of itself, a primary
+/// constructor's parameters, a constructor with loops and an expression body.
+#[test]
+fn closures_over_this_fields_and_constructor_parameters_in_scopes() {
+    check(
+        "ClosuresThis",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+class Box {
+  public int F = 10;
+  public List<Func<int>> Make(int n) { var r = new List<Func<int>>(); for (int i = 0; i < n; i++) { int c = i; r.Add(() => F + c); } return r; }
+  public List<Func<int>> MakeEach(int[] xs) { var r = new List<Func<int>>(); foreach (var x in xs) { r.Add(() => F * x); r.Add(() => x); } return r; }
+  public Func<int> OnlyThis() => () => F;
+  public List<Func<int>> Mixed() { var r = new List<Func<int>>(); int outer = 1; foreach (var x in new[] { 2, 3 }) { r.Add(() => F + outer + x); } outer = 5; return r; }
+  public readonly Func<int> Init = () => 42;
+  public Func<int> Init2 = null;
+  public static Func<int> Stat = () => 7;
+  public IEnumerable<Func<int>> Prop => new[] { 1, 2 }.Select(x => (Func<int>)(() => x + 100));
+  public Func<int> Calc(int a, int b) => () => a * b;
+}
+struct S {
+  public int V;
+  public List<Func<int>> Make() { var r = new List<Func<int>>(); S copy = this; foreach (var x in new[] { 1, 2 }) r.Add(() => copy.V + x); return r; }
+}
+class Prim(int a, string b) {
+  public List<Func<string>> Make() { var r = new List<Func<string>>(); foreach (var x in new[] { 1, 2 }) r.Add(() => b + a + x); return r; }
+  public Func<int> Fn = () => a * 2;
+}
+class WithCtor {
+  public List<Func<int>> L = new List<Func<int>>();
+  public WithCtor(int n) { for (int i = 0; i < n; i++) { int c = i; L.Add(() => c * n); } foreach (var x in new[] { 7, 8 }) L.Add(() => x); }
+}
+class P {
+  static void Show(string name, IEnumerable<Func<int>> fs) => Console.WriteLine(name + ": " + string.Join(",", fs.Select(f => f())));
+  static void Main() {
+    var b = new Box();
+    Show("this-loop", b.Make(3));
+    Show("this-foreach", b.MakeEach(new[] { 1, 2 }));
+    Show("only-this", new[] { b.OnlyThis() });
+    Show("mixed", b.Mixed());
+    b.F = 20;
+    Show("mixed-after", b.Mixed());
+    Show("initializers", new[] { b.Init, Box.Stat, b.Calc(6, 7) });
+    Show("prop", b.Prop);
+    var s = new S { V = 5 };
+    Show("struct", s.Make());
+    var p = new Prim(3, "q");
+    Console.WriteLine("primary: " + string.Join(",", p.Make().Select(f => f())) + "," + p.Fn());
+    Show("ctor", new WithCtor(3).L);
+    Func<int> same1 = new Box().OnlyThis(); Func<int> same2 = new Box().OnlyThis();
+    Console.WriteLine("this-targets: " + ReferenceEquals(same1.Target, same2.Target));
+  }
+}
+"####,
+        r####"this-loop: 10,11,12
+this-foreach: 10,1,20,2
+only-this: 10
+mixed: 17,18
+mixed-after: 27,28
+initializers: 42,7,42
+prop: 101,102
+struct: 6,7
+primary: q31,q32,6
+ctor: 0,3,6,7,8
+this-targets: False
+"####,
+    );
+}
+
+/// A range variable is a parameter of the lambda a clause becomes, so a
+/// closure over it sees the element it was made for: `select`, a second
+/// `from`, `let`, `where`, `orderby`, `group`, `join`, a nested query, a
+/// continuation, and a `Task.Run` in the select. The range variables were
+/// locals of the member and every closure saw the last element.
+#[test]
+fn query_range_variables_are_fresh_for_each_element() {
+    check(
+        "ClosuresQueries",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+class P {
+  static void Show(string name, IEnumerable<Func<int>> fs) => Console.WriteLine(name + ": " + string.Join(",", fs.Select(f => f())));
+  static async Task Main() {
+    var urls = new[] { "a", "bb", "ccc" };
+    var xs = new[] { 1, 2 }; var ys = new[] { 3, 4 };
+    // 1 select with lambdas
+    Show("select", (from u in urls select (Func<int>)(() => u.Length)).ToList());
+    // 2 select with Task.Run
+    var tasks = (from u in urls select Task.Run(() => u.Length)).ToList();
+    Console.WriteLine("task-run: " + string.Join(",", (await Task.WhenAll(tasks))));
+    // 3 two from clauses
+    Show("from-from", (from x in xs from y in ys select (Func<int>)(() => x * y)).ToList());
+    // 4 where and let
+    Show("where-let", (from x in new[] { 1, 2, 3, 4 } where x % 2 == 0 let z = x * 10 select (Func<int>)(() => z + x)).ToList());
+    // 5 method syntax is the same
+    Show("method", urls.Select(u => (Func<int>)(() => u.Length)).ToList());
+    // 6 orderby, group
+    Show("orderby", (from u in urls orderby u.Length descending select (Func<int>)(() => u.Length * 2)).ToList());
+    var groups = (from n in new[] { 1, 2, 3, 4, 5 } group n by n % 2 into g select (Func<int>)(() => g.Key * 100 + g.Count())).ToList();
+    Show("group", groups);
+    // 7 join
+    Show("join", (from x in xs join y in ys on x equals y - 2 select (Func<int>)(() => x * 10 + y)).ToList());
+    // 8 nested queries
+    Show("nested", (from x in xs select (from y in ys select (Func<int>)(() => x * 100 + y)).First()).ToList());
+    // 9 query in a loop capturing loop variable
+    { var fs = new List<Func<int>>(); foreach (var k in new[] { 5, 6 }) fs.AddRange(from x in xs select (Func<int>)(() => x + k)); Show("query-in-loop", fs); }
+    // 10 query continuation and select into
+    Show("into", (from x in xs select x * 2 into d select (Func<int>)(() => d + 1)).ToList());
+  }
+}
+"####,
+        r####"select: 1,2,3
+task-run: 1,2,3
+from-from: 3,4,6,8
+where-let: 22,44
+method: 1,2,3
+orderby: 6,4,2
+group: 103,2
+join: 13,24
+nested: 103,203
+query-in-loop: 6,7,7,8
+into: 3,5
+"####,
+    );
+}
+
+/// Top-level statements are one member's body: its loops make a class per
+/// iteration like any other.
+#[test]
+fn closures_in_top_level_statements_are_fresh_per_scope() {
+    check(
+        "ClosuresTopLevel",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+var fs = new List<Func<int>>();
+foreach (var x in new[] { 1, 2, 3 }) fs.Add(() => x);
+for (int i = 0; i < 3; i++) { int c = i; fs.Add(() => c + 10); }
+Console.WriteLine("top: " + string.Join(",", fs.Select(f => f())));
+int counter = 0;
+Action inc = () => counter++;
+inc(); inc();
+Console.WriteLine("top-shared: " + counter);
+int Local(int n) { var r = new List<Func<int>>(); foreach (var y in Enumerable.Range(0, n)) r.Add(() => y + counter); return r.Sum(f => f()); }
+Console.WriteLine("top-local: " + Local(3));
+"####,
+        r####"top: 1,2,3,10,11,12
+top-shared: 2
+top-local: 9
+"####,
+    );
+}
+
+/// An iterator's locals live in the machine, but what a closure captured in
+/// a scope lives in a class made when `MoveNext` enters the scope and kept in
+/// a field of the machine across the `yield`s: loops, blocks, `try`,
+/// `using`, `catch`, a local function, a lambda in a lambda, `this`,
+/// walking the sequence twice.
+#[test]
+fn iterators_make_the_class_of_a_scope_when_it_is_entered() {
+    check(
+        "ClosuresIterators",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+class P {
+  static string J(IEnumerable<Func<int>> fs) => string.Join(",", fs.Select(f => f()));
+  static IEnumerable<Func<int>> ForLoop() { for (int i = 0; i < 3; i++) { int cp = i; yield return () => cp * 2; } }
+  static IEnumerable<Func<int>> ForShared() { for (int i = 0; i < 3; i++) { yield return () => i; } }
+  static IEnumerable<Func<int>> Each() { foreach (var x in new[] { 7, 8 }) yield return () => x; }
+  static IEnumerable<Func<int>> Nested() { foreach (var x in new[] { 1, 2 }) foreach (var y in new[] { 10, 20 }) yield return () => x + y; }
+  static IEnumerable<Func<int>> Writes() { for (int i = 0; i < 2; i++) { int c = i; yield return () => ++c; yield return () => c; } }
+  static IEnumerable<Func<int>> AfterYield() { for (int i = 0; i < 3; i++) { int c = i * 10; yield return () => c; c++; yield return () => c; } }
+  static IEnumerable<Func<int>> Param(int a) { int local = a * 2; yield return () => a + local; for (int i = 0; i < 2; i++) { int k = i + a; yield return () => k; } }
+  static IEnumerable<Func<int>> WhileLoop() { int n = 0; while (n < 3) { int c = n; n++; yield return () => c; } }
+  static IEnumerable<Func<int>> Blocks() { { int a = 1; yield return () => a; } { int a = 2; yield return () => a++; yield return () => a; } }
+  static IEnumerable<Func<int>> Tryer() { for (int i = 0; i < 2; i++) { try { int c = i; yield return () => c; } finally { int d = i + 50; Console.Write(""); } } }
+  static IEnumerable<Func<int>> LocalFn() { foreach (var x in new[] { 1, 2 }) { int Sq() => x * x; yield return Sq; } }
+  static IEnumerable<Func<int>> Lambdas() { foreach (var x in new[] { 1, 2 }) { Func<Func<int>> mk = () => { int y = x * 10; return () => y; }; yield return mk(); } }
+  static IEnumerator<Func<int>> Enumerator() { for (int i = 0; i < 2; i++) { int c = i + 100; yield return () => c; } }
+  static IEnumerable<Func<int>> This1(Box b) { return b.Gen(); }
+  static IEnumerable<Func<int>> UsingIt() { for (int i = 0; i < 2; i++) { using (var r = new System.IO.StringReader("x" + i)) { string s = r.ReadToEnd(); yield return () => s.Length + 10; } } }
+  static IEnumerable<Func<int>> Catcher() { for (int i = 0; i < 2; i++) { Func<int> f = null; try { throw new Exception(i.ToString()); } catch (Exception ex) { f = () => int.Parse(ex.Message) + 1; } yield return f; } }
+  class Box { public int F = 9; public IEnumerable<Func<int>> Gen() { foreach (var x in new[] { 1, 2 }) { yield return () => F + x; } } }
+  static void Main() {
+    Console.WriteLine("for: " + J(ForLoop()));
+    Console.WriteLine("for-shared: " + J(ForShared()));
+    Console.WriteLine("foreach: " + J(Each()));
+    Console.WriteLine("nested: " + J(Nested()));
+    Console.WriteLine("writes: " + J(Writes()));
+    { var fs = Writes().ToList(); Console.WriteLine("writes-twice: " + J(fs) + " " + J(fs)); }
+    { var fs = AfterYield().ToList(); Console.WriteLine("after-yield: " + J(fs)); }
+    Console.WriteLine("param: " + J(Param(3)));
+    Console.WriteLine("while: " + J(WhileLoop()));
+    { var fs = Blocks().ToList(); Console.WriteLine("blocks: " + J(fs) + " " + J(fs)); }
+    Console.WriteLine("try: " + J(Tryer()));
+    Console.WriteLine("local-fn: " + J(LocalFn()));
+    Console.WriteLine("lambdas: " + J(Lambdas()));
+    { var e = Enumerator(); var l = new List<Func<int>>(); while (e.MoveNext()) l.Add(e.Current); Console.WriteLine("enumerator: " + J(l)); }
+    Console.WriteLine("this: " + J(This1(new Box())));
+    Console.WriteLine("using: " + J(UsingIt()));
+    Console.WriteLine("catch: " + J(Catcher()));
+    { var en = ForLoop(); Console.WriteLine("two-walks: " + J(en) + " " + J(en)); }
+    { var e = ForShared().GetEnumerator(); e.MoveNext(); var a = e.Current; e.MoveNext(); var b = e.Current; Console.WriteLine("shared-live: " + a() + b()); }
+  }
+}
+"####,
+        r####"for: 0,2,4
+for-shared: 0,1,2
+foreach: 7,8
+nested: 11,21,12,22
+writes: 1,1,2,2
+writes-twice: 1,1,2,2 2,2,3,3
+after-yield: 1,1,11,11,21,21
+param: 9,3,4
+while: 0,1,2
+blocks: 1,2,3 1,3,4
+try: 0,1
+local-fn: 1,4
+lambdas: 10,20
+enumerator: 100,101
+this: 10,11
+using: 12,12
+catch: 1,2
+two-walks: 0,2,4 0,2,4
+shared-live: 11
+"####,
+    );
+}
+
+/// The same for an `async` method: the class of a scope is made when
+/// `MoveNext` enters it and kept in a field of the machine across the
+/// `await`s: loops, blocks, `try`, `using`, `catch` that awaits, a `switch`,
+/// a local function, `Task.Run` in nested loops, an `async` lambda in a loop,
+/// an `async` iterator.
+#[test]
+fn async_methods_make_the_class_of_a_scope_when_it_is_entered() {
+    check(
+        "ClosuresAsync",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+class P {
+  static string J(IEnumerable<Func<int>> fs) => string.Join(",", fs.Select(f => f()));
+  static async Task<List<Func<int>>> ForLoop() { var r = new List<Func<int>>(); for (int i = 0; i < 3; i++) { int cp = i; await Task.Yield(); r.Add(() => cp * 2); } return r; }
+  static async Task<List<Func<int>>> ForShared() { var r = new List<Func<int>>(); for (int i = 0; i < 3; i++) { await Task.Yield(); r.Add(() => i); } return r; }
+  static async Task<List<Func<int>>> Each() { var r = new List<Func<int>>(); foreach (var x in new[] { 7, 8 }) { await Task.Delay(1); r.Add(() => x); } return r; }
+  static async Task<List<Func<int>>> Nested() { var r = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) foreach (var y in new[] { 10, 20 }) { await Task.Yield(); r.Add(() => x + y); } return r; }
+  static async Task<List<Func<int>>> Writes() { var r = new List<Func<int>>(); for (int i = 0; i < 2; i++) { int c = i; r.Add(() => ++c); await Task.Yield(); r.Add(() => c); } return r; }
+  static async Task<List<Func<int>>> AfterAwait() { var r = new List<Func<int>>(); for (int i = 0; i < 3; i++) { int c = i * 10; r.Add(() => c); await Task.Yield(); c++; r.Add(() => c); } return r; }
+  static async Task<List<Func<int>>> Param(int a) { var r = new List<Func<int>>(); int local = a * 2; r.Add(() => a + local); await Task.Yield(); for (int i = 0; i < 2; i++) { int k = i + a; r.Add(() => k); } return r; }
+  static async Task<List<Func<int>>> WhileLoop() { var r = new List<Func<int>>(); int n = 0; while (n < 3) { int c = n; n++; await Task.Yield(); r.Add(() => c); } return r; }
+  static async Task<List<Func<int>>> Blocks() { var r = new List<Func<int>>(); { int a = 1; await Task.Yield(); r.Add(() => a); } { int a = 2; r.Add(() => a++); await Task.Yield(); r.Add(() => a); } return r; }
+  static async Task<List<Func<int>>> Tryer() { var r = new List<Func<int>>(); for (int i = 0; i < 2; i++) { try { int c = i; await Task.Yield(); r.Add(() => c); } finally { await Task.Yield(); } } return r; }
+  static async Task<List<Func<int>>> LocalFn() { var r = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) { int Sq() => x * x; await Task.Yield(); r.Add(Sq); } return r; }
+  static async Task<List<Func<int>>> Lambdas() { var r = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) { Func<Func<int>> mk = () => { int y = x * 10; return () => y; }; await Task.Yield(); r.Add(mk()); } return r; }
+  static async Task<List<Func<int>>> Catcher() { var r = new List<Func<int>>(); for (int i = 0; i < 2; i++) { try { throw new Exception(i.ToString()); } catch (Exception ex) { await Task.Yield(); r.Add(() => int.Parse(ex.Message) + 1); } } return r; }
+  static async Task<List<Func<int>>> Usings() { var r = new List<Func<int>>(); for (int i = 0; i < 2; i++) { using (var d = new System.IO.StringReader("x" + i)) { await Task.Yield(); var s = d.ReadToEnd(); r.Add(() => s.Length + i * 0 + 10); } } return r; }
+  static async Task<List<Func<int>>> Switcher() { var r = new List<Func<int>>(); foreach (object o in new object[] { 1, "ab", 3 }) { switch (o) { case int n: await Task.Yield(); r.Add(() => n); break; case string s: r.Add(() => s.Length); break; } } return r; }
+  static async Task<List<Task<int>>> TaskRun() { var r = new List<Task<int>>(); foreach (var x in new[] { 1, 2, 3 }) { for (int y = 1; y <= 2; y++) { int yy = y; r.Add(Task.Run(() => x * 10 + yy)); } } await Task.Yield(); return r; }
+  static async Task<int> AsyncLambda() { var fs = new List<Func<Task<int>>>(); foreach (var x in new[] { 1, 2, 3 }) fs.Add(async () => { await Task.Yield(); return x * 5; }); int sum = 0; foreach (var f in fs) sum = sum * 100 + await f(); return sum; }
+  static async IAsyncEnumerable<Func<int>> AsyncIter() { for (int i = 0; i < 3; i++) { int c = i * 3; await Task.Yield(); yield return () => c; } foreach (var x in new[] { 90, 91 }) yield return () => x; }
+  class Box { public int F = 5; public async Task<List<Func<int>>> Gen() { var r = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) { await Task.Yield(); r.Add(() => F + x); } return r; } }
+  static async Task Main() {
+    Console.WriteLine("for: " + J(await ForLoop()));
+    Console.WriteLine("for-shared: " + J(await ForShared()));
+    Console.WriteLine("foreach: " + J(await Each()));
+    Console.WriteLine("nested: " + J(await Nested()));
+    { var fs = await Writes(); Console.WriteLine("writes: " + J(fs) + " " + J(fs)); }
+    { var fs = await AfterAwait(); Console.WriteLine("after-await: " + J(fs)); }
+    Console.WriteLine("param: " + J(await Param(3)));
+    Console.WriteLine("while: " + J(await WhileLoop()));
+    { var fs = await Blocks(); Console.WriteLine("blocks: " + J(fs) + " " + J(fs)); }
+    Console.WriteLine("try: " + J(await Tryer()));
+    Console.WriteLine("local-fn: " + J(await LocalFn()));
+    Console.WriteLine("lambdas: " + J(await Lambdas()));
+    Console.WriteLine("catch: " + J(await Catcher()));
+    Console.WriteLine("using: " + J(await Usings()));
+    Console.WriteLine("switch: " + J(await Switcher()));
+    Console.WriteLine("task-run: " + string.Join(",", await Task.WhenAll(await TaskRun())));
+    Console.WriteLine("async-lambda: " + await AsyncLambda());
+    { var l = new List<Func<int>>(); await foreach (var f in AsyncIter()) l.Add(f); Console.WriteLine("async-iter: " + J(l)); }
+    Console.WriteLine("this: " + J(await new Box().Gen()));
+  }
+}
+"####,
+        r####"for: 0,2,4
+for-shared: 3,3,3
+foreach: 7,8
+nested: 11,21,12,22
+writes: 1,1,2,2 2,2,3,3
+after-await: 1,1,11,11,21,21
+param: 9,3,4
+while: 0,1,2
+blocks: 1,2,3 1,3,4
+try: 0,1
+local-fn: 1,4
+lambdas: 10,20
+catch: 1,2
+using: 12,12
+switch: 1,2,3
+task-run: 11,12,21,22,31,32
+async-lambda: 51015
+async-iter: 0,3,6,90,91
+this: 6,7
+"####,
+    );
+}
+
+/// What an `await using`, an `await foreach`, an `await` in a loop's
+/// condition or a `switch`'s governing expression and a `catch` or `finally`
+/// that awaits are rewritten into does not lose the variables a closure
+/// captured there. An expression tree reads them from the same class.
+#[test]
+fn async_scopes_survive_awaits_in_conditions_usings_and_handlers() {
+    check(
+        "ClosuresAsyncAwaits",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Linq.Expressions;
+class AD : IAsyncDisposable, IDisposable { public int Id; public AD(int i) { Id = i; } public ValueTask DisposeAsync() { return default; } public void Dispose() { } }
+class P {
+  static string J(IEnumerable<Func<int>> fs) => string.Join(",", fs.Select(f => f()));
+  static async IAsyncEnumerable<int> Numbers() { for (int i = 0; i < 3; i++) { await Task.Yield(); yield return i * 7; } }
+  static async Task<List<Func<int>>> AwaitUsing() { var r = new List<Func<int>>(); for (int i = 0; i < 3; i++) { await using (var d = new AD(i)) { int w = i + 100; r.Add(() => d.Id * 1000 + w); } } return r; }
+  static async Task<List<Func<int>>> AwaitUsingDecl() { var r = new List<Func<int>>(); for (int i = 0; i < 3; i++) { await using var d = new AD(i); int w = i + 200; r.Add(() => d.Id * 1000 + w); await Task.Yield(); } return r; }
+  static async Task<List<Func<int>>> AwaitForeach() { var r = new List<Func<int>>(); await foreach (var x in Numbers()) { int y = x + 1; r.Add(() => y); r.Add(() => x); } return r; }
+  static async Task<List<Func<int>>> AwaitInCondition() { var r = new List<Func<int>>(); int n = 0; while (await Task.FromResult(n) < 3) { int c = n; r.Add(() => c); n++; } return r; }
+  static async Task<List<Func<int>>> AwaitInInit() { var r = new List<Func<int>>(); foreach (var x in await Task.FromResult(new[] { 4, 5 })) { r.Add(() => x); } return r; }
+  static async Task<List<Func<int>>> AwaitInSwitch() { var r = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) { switch (await Task.FromResult(x)) { case 1: int a = x * 3; r.Add(() => a); break; default: int b = x * 5; r.Add(() => b); break; } } return r; }
+  static async Task<List<Func<int>>> AwaitInExpression() { var r = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) { int y = x + await Task.FromResult(10); r.Add(() => y); } return r; }
+  static async Task<List<Func<int>>> TryCatchFinally() { var r = new List<Func<int>>(); for (int i = 0; i < 2; i++) { try { await Task.Yield(); throw new Exception("e" + i); } catch (Exception ex) { await Task.Yield(); r.Add(() => ex.Message.Length + 10); } finally { int f = i + 70; await Task.Yield(); r.Add(() => f); } } return r; }
+  static void Trees() {
+    var es = new List<Expression<Func<int>>>(); foreach (var x in new[] { 1, 2 }) { int y = x * 10; es.Add(() => x + y); }
+    Console.WriteLine("trees: " + string.Join(",", es.Select(e => e.Compile()())));
+  }
+  static async Task Main() {
+    Console.WriteLine("await-using: " + J(await AwaitUsing()));
+    Console.WriteLine("await-using-decl: " + J(await AwaitUsingDecl()));
+    Console.WriteLine("await-foreach: " + J(await AwaitForeach()));
+    Console.WriteLine("await-condition: " + J(await AwaitInCondition()));
+    Console.WriteLine("await-init: " + J(await AwaitInInit()));
+    Console.WriteLine("await-switch: " + J(await AwaitInSwitch()));
+    Console.WriteLine("await-expr: " + J(await AwaitInExpression()));
+    Console.WriteLine("try: " + J(await TryCatchFinally()));
+    Trees();
+  }
+}
+"####,
+        r####"await-using: 100,1101,2102
+await-using-decl: 200,1201,2202
+await-foreach: 1,0,8,7,15,14
+await-condition: 0,1,2
+await-init: 4,5
+await-switch: 3,10
+await-expr: 11,12
+try: 12,70,12,71
+trees: 11,22
+"####,
+    );
+}
+
+/// An `async` lambda or local function whose parameter or local a closure
+/// inside it captures makes the class for it as its machine starts, and
+/// keeps it in a field across the `await`s: one per call, with the arguments
+/// put into it, and the class around the lambda as its parent. An `async`
+/// lambda with captured variables of its own was not built at all.
+#[test]
+fn async_lambdas_and_local_functions_make_the_class_of_their_own_variables() {
+    check(
+        "ClosuresAsyncLambdas",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+class P {
+  static string J(IEnumerable<Func<int>> fs) => string.Join(",", fs.Select(f => f()));
+  class Box {
+    public int F = 100;
+    public async Task<List<Func<int>>> Make() {
+      var r = new List<Func<int>>();
+      Func<int, Task> add = async n => { int d = n * 2; await Task.Yield(); r.Add(() => d + n + F); d++; };
+      await add(1); await add(2);
+      return r;
+    }
+  }
+  static async Task Main() {
+    // 1 an async lambda's own parameter and local captured by a lambda inside it
+    { var r = new List<Func<int>>(); Func<int, Task> add = async n => { int d = n * 10; await Task.Yield(); r.Add(() => d + n); d++; await Task.Yield(); r.Add(() => d - n); }; await add(1); await add(2); Console.WriteLine("lambda-params: " + J(r)); }
+    // 2 an async local function whose parameter and local a lambda captures
+    { var r = new List<Func<int>>(); async Task Add(int n) { int d = n * 10; await Task.Yield(); r.Add(() => d + n); d++; } await Add(3); await Add(4); Console.WriteLine("local-async: " + J(r)); }
+    // 3 an async local function with a loop
+    { var r = new List<Func<int>>(); async Task Loop(int n) { for (int i = 0; i < n; i++) { int c = i; await Task.Yield(); r.Add(() => c * 100 + n); } } await Loop(2); await Loop(3); Console.WriteLine("local-loop: " + J(r)); }
+    // 4 this
+    Console.WriteLine("this: " + J(await new Box().Make()));
+    // 5 an iterator local function with its own captured variable
+    { IEnumerable<Func<int>> It(int n) { int d = n * 5; yield return () => d; d++; yield return () => d + n; } Console.WriteLine("iter-local: " + J(It(1)) + " " + J(It(2))); }
+    // 6 async lambda in a loop with a loop inside it
+    { var fs = new List<Func<Task<int>>>(); foreach (var x in new[] { 1, 2 }) fs.Add(async () => { var inner = new List<Func<int>>(); for (int i = 0; i < 2; i++) { int c = i + x; await Task.Yield(); inner.Add(() => c); } return inner.Sum(f => f()); }); int sum = 0; foreach (var f in fs) sum = sum * 100 + await f(); Console.WriteLine("lambda-loop: " + sum); }
+  }
+}
+"####,
+        r####"lambda-params: 12,10,23,19
+local-async: 34,45
+local-loop: 2,102,3,103,203
+this: 104,107
+iter-local: 5,7 10,13
+lambda-loop: 305
+"####,
+    );
+}
+
+/// A lambda in a loop's condition, in the collection a `foreach` walks, in
+/// a `switch`'s governing expression or a case guard, in a `using`'s
+/// resource, in a constructor initializer or a struct constructor belongs to
+/// the scope that holds it, not the one that is entered after it is
+/// evaluated.
+#[test]
+fn closures_in_conditions_guards_constructors_and_instance_methods() {
+    check(
+        "ClosuresMore",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+class P {
+  static void Show(string name, IEnumerable<Func<int>> fs) => Console.WriteLine(name + ": " + string.Join(",", fs.Select(f => f())));
+  int field = 1000;
+  struct S2 { public int V; public S2(int v) { V = v; Fs = new List<Func<int>>(); for (int i = 0; i < 2; i++) { int c = i; Fs.Add(() => c * 10); } } public List<Func<int>> Fs; }
+  class Base { public Base(Func<int> f) { Console.WriteLine("base: " + f()); } }
+  class Derived : Base { public Derived(int a) : base(() => a * 2) { var fs = new List<Func<int>>(); for (int i = 0; i < 2; i++) { int c = i + a; fs.Add(() => c); } Show("derived", fs); } }
+  List<Func<int>> Inst() { var r = new List<Func<int>>(); for (int i = 0; i < 2; i++) { int c = i; Func<int> f = () => field + c; r.Add(f); r.Add(() => field); } return r; }
+  static void Main() {
+    // 1 case guards with lambdas
+    { var fs = new List<Func<int>>(); foreach (var o in new object[] { 1, 2, 3 }) { switch (o) { case int n when new Func<bool>(() => n > 1)(): fs.Add(() => n * 10); break; case int n: fs.Add(() => n); break; } } Show("guards", fs); }
+    // 2 lambda in a foreach collection expression and in the condition
+    { int limit = 2; var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 2, 3 }.Where(v => v >= limit)) { fs.Add(() => x + limit); } Show("collection-lambda", fs); }
+    { var fs = new List<Func<int>>(); int n = 0; while (new Func<bool>(() => n < 3)()) { int c = n; fs.Add(() => c); n++; } Show("cond-lambda", fs); }
+    { var fs = new List<Func<int>>(); for (int i = 0; new Func<bool>(() => i < 3)(); i++) { int c = i; fs.Add(() => c + i); } Show("for-cond-lambda", fs); }
+    // 3 switch governing lambda
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 2; i++) { switch (new Func<int>(() => i)()) { case 0: int a = 5; fs.Add(() => a + i); break; default: int b = 6; fs.Add(() => b + i); break; } } Show("switch-gov", fs); }
+    // 4 using expression with a lambda
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 2; i++) { using (var r = new System.IO.StringReader("ab")) { int len = r.ReadToEnd().Length; fs.Add(() => len + i); } } Show("using-expr", fs); }
+    // 5 goto out of loops
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { int c = i; fs.Add(() => c); if (i == 1) goto done; } done: Show("goto-out", fs); }
+    // 6 nested try/catch in lambda in loop
+    { var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 0 }) fs.Add(() => { try { return 10 / x; } catch (DivideByZeroException ex) { int l = ex.Message.Length; Func<int> g = () => l; return g(); } }); Show("lambda-try", fs.Select(f => f)); }
+    // 7 struct ctor and base ctor
+    { var s = new S2(1); Show("struct-ctor", s.Fs); }
+    { new Derived(4); }
+    // 8 instance method capturing this in loops
+    { Show("instance", new P().Inst()); }
+    // 9 shared variable between local function and lambda in a loop
+    { var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) { int tot = x; void Add(int d) => tot += d; fs.Add(() => { Add(10); return tot; }); fs.Add(() => tot); } Show("fn-lambda-share", fs); Show("fn-lambda-share2", fs); }
+    // 10 closures in expression-bodied lambdas in nested loops writing outer counters
+    { int calls = 0; var fs = new List<Func<int>>(); for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) { int ij = i * 10 + j; fs.Add(() => { calls++; return ij + calls; }); } Show("counter", fs); }
+    // 11 parameter capture in loops
+    { Show("param", Mk(5, "x")); }
+    // 12 lock inside lambda inside loop with capture
+    { var gate = new object(); var fs = new List<Func<int>>(); foreach (var x in new[] { 3, 4 }) fs.Add(() => { lock (gate) { int y = x * 2; Func<int> g = () => y + x; return g(); } }); Show("lock-lambda", fs); }
+    // 13 default parameter values and optional args with closures
+    { var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) fs.Add(Opt(x)); Show("optional", fs); }
+    // 14 checked context lambdas
+    { var fs = new List<Func<int>>(); foreach (var x in new[] { 100, 200 }) { fs.Add(() => checked((byte)(x - 50))); } Show("checked-lambda", fs); }
+  }
+  static List<Func<int>> Mk(int n, string s) { var r = new List<Func<int>>(); for (int i = 0; i < n; i += 2) { int c = i; r.Add(() => c + n + s.Length); } return r; }
+  static Func<int> Opt(int x, int y = 5) { int z = x; return () => z + y; }
+}
+"####,
+        r####"guards: 1,20,30
+collection-lambda: 4,5
+cond-lambda: 0,1,2
+for-cond-lambda: 3,4,5
+switch-gov: 7,8
+using-expr: 4,4
+goto-out: 0,1
+lambda-try: 10,28
+struct-ctor: 0,10
+base: 8
+derived: 4,5
+instance: 1000,1000,1001,1000
+fn-lambda-share: 11,11,12,12
+fn-lambda-share2: 21,21,22,22
+counter: 1,3,13,15
+param: 6,8,10
+lock-lambda: 9,12
+optional: 6,7
+checked-lambda: 50,150
+"####,
+    );
+}
+
+/// Top-level statements with an `await` are an `async` member's body, and
+/// its loops keep the class of each iteration in a field of the machine.
+#[test]
+fn closures_in_top_level_statements_that_await() {
+    check(
+        "ClosuresTopLevelAsync",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+var fs = new List<Func<int>>();
+foreach (var x in new[] { 1, 2, 3 }) { await Task.Yield(); fs.Add(() => x); }
+for (int i = 0; i < 2; i++) { int c = i * 7; await Task.Delay(1); fs.Add(() => c + i); }
+Console.WriteLine("top-async: " + string.Join(",", fs.Select(f => f())));
+{
+  int local = 5;
+  var gs = new List<Func<int>>();
+  for (int k = 0; k < 2; k++) { int m = k; gs.Add(() => local + m); local++; }
+  Console.WriteLine("top-block: " + string.Join(",", gs.Select(f => f())));
+}
+async Task<int> Sum() { var r = new List<Func<int>>(); foreach (var y in new[] { 4, 5 }) { await Task.Yield(); r.Add(() => y * 2); } return r.Sum(f => f()); }
+Console.WriteLine("top-local: " + await Sum());
+"####,
+        r####"top-async: 1,2,3,2,9
+top-block: 7,8
+top-local: 18
+"####,
+    );
+}
+
+/// A parameter of a local function written in an iterator or an `async`
+/// method that a lambda captures lives in the class made for each call of
+/// the function: the function's own writes to it are what the lambda reads.
+/// The machine kept a second copy, which the function wrote and nothing read.
+#[test]
+fn a_captured_parameter_of_a_local_function_in_a_state_machine_is_its_own() {
+    check(
+        "ClosuresMachineFunctionParameters",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+class P {
+  static async Task A() {
+    await Task.Yield();
+    int F(int a) { Func<int> g = () => a * 2; a++; return g(); }
+    Console.WriteLine("async-fn-param: " + F(3) + "," + F(10));
+  }
+  static IEnumerable<int> I() {
+    int F(int a) { Func<int> g = () => a * 2; a++; return g(); }
+    yield return F(3);
+    yield return F(10);
+  }
+  static void Main() {
+    A().Wait();
+    Console.WriteLine("iter-fn-param: " + string.Join(",", I()));
+  }
+}
+"####,
+        r####"async-fn-param: 8,22
+iter-fn-param: 8,22
+"####,
+    );
+}
+
+/// Lambdas of an iterator or an `async` method share the machine's locals
+/// with each other and with the scopes' classes, and a recursive local
+/// function makes a class per call.
+#[test]
+fn lambdas_and_local_functions_share_variables_inside_state_machines() {
+    check(
+        "ClosuresMachineSharing",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+class P {
+  static IEnumerable<Func<int>> I() {
+    int total = 0;
+    for (int i = 0; i < 3; i++) {
+      int c = i;
+      Func<int> add = () => total += c;
+      yield return add;
+      yield return () => total * 100 + c;
+      total++;
+    }
+  }
+  static async Task<List<Func<int>>> A() {
+    var r = new List<Func<int>>();
+    int shared = 0;
+    foreach (var x in new[] { 1, 2 }) {
+      await Task.Yield();
+      Func<Func<int>> mk = () => { int y = x * 10; return () => y + x + shared; };
+      r.Add(mk());
+      shared += 100;
+      void Local(int depth) { if (depth > 0) { int d = depth; r.Add(() => d + x); Local(depth - 1); } }
+      Local(2);
+    }
+    return r;
+  }
+  static IEnumerable<int> Rec(int n) {
+    int Fib(int k) { int a = k; Func<int> f = () => a; return k < 2 ? f() : Fib(k - 1) + Fib(k - 2); }
+    for (int i = 0; i < n; i++) { yield return Fib(i + 3); }
+  }
+  static void Main() {
+    var l = I().ToList();
+    Console.WriteLine("iter: " + string.Join(",", l.Select(f => f())));
+    Console.WriteLine("async: " + string.Join(",", A().Result.Select(f => f())));
+    Console.WriteLine("rec: " + string.Join(",", Rec(3)));
+  }
+}
+"####,
+        r####"iter: 3,300,4,401,6,602
+async: 211,3,2,222,4,3
+rec: 2,3,5
+"####,
+    );
+}
+
+/// The class an `async` lambda or local function makes for its own variables
+/// is named through the type parameters its machine declares.
+#[test]
+fn async_lambdas_of_generic_methods_name_their_closure_classes() {
+    check(
+        "ClosuresGenericAsyncLambdas",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+class G<T> {
+  public async Task<List<Func<string>>> Run<U>(T t, U u) {
+    var r = new List<Func<string>>();
+    Func<int, Task> add = async n => { string d = t + "/" + u + "/" + n; await Task.Yield(); r.Add(() => d + t); d += "!"; for (int i = 0; i < 2; i++) { int c = i; r.Add(() => d + c + u); } };
+    await add(1); await add(2);
+    async Task Local(U v) { T tt = t; await Task.Yield(); r.Add(() => tt + "|" + v); }
+    await Local(u);
+    return r;
+  }
+}
+class P {
+  static void Main() {
+    var g = new G<int>();
+    Console.WriteLine(string.Join(",", g.Run(5, "s").Result.Select(f => f())));
+  }
+}
+"####,
+        r####"5/s/1!5,5/s/1!0s,5/s/1!1s,5/s/2!5,5/s/2!0s,5/s/2!1s,5|s
+"####,
+    );
+}
+
+/// A static constructor, a field initializer, a property accessor, an
+/// indexer, an operator, an event accessor, a conversion, an expression
+/// body, a local function, an extension method and a record's property:
+/// each member's body is the outermost scope of its closures.
+#[test]
+fn closures_in_every_kind_of_member_make_a_class_per_scope() {
+    check(
+        "ClosuresMembers",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+static class Ext {
+  public static List<Func<int>> Each(this int[] xs, int add) { var r = new List<Func<int>>(); foreach (var x in xs) { int y = x + add; r.Add(() => y); } return r; }
+}
+class M {
+  public static readonly List<Func<int>> Stat = Make("static");
+  public List<Func<int>> Inst = Make("inst");
+  static List<Func<int>> Make(string s) { var r = new List<Func<int>>(); foreach (var c in s) r.Add(() => c); return r; }
+  public static List<Func<int>> FromInit = new Func<List<Func<int>>>(() => { var r = new List<Func<int>>(); for (int i = 0; i < 3; i++) { int c = i * i; r.Add(() => c); } return r; })();
+  static M() { for (int i = 0; i < 2; i++) { int c = i + 50; Stat.Add(() => c); } }
+  public List<Func<int>> Prop { get { var r = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) r.Add(() => x * 7); return r; } }
+  public Func<int> this[int a] { get { int b = a * 2; return () => a + b; } }
+  public static List<Func<int>> operator +(M m, int n) { var r = new List<Func<int>>(); for (int i = 0; i < n; i++) { int c = i; r.Add(() => c + n); } return r; }
+  public event Action E { add { for (int i = 0; i < 2; i++) { int c = i; value += () => Console.WriteLine("e" + c); } value(); } remove { } }
+  public static implicit operator Func<int>(M m) { int z = 9; return () => z; }
+  public List<Func<int>> Expr(int n) => Enumerable.Range(0, n).Select(i => (Func<int>)(() => i * n)).ToList();
+  public List<Func<int>> Local(int n) { List<Func<int>> Inner() { var r = new List<Func<int>>(); for (int i = 0; i < n; i++) { int c = i; r.Add(() => c + n); } return r; } return Inner(); }
+}
+class Dtor { public List<Func<int>> L = new List<Func<int>>(); public Dtor() { foreach (var x in new[] { 5, 6 }) L.Add(() => x); } }
+record R(int A, int B) { public List<Func<int>> Fs { get { var r = new List<Func<int>>(); foreach (var x in new[] { A, B }) r.Add(() => x + A); return r; } } }
+class P {
+  static string J(IEnumerable<Func<int>> fs) => string.Join(",", fs.Select(f => f()));
+  static void Main() {
+    Console.WriteLine("static: " + J(M.Stat));
+    Console.WriteLine("inst: " + J(new M().Inst));
+    Console.WriteLine("from-init: " + J(M.FromInit));
+    Console.WriteLine("prop: " + J(new M().Prop));
+    Console.WriteLine("indexer: " + new M()[4]());
+    Console.WriteLine("operator: " + J(new M() + 3));
+    var m = new M(); Action a = () => Console.WriteLine("added"); m.E += a;
+    Func<int> conv = new M(); Console.WriteLine("conversion: " + conv());
+    Console.WriteLine("expr-bodied: " + J(new M().Expr(3)));
+    Console.WriteLine("local: " + J(new M().Local(3)));
+    Console.WriteLine("extension: " + J(new[] { 1, 2 }.Each(10)));
+    Console.WriteLine("ctor: " + J(new Dtor().L));
+    Console.WriteLine("record: " + J(new R(3, 4).Fs));
+  }
+}
+"####,
+        r####"static: 115,116,97,116,105,99,50,51
+inst: 105,110,115,116
+from-init: 0,1,4
+prop: 7,14
+indexer: 12
+operator: 3,4,5
+added
+e0
+e1
+conversion: 9
+expr-bodied: 0,3,6
+local: 3,4,5
+extension: 11,12
+ctor: 5,6
+record: 6,7
+"####,
+    );
+}
+
+/// A class made for a scope inside a generic type, a generic method, a
+/// generic local function, an iterator and an `async` method holds values of
+/// those parameters and is named through them.
+#[test]
+fn scope_classes_in_generic_types_and_methods_name_their_parameters() {
+    check(
+        "ClosuresGenerics",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+class Pool<T> {
+  public List<Func<T>> Make(IEnumerable<T> xs) { var r = new List<Func<T>>(); foreach (var x in xs) { T copy = x; r.Add(() => copy); } return r; }
+  public List<Func<string>> Pairs<U>(IEnumerable<T> xs, U u) { var r = new List<Func<string>>(); foreach (var x in xs) { for (int i = 0; i < 2; i++) { int k = i; r.Add(() => x + "/" + u + "/" + k); } } return r; }
+  public IEnumerable<Func<T>> Iter(IEnumerable<T> xs) { foreach (var x in xs) { T c = x; yield return () => c; } }
+  public async Task<List<Func<T>>> Async(IEnumerable<T> xs) { var r = new List<Func<T>>(); foreach (var x in xs) { await Task.Yield(); T c = x; r.Add(() => c); } return r; }
+  public IEnumerable<Func<string>> IterG<U>(IEnumerable<T> xs, U u) { foreach (var x in xs) { for (int i = 0; i < 2; i++) { int k = i; yield return () => x + "/" + u + "/" + k; } } }
+  public async Task<List<Func<string>>> AsyncG<U>(IEnumerable<T> xs, U u) { var r = new List<Func<string>>(); foreach (var x in xs) { for (int i = 0; i < 2; i++) { int k = i; await Task.Yield(); r.Add(() => x + "/" + u + "/" + k); } } return r; }
+}
+class P {
+  static List<Func<string>> LocalGen<T>(T a, T b) {
+    var r = new List<Func<string>>();
+    foreach (var t in new[] { a, b }) {
+      string Show<U>(U u) => t + ":" + u;
+      int n = r.Count;
+      r.Add(() => Show(n) + Show("s"));
+    }
+    return r;
+  }
+  static IEnumerable<Func<string>> IterLocalGen<T>(T a, T b) {
+    foreach (var t in new[] { a, b }) {
+      string Show<U>(U u) => t + ":" + u;
+      yield return () => Show(1) + Show("s");
+    }
+  }
+  static List<Func<T>> Constrained<T>(IEnumerable<T> xs) where T : struct { var r = new List<Func<T>>(); foreach (var x in xs) { T? n = x; r.Add(() => n.Value); } return r; }
+  static void Main() {
+    var p = new Pool<int>();
+    Console.WriteLine("make: " + string.Join(",", p.Make(new[] { 1, 2, 3 }).Select(f => f())));
+    Console.WriteLine("pairs: " + string.Join(",", p.Pairs(new[] { 1, 2 }, "u").Select(f => f())));
+    Console.WriteLine("iter: " + string.Join(",", p.Iter(new[] { 4, 5 }).Select(f => f())));
+    Console.WriteLine("async: " + string.Join(",", p.Async(new[] { 6, 7 }).Result.Select(f => f())));
+    Console.WriteLine("iterg: " + string.Join(",", p.IterG(new[] { 1, 2 }, 'c').Select(f => f())));
+    Console.WriteLine("asyncg: " + string.Join(",", p.AsyncG(new[] { 1, 2 }, 2.5).Result.Select(f => f())));
+    Console.WriteLine("localgen: " + string.Join(",", LocalGen("a", "b").Select(f => f())));
+    Console.WriteLine("iterlocalgen: " + string.Join(",", IterLocalGen(1, 2).Select(f => f())));
+    Console.WriteLine("constrained: " + string.Join(",", Constrained(new[] { 3, 4 }).Select(f => f())));
+    var q = new Pool<string>();
+    Console.WriteLine("string-pool: " + string.Join(",", q.Make(new[] { "x", "y" }).Select(f => f())));
+  }
+}
+"####,
+        r####"make: 1,2,3
+pairs: 1/u/0,1/u/1,2/u/0,2/u/1
+iter: 4,5
+async: 6,7
+iterg: 1/c/0,1/c/1,2/c/0,2/c/1
+asyncg: 1/2.5/0,1/2.5/1,2/2.5/0,2/2.5/1
+localgen: a:0a:s,b:1b:s
+iterlocalgen: 1:11:s,2:12:s
+constrained: 3,4
+string-pool: x,y
+"####,
+    );
+}
+
+/// `foreach` over a span and a dictionary, a `switch` expression whose arms
+/// capture pattern variables, loops built from `goto`, a variable written
+/// after the closure is made, per-call frames of a lambda, `ref` to a
+/// captured variable, `using` in a loop, jagged loops.
+#[test]
+fn closures_over_span_loops_switch_expressions_and_gotos() {
+    check(
+        "ClosuresMisc",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+class P {
+  static void Show(string name, IEnumerable<Func<int>> fs) => Console.WriteLine(name + ": " + string.Join(",", fs.Select(f => f())));
+  delegate int Op(ref int x);
+  static void Main() {
+    // 1 foreach over span and array of structs
+    { var fs = new List<Func<int>>(); Span<int> sp = new[] { 1, 2, 3 }; foreach (var x in sp) fs.Add(() => x); Show("span", fs); }
+    { var fs = new List<Func<int>>(); foreach (var (a, b) in new Dictionary<int, int> { [1] = 2, [3] = 4 }) fs.Add(() => a + b); Show("kvp", fs); }
+    // 2 switch expression with pattern variables
+    { var fs = new List<Func<int>>(); foreach (object o in new object[] { 1, "ab", 3.5 }) { fs.Add(o switch { int n => () => n, string s => () => s.Length, _ => () => -1 }); } Show("switch-expr", fs); }
+    // 3 goto-built loops: every pass is a fresh scope, even with a label inside
+    { var fs = new List<Func<int>>(); int i = 0; top: if (i < 3) { int v = i * 10; fs.Add(() => v); i++; goto top; } Show("goto-loop", fs); }
+    { var fs = new List<Func<int>>(); int i = 0; again: { int v = i; fs.Add(() => v); } i++; if (i < 3) goto again; Show("goto-back", fs); }
+    // 4 lambdas and local functions mixing scopes, called after the scopes ended
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 2; i++) { int a = i; for (int j = 0; j < 2; j++) { int b = j; int Sum() => a * 10 + b + i + j; fs.Add(Sum); } } Show("mix", fs); }
+    // 5 closure over a variable written after the closure is created in the same scope
+    { var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) { int late = 0; fs.Add(() => late + x); late = x * 100; } Show("late-write", fs); }
+    // 6 nested lambdas share the enclosing iteration's variable
+    { var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) { int n = x; Func<Func<int>> outer = () => () => n++; var inner = outer(); fs.Add(inner); fs.Add(() => n); } Show("nested-share", fs); Show("nested-share2", fs); }
+    // 7 lambda parameters shadow nothing but are fresh per call
+    { Func<int, Func<int>> mk = a => { int c = a; return () => c++; }; var f1 = mk(10); var f2 = mk(20); Console.WriteLine("per-call: " + f1() + "," + f1() + "," + f2() + "," + f1()); }
+    // 8 variable in a lambda body captured by an inner lambda inside a loop in the lambda
+    { Func<int, List<Func<int>>> mk = a => { var r = new List<Func<int>>(); int shared = a * 100; for (int i = 0; i < 2; i++) { int c = i; r.Add(() => shared + c); } shared++; return r; }; Show("lambda-loop-shared", mk(1).Concat(mk(2))); }
+    // 9 delegate invocation through Invoke and DynamicInvoke of closures from different iterations
+    { var fs = new List<Delegate>(); foreach (var x in new[] { 3, 4 }) fs.Add((Func<int>)(() => x)); Console.WriteLine("dynamic: " + string.Join(",", fs.Select(d => d.DynamicInvoke()))); }
+    // 10 try/finally in loops with a variable captured in finally
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 2; i++) { try { } finally { int f = i + 40; fs.Add(() => f); } } Show("finally", fs); }
+    // 11 conditional scope
+    { var fs = new List<Func<int>>(); for (int i = 0; i < 4; i++) { if (i % 2 == 0) continue; int c = i; fs.Add(() => c); } Show("continue", fs); }
+    // 12 using declaration in loop with lambdas disposing
+    { var log = new List<string>(); var acts = new List<Action>(); for (int i = 0; i < 2; i++) { using var d = new Disp(log, i); int n = i; acts.Add(() => log.Add("act" + n + d.Id)); } foreach (var a in acts) a(); Console.WriteLine("using: " + string.Join(",", log)); }
+    // 13 lock + nested block shadowing names across siblings
+    { var fs = new List<Func<int>>(); { int a = 1; fs.Add(() => a); } { int a = 2; fs.Add(() => a); } Show("siblings", fs); }
+    // 14 compound/increment ops on captured loop-body variables
+    { var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) { int c = x; c += 5; c++; fs.Add(() => c * 2); } Show("compound", fs); }
+    // 15 ref to a captured variable
+    { var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) { int c = x; Inc(ref c); fs.Add(() => c); } Show("ref", fs); }
+    // 16 arrays and strings of captured values in jagged loops
+    { var fs = new List<Func<int>>(); var jag = new[] { new[] { 1, 2 }, new[] { 3 } }; for (int r = 0; r < jag.Length; r++) for (int c = 0; c < jag[r].Length; c++) { int v = jag[r][c]; fs.Add(() => v * 10 + r); } Show("jagged", fs); }
+  }
+  static void Inc(ref int x) => x += 7;
+  class Disp : IDisposable { public List<string> Log; public int Id; public Disp(List<string> l, int i) { Log = l; Id = i; } public void Dispose() => Log.Add("dispose" + Id); }
+}
+"####,
+        r####"span: 1,2,3
+kvp: 3,7
+switch-expr: 1,2,-1
+goto-loop: 0,10,20
+goto-back: 0,1,2
+mix: 4,5,14,15
+late-write: 101,202
+nested-share: 1,2,2,3
+nested-share2: 2,3,3,4
+per-call: 10,11,20,12
+lambda-loop-shared: 101,102,201,202
+dynamic: 3,4
+finally: 40,41
+continue: 1,3
+using: dispose0,dispose1,act00,act11
+siblings: 1,2
+compound: 14,16
+ref: 8,9
+jagged: 12,22,32
+"####,
+    );
+}
+
+/// `foreach (x) foreach (y) list.Add(() => x + y)` gave `22,22,22,22`.
+#[test]
+fn a_closure_in_nested_loops_sees_the_variables_of_each_level() {
+    check(
+        "ClosuresNestedLoops",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+class P {
+  static void Main() {
+    var b = new List<Func<int>>();
+    foreach (var x in new[] { 1, 2 })
+      foreach (var y in new[] { 10, 20 })
+        b.Add(() => x + y);
+    Console.WriteLine(string.Join(",", b.Select(f => f())));
+    var c = new List<Func<int>>();
+    foreach (var x in new[] { 1, 2 }) { foreach (var y in new[] { 10, 20 }) { c.Add(() => y); } }
+    Console.WriteLine(string.Join(",", c.Select(f => f())));
+    var d = new List<Func<int>>();
+    foreach (var x in new[] { 1, 2 }) { for (int j = 0; j < 2; j++) { int k = j * 100 + x; d.Add(() => k); } }
+    Console.WriteLine(string.Join(",", d.Select(f => f())));
+    var e = new List<Func<int>>();
+    foreach (var x in new[] { 1, 2 }) { e.Add(() => x); }
+    foreach (var y in new[] { 10, 20 }) { e.Add(() => y); }
+    Console.WriteLine(string.Join(",", e.Select(f => f())));
+  }
+}
+"####,
+        r####"11,21,12,22
+10,20,10,20
+1,101,2,102
+1,2,10,20
+"####,
+    );
+}
+
+/// `from u in urls select Task.Run(() => u.Length)` saw the last `u`.
+#[test]
+fn a_task_started_in_a_query_select_sees_its_own_range_variable() {
+    check(
+        "ClosuresQueryTask",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+class P {
+  static void Main() {
+    var urls = new[] { "a", "bb", "ccc" };
+    var tasks = (from u in urls select Task.Run(() => u.Length)).ToList();
+    Console.WriteLine(string.Join(",", tasks.Select(t => t.Result)));
+    var acts = (from u in urls select new Func<string>(() => u.ToUpper())).ToList();
+    Console.WriteLine(string.Join(",", acts.Select(a => a())));
+    var viaMethod = urls.Select(u => Task.Run(() => u.Length)).ToList();
+    Console.WriteLine(string.Join(",", viaMethod.Select(t => t.Result)));
+  }
+}
+"####,
+        r####"1,2,3
+A,BB,CCC
+1,2,3
+"####,
+    );
+}
+
+/// A loop written inside a lambda's body or a local function's shared one
+/// variable between iterations.
+#[test]
+fn loops_in_lambda_and_local_function_bodies_make_a_class_per_iteration() {
+    check(
+        "ClosuresLoopsInLambdas",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+class P {
+  static void Main() {
+    Func<string> d = () => { var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 2, 3 }) { fs.Add(() => x * 3); } return string.Join(",", fs.Select(f => f())); };
+    Console.WriteLine(d());
+    Action<int> a = n => { var fs = new List<Func<int>>(); for (int i = 0; i < n; i++) { int cp = i; fs.Add(() => cp); } Console.WriteLine(string.Join(",", fs.Select(f => f()))); };
+    a(3);
+    string Local() { var fs = new List<Func<int>>(); foreach (var x in new[] { 5, 6 }) fs.Add(() => x); return string.Join(",", fs.Select(f => f())); }
+    Console.WriteLine(Local());
+  }
+}
+"####,
+        r####"3,6,9
+0,1,2
+5,6
+"####,
+    );
+}
+
+/// `for (...) { int cp = i; yield return () => cp * 2; }` gave `4,4,4`.
+#[test]
+fn closures_in_iterator_loops_see_their_own_iteration() {
+    check(
+        "ClosuresIteratorLoops",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+class P {
+  static IEnumerable<Func<int>> A() { for (int i = 0; i < 3; i++) { int cp = i; yield return () => cp * 2; } }
+  static IEnumerable<Func<int>> B() { foreach (var x in new[] { 7, 8 }) { yield return () => x; } }
+  static IEnumerable<Func<int>> C() { int k = 0; while (k < 3) { int cp = k++; yield return () => cp; } }
+  static IEnumerable<int> D() { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { int cp = i; fs.Add(() => cp * 2); } foreach (var f in fs) yield return f(); }
+  static void Main() {
+    Console.WriteLine(string.Join(",", A().ToList().Select(f => f())));
+    Console.WriteLine(string.Join(",", B().ToList().Select(f => f())));
+    Console.WriteLine(string.Join(",", C().ToList().Select(f => f())));
+    Console.WriteLine(string.Join(",", D()));
+  }
+}
+"####,
+        r####"0,2,4
+7,8
+0,1,2
+0,2,4
+"####,
+    );
+}
+
+/// The same in `async` methods.
+#[test]
+fn closures_in_async_loops_see_their_own_iteration() {
+    check(
+        "ClosuresAsyncLoops",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+class P {
+  static async Task<string> A() { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { int cp = i; fs.Add(() => cp * 2); await Task.Yield(); } foreach (var x in new[] { 7, 8 }) { fs.Add(() => x); await Task.Yield(); } return string.Join(",", fs.Select(f => f())); }
+  static async Task<string> B() { var fs = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) { int y = x * 10; fs.Add(() => y + x); } await Task.Yield(); return string.Join(",", fs.Select(f => f())); }
+  static async IAsyncEnumerable<Func<int>> C() { for (int i = 0; i < 3; i++) { int cp = i; yield return () => cp; await Task.Yield(); } }
+  static Func<string> D() { return () => { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { int cp = i; fs.Add(() => cp * 3); } return string.Join(",", fs.Select(f => f())); }; }
+  static string E() { string L() { var fs = new List<Func<int>>(); foreach (var x in new[] { 5, 6 }) { fs.Add(() => x); } return string.Join(",", fs.Select(f => f())); } return L(); }
+  static IEnumerable<string> F() { Func<int, Func<int>> mk = n => () => n; var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { fs.Add(mk(i)); yield return "x"; } yield return string.Join(",", fs.Select(f => f())); }
+  static IEnumerable<int> G() { for (int i = 0; i < 3; i++) { int cp = i; var t = Task.Run(() => cp * 10); yield return t.Result; } }
+  static void Main() {
+    Console.WriteLine(A().Result); Console.WriteLine(B().Result);
+    var l = new List<int>(); var e = C().GetAsyncEnumerator(); var fs = new List<Func<int>>(); while (e.MoveNextAsync().AsTask().Result) fs.Add(e.Current); Console.WriteLine(string.Join(",", fs.Select(f => f())));
+    Console.WriteLine(D()()); Console.WriteLine(E()); Console.WriteLine(string.Join("", F())); Console.WriteLine(string.Join(",", G()));
+  }
+}
+"####,
+        r####"0,2,4,7,8
+11,22
+0,1,2
+0,3,6
+5,6
+xxx0,1,2
+0,10,20
+"####,
+    );
+}
+
+/// A loop built from `goto` with a block-local captured variable gave one
+/// variable for every pass.
+#[test]
+fn a_backward_goto_enters_the_scope_again() {
+    check(
+        "ClosuresGotoLoops",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+class P {
+  static void Main() {
+    var a = new List<Func<string>>(); for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) { int s = i * 10 + j; a.Add(() => i + "," + j + "," + s); } Console.WriteLine(string.Join(" ", a.Select(f => f())));
+    var b = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) foreach (var y in new[] { 10, 20 }) { b.Add(() => x + y); } Console.WriteLine(string.Join(",", b.Select(f => f())));
+    var c = new List<Func<int>>(); foreach (var s in new[] { "1", "22" }) { if (int.TryParse(s, out var n)) c.Add(() => n); } Console.WriteLine(string.Join(",", c.Select(f => f())));
+    var d = new List<Func<int>>(); foreach (var o in new object[] { 1, "s", 3 }) { if (o is int n) d.Add(() => n); } Console.WriteLine(string.Join(",", d.Select(f => f())));
+    var e = new List<Func<int>>(); var q = new Queue<object>(new object[] { 1, 2, 3 }); while (q.Count > 0 && q.Dequeue() is int n2) { e.Add(() => n2); } Console.WriteLine(string.Join(",", e.Select(f => f())));
+    var f = new List<Func<int>>(); for (int i = 0; i < 3; i++) { var (p, r) = (i, i * 2); f.Add(() => p + r); } Console.WriteLine(string.Join(",", f.Select(g => g())));
+    var g2 = new List<Func<int>>(); for (int i = 0; i < 3; i++) { try { throw new Exception(i.ToString()); } catch (Exception ex) { g2.Add(() => int.Parse(ex.Message)); } } Console.WriteLine(string.Join(",", g2.Select(g => g())));
+    var h = new List<Func<string>>(); for (int i = 0; i < 2; i++) { using var d2 = new System.IO.StringReader("r" + i); h.Add(() => d2.ToString().Length > 0 ? i + "" : ""); } Console.WriteLine(string.Join(",", h.Select(g => g())));
+    var k = new List<Func<int>>(); for (int i = 0; i < 3; i++) { Func<int> inner = () => i; k.Add(() => inner() + 100); } Console.WriteLine(string.Join(",", k.Select(g => g())));
+    var m = new List<Action>(); var log = new List<string>(); for (int i = 0; i < 2; i++) { int cp = i; m.Add(() => { cp += 10; log.Add("cp" + cp); }); m.Add(() => log.Add("view" + cp)); } foreach (var x in m) x(); foreach (var x in m) x(); Console.WriteLine(string.Join(",", log));
+    var n3 = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) { var local = x; n3.Add(() => { local *= 2; return local; }); } Console.WriteLine(string.Join(",", n3.Select(g => g() + g())));
+    var o2 = new List<Func<int>>(); int shared = 100; foreach (var x in new[] { 1, 2 }) { o2.Add(() => x + shared); shared++; } Console.WriteLine(string.Join(",", o2.Select(g => g())));
+    var p2 = new List<Func<int, int>>(); for (int i = 0; i < 2; i++) { p2.Add(delegate (int z) { return z + i; }); } Console.WriteLine(string.Join(",", p2.Select(g => g(1))));
+    var r2 = new List<Func<int>>(); label: for (int i = 0; i < 3; i++) { int cp = i; r2.Add(() => cp); if (i == 1) goto done; } done: Console.WriteLine(string.Join(",", r2.Select(g => g())));
+    int cnt = 0; var s2 = new List<Func<int>>(); lbl: { int v = cnt; s2.Add(() => v); } if (++cnt < 3) goto lbl; Console.WriteLine(string.Join(",", s2.Select(g => g())));
+  }
+}
+"####,
+        r####"2,2,0 2,2,1 2,2,10 2,2,11
+11,21,12,22
+1,22
+1,3
+1,2,3
+0,3,6
+0,1,2
+2,2
+103,103,103
+cp10,view10,cp11,view11,cp20,view20,cp21,view21
+6,12
+103,104
+3,3
+0,1
+0,1,2
+"####,
+    );
+}
+
+/// `Task.Run` in loops, field initializers and local functions.
+#[test]
+fn closures_in_task_run_field_initializers_and_local_functions() {
+    check(
+        "ClosuresTaskRun",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+class Holder {
+  public List<Func<int>> Fs = new();
+  public Holder() { foreach (var x in new[] { 1, 2, 3 }) Fs.Add(() => x); }
+  public int Prop { get { var l = new List<Func<int>>(); foreach (var x in new[] { 4, 5 }) l.Add(() => x); return l.Sum(f => f() * (l.IndexOf(f) + 1)); } }
+  public static List<Func<int>> S; static Holder() { S = new(); for (int i = 0; i < 3; i++) { int c = i; S.Add(() => c); } }
+  public static Holder operator +(Holder a, Holder b) { var l = new List<Func<int>>(); foreach (var x in new[] { 7, 8 }) l.Add(() => x); a.Fs.AddRange(l); return a; }
+  public Func<List<Func<int>>> Fld = () => { var l = new List<Func<int>>(); foreach (var x in new[] { 9, 10 }) l.Add(() => x); return l; };
+}
+class P {
+  static async Task<string> NestedAsync() { var l = new List<Func<int>>(); foreach (var x in new[] { 1, 2 }) foreach (var y in new[] { 10, 20 }) { l.Add(() => x + y); await Task.Yield(); } return string.Join(",", l.Select(f => f())); }
+  static string Generic<T>(IEnumerable<T> xs) { var l = new List<Func<T>>(); foreach (var x in xs) l.Add(() => x); return string.Join(",", l.Select(f => f())); }
+  static string Gen2<T>(T[] xs) { var l = new List<Func<T>>(); for (int i = 0; i < xs.Length; i++) { var t = xs[i]; l.Add(() => t); } return string.Join(",", l.Select(f => f())); }
+  static void Main() {
+    Console.WriteLine(string.Join(",", new Holder().Fs.Select(f => f()))); Console.WriteLine(new Holder().Prop); Console.WriteLine(string.Join(",", Holder.S.Select(f => f()))); Console.WriteLine(string.Join(",", (new Holder() + new Holder()).Fs.Select(f => f()))); Console.WriteLine(string.Join(",", new Holder().Fld().Select(f => f())));
+    Console.WriteLine(NestedAsync().Result); Console.WriteLine(Generic(new[] { 1, 2 }) + Gen2(new[] { "a", "b" }));
+    var tasks = new List<Task<int>>(); foreach (var x in new[] { 1, 2, 3 }) foreach (var y in new[] { 10, 20 }) tasks.Add(Task.Run(() => x * y)); Console.WriteLine(string.Join(",", tasks.Select(t => t.Result)));
+    var lq = (from x in new[] { 1, 2 } from y in new[] { 3, 4 } select (Func<int>)(() => x * y)).ToList(); Console.WriteLine(string.Join(",", lq.Select(f => f())));
+  }
+}
+"####,
+        r####"1,2,3
+14
+0,1,2
+1,2,3,7,8
+9,10
+11,21,12,22
+1,2a,b
+10,20,20,40,30,60
+3,4,6,8
+"####,
+    );
+}
+
+/// Each call of a recursive lambda or local function has variables of
+/// its own.
+#[test]
+fn recursion_makes_a_class_per_call() {
+    check(
+        "ClosuresRecursion",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+class P {
+  static int Rec(int n, List<Func<int>> acc) { int local = n * 10; acc.Add(() => local + n); return n > 0 ? Rec(n - 1, acc) + local : local; }
+  static void Main() {
+    Func<int, int> f = null; var acc = new List<Func<int>>(); f = n => { int loc = n; acc.Add(() => loc * 100 + n); return n > 0 ? f(n - 1) + loc : loc; }; Console.WriteLine(f(3)); Console.WriteLine(string.Join(",", acc.Select(g => g())));
+    var acc2 = new List<Func<int>>(); Rec(3, acc2); Console.WriteLine(string.Join(",", acc2.Select(g => g())));
+    var acc3 = new List<Func<int>>(); int Loc(int n) { int loc = n; acc3.Add(() => loc + 1000 * n); return n > 0 ? Loc(n - 1) + loc : loc; } Loc(2); Console.WriteLine(string.Join(",", acc3.Select(g => g())));
+    Func<int, Func<int, Func<int>>> curried = a => b => () => a * 10 + b; var cs = new List<Func<int>>(); foreach (var a in new[] { 1, 2 }) { var fb = curried(a); foreach (var b in new[] { 3, 4 }) cs.Add(fb(b)); } Console.WriteLine(string.Join(",", cs.Select(g => g())));
+    var acc4 = new List<Func<int>>(); Action<int> outer = n => { for (int i = 0; i < n; i++) { acc4.Add(() => i * 10 + n); } }; outer(2); outer(3); Console.WriteLine(string.Join(",", acc4.Select(g => g())));
+    var acc5 = new List<Func<int>>(); void Outer2(int n) { foreach (var i in Enumerable.Range(0, n)) { acc5.Add(() => i * 10 + n); } } Outer2(2); Outer2(3); Console.WriteLine(string.Join(",", acc5.Select(g => g())));
+  }
+}
+"####,
+        r####"6
+303,202,101,0
+33,22,11,0
+2002,1001,0
+13,14,23,24
+22,22,33,33,33
+2,12,3,13,23
+"####,
+    );
+}
+
+/// Closures that read variables of several scopes at once.
+#[test]
+fn closures_over_the_variables_of_several_scopes() {
+    check(
+        "ClosuresSeveralScopes",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+class P {
+  static void Main() {
+    var l = new List<Func<int>>();
+    for (int i = 0; i < 3; i++) { int x = i * 10; l.Add(() => x++); }
+    Console.WriteLine(string.Join(",", l.Select(f => f() + f())));
+    var l2 = new List<Action>(); int total = 0;
+    foreach (var s in new[] { "a", "bb", "ccc" }) { int n = s.Length; l2.Add(() => total += n); } foreach (var a in l2) a(); Console.WriteLine(total);
+    var l3 = new List<Func<int>>(); int j = 0; while (j < 3) { int k = j; l3.Add(() => k * k); j++; } Console.WriteLine(string.Join(",", l3.Select(f => f())));
+    var l4 = new List<Func<int>>(); for (int i = 0; i < 3; i++) { l4.Add(() => i); } Console.WriteLine(string.Join(",", l4.Select(f => f())));
+    var l5 = new List<Func<int>>(); for (int i = 0; i < 3; i++) { int q = i; if (i % 2 == 0) { int r = q + 100; l5.Add(() => r + q); } else { l5.Add(() => q); } } Console.WriteLine(string.Join(",", l5.Select(f => f())));
+    var l6 = new List<Func<int>>(); { int shared = 0; for (int i = 0; i < 3; i++) { l6.Add(() => ++shared); } } Console.WriteLine(string.Join(",", l6.Select(f => f())));
+    Func<int> counter = MakeCounter(); Console.WriteLine(counter() + counter() + counter()); var c2 = MakeCounter(); Console.WriteLine(c2());
+    var l7 = new List<Func<int>>(); for (int i = 0; i < 3; i++) { var captured = new[] { i }; l7.Add(() => captured[0]++); } Console.WriteLine(string.Join(",", l7.Select(f => f() + f())));
+    var l8 = new List<Func<string>>(); foreach (var (a, b) in new[] { (1, "x"), (2, "y") }) { l8.Add(() => a + b); } Console.WriteLine(string.Join(",", l8.Select(f => f())));
+    var l9 = new List<Func<int>>(); foreach (var x in new[] { 1, 2, 3 }) { l9.Add(() => x); x2 = x; } Console.WriteLine(string.Join(",", l9.Select(f => f())));
+    var l10 = new List<Func<int>>(); int outerv = 0; for (int i = 0; i < 2; i++) { int inner = 0; l10.Add(() => { inner++; outerv++; return inner * 100 + outerv; }); } Console.WriteLine(string.Join(",", l10.Select(f => f())) + "," + string.Join(",", l10.Select(f => f())));
+    var l11 = new List<Func<int>>(); for (int i = 0; i < 3; i++) { switch (i) { case 0: int a = 5; l11.Add(() => a++); break; case 1: int b = 6; l11.Add(() => b++); break; default: l11.Add(() => 0); break; } } Console.WriteLine(string.Join(",", l11.Select(f => f() + f())));
+    var l12 = new List<Func<int>>(); for (int i = 0; i < 3; i++) { try { int t = i; l12.Add(() => t); } finally { } } Console.WriteLine(string.Join(",", l12.Select(f => f())));
+    var l13 = new List<Func<int>>(); int idx = 0; do { int cp = idx; l13.Add(() => cp); } while (++idx < 3); Console.WriteLine(string.Join(",", l13.Select(f => f())));
+    var l14 = new List<Func<int>>(); for (int i = 0; i < 3; i++) { int v = i; Func<int> g = () => v; l14.Add(() => g() + v); v += 10; } Console.WriteLine(string.Join(",", l14.Select(f => f())));
+    var l15 = Enumerable.Range(0, 3).Select(i => { int sq = i * i; return (Func<int>)(() => sq + i); }).ToList(); Console.WriteLine(string.Join(",", l15.Select(f => f())));
+    var l16 = new List<Task<int>>(); for (int i = 0; i < 3; i++) { int ii = i; l16.Add(Task.Run(async () => { await Task.Yield(); return ii; })); } Console.WriteLine(string.Join(",", l16.Select(t => t.Result)));
+    Console.WriteLine(string.Join(",", Gen()));
+  }
+  static int x2;
+  static Func<int> MakeCounter() { int c = 0; return () => ++c; }
+  static IEnumerable<int> Gen() { var fs = new List<Func<int>>(); for (int i = 0; i < 3; i++) { int cp = i; fs.Add(() => cp * 2); yield return fs.Last()(); } foreach (var x in new[] { 7, 8 }) { fs.Add(() => x); } foreach (var f in fs) yield return f(); }
+}
+"####,
+        r####"1,21,41
+6
+0,1,4
+3,3,3
+100,1,104
+1,2,3
+6
+1
+1,3,5
+1x,2y
+1,2,3
+101,102,203,204
+11,13,0
+0,1,2
+0,1,2
+20,22,24
+0,2,6
+0,1,2
+0,2,4,0,2,4,7,8
+"####,
+    );
+}
+
+/// Closures in queries over several range variables.
+#[test]
+fn closures_in_queries_over_several_range_variables() {
+    check(
+        "ClosuresQueryRanges",
+        r####"
+using System;
+using System.Collections.Generic;
+using System.Linq;
+class P {
+  static void Main() {
+    var a = new[] { 1, 2 }.SelectMany(x => new[] { 3, 4 }, (x, y) => (Func<int>)(() => x * y)).ToList(); Console.WriteLine(string.Join(",", a.Select(f => f())));
+    var b = new[] { 1, 2 }.Select(x => (Func<int>)(() => x)).ToList(); Console.WriteLine(string.Join(",", b.Select(f => f())));
+    var c = new[] { 1, 2 }.SelectMany(x => new[] { 3, 4 }.Select(y => (Func<int>)(() => x * y))).ToList(); Console.WriteLine(string.Join(",", c.Select(f => f())));
+    var d = (from x in new[] { 1, 2 } select (Func<int>)(() => x)).ToList(); Console.WriteLine(string.Join(",", d.Select(f => f())));
+    var e = (from x in new[] { 1, 2 } from y in new[] { 3, 4 } select (Func<int>)(() => x * y)).ToList(); Console.WriteLine(string.Join(",", e.Select(f => f())));
+    var f = (from x in new[] { 1, 2 } let z = x * 10 select (Func<int>)(() => z + x)).ToList(); Console.WriteLine(string.Join(",", f.Select(g => g())));
+    Func<int, int, Func<int>> mk = (p, q) => () => p * q; var l = new[] { mk(1, 2), mk(3, 4) }; Console.WriteLine(string.Join(",", l.Select(g => g())));
+    Action<int, int> reg = null; var regs = new List<Func<int>>(); reg = (p, q) => regs.Add(() => p + q); reg(1, 2); reg(3, 4); Console.WriteLine(string.Join(",", regs.Select(g => g())));
+  }
+}
+"####,
+        r####"3,4,6,8
+1,2
+3,4,6,8
+1,2
+3,4,6,8
+11,22
+2,12
+3,7
+"####,
+    );
+}

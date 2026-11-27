@@ -21,6 +21,7 @@ impl BodyBinder<'_> {
         self.push_scope();
         let statements = self.bind_statement_list(&node.children().collect::<Vec<_>>());
         self.pop_scope();
+        self.body.blocks.insert(node.span());
         BoundStatement::new(BoundStatementKind::Block(statements), node.span())
     }
 
