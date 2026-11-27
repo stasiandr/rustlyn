@@ -78,8 +78,28 @@ implements the behaviour.
   that tie still resolves to the first candidate. CS0122 for a nested type is reported
   where it is named through its owner (`Outer.Hidden`); by its bare name in a type
   derived from the owner it is CS0246, and inside `nameof` it is let through. CS0031 (a constant that does not fit) is
-  reported for a declaration or an assignment, not for an element of an array
-  initializer.
+  reported for a declaration, an assignment, an element of an array initializer and the
+  right-hand side of a compound assignment.
+* A compound assignment (`x op= y`) is judged as Roslyn judges `x = x op y` (§12.21.4)
+  where both sides are numbers, `char`, `nint`, `nuint`, `bool`, `string`, `object`, an
+  enum or a `T?` of one of these: CS0019, CS0034, CS0266, CS0029 and CS0031 come out as
+  Roslyn gives them. Anything else (a user-defined operator or conversion, a delegate or
+  event, a pointer, `dynamic`, a type parameter, an operator written as `operator +=`) is
+  let through, and so are `x op= null` (CS0037, CS0019 or CS0029), `x op= default`
+  (CS8310), a target that is not a variable (CS1612 and CS1510 are not said either), and
+  any compound assignment where an extension block (C# 14) declares an operator of that
+  name.
+* A `decimal` constant is folded as `System.Decimal` works it out, except for one corner
+  of `%` that .NET sometimes refuses with an overflow and whose rule is not known: that
+  expression is left unfolded, so a `const` made of it is not a compile-time constant to
+  the checks that come after, and nothing is said about it.
+* CS0133 on a `const` is said of a call, a property, an element, a `string` joined to a
+  value that is not a `string` (`"a" + 1`), and an interpolated string with an alignment or
+  a format; not of a parameter, a local, a field that is not `const`, or an interpolated
+  string with a hole that is not a `string`.
+* CS9135 (a pattern that holds no constant) is said of a call, a property, an element, a
+  parameter or a `readonly` field in an `is` pattern, a relational pattern and a switch
+  expression arm; not in the label of a `switch` statement.
 * Definite assignment follows `goto`, through a `finally` too; a body the binder did not
   fully understand gets no CS0165 at all. An `is` pattern is known to take every value
   where it is `var`, `_`, a pattern and its `not`, `null` together with a type test the

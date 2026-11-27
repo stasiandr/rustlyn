@@ -6794,3 +6794,68 @@ fn twelve_thousand_link_chains_compile_in_linear_time() {
         );
     }
 }
+
+/// `x op= y` stores `(T)(x op y)` where the language allows the cast to be
+/// left out: a `byte` wraps, a `checked` one throws, an enum is computed in
+/// its underlying type, and a nullable stays null. The output is Roslyn's.
+#[test]
+fn compound_assignment_narrows_the_result() {
+    check(
+        "CompoundNarrowing",
+        r#"using System;
+enum E { A, B, C }
+enum F : byte { A = 1, B = 2, C = 250 }
+class P { public byte B { get; set; } public short this[int i] { get => _s; set { _s = value; } } short _s; public byte Fb; }
+class T {
+    static byte sb = 250;
+    static void Main() {
+        byte b = 250; b += 10; Console.WriteLine(b);
+        b = 5; b -= 10; Console.WriteLine(b);
+        b = 200; b *= 2; Console.WriteLine(b);
+        b = 100; b <<= 2; Console.WriteLine(b);
+        b = 255; b >>= 3; Console.WriteLine(b);
+        sbyte s = 127; s += 1; Console.WriteLine(s);
+        short sh = 32767; sh += 1; sh += (short)2; Console.WriteLine(sh);
+        sh = 100; sh *= 1000; Console.WriteLine(sh);
+        char c = 'a'; c += (char)1; c += (char)2; Console.WriteLine(c);
+        c = (char)65535; c += (char)1; Console.WriteLine((int)c);
+        ushort us = 65535; us += 1; Console.WriteLine(us);
+        us = 3; us -= 4; Console.WriteLine(us);
+        uint u = 0; u -= 1; Console.WriteLine(u);
+        uint u2 = 4000000000; u2 += 500000000; Console.WriteLine(u2);
+        ulong ul = 18446744073709551615UL; ul += 2; Console.WriteLine(ul);
+        int i = 2147483647; i += 1; Console.WriteLine(i);
+        i = 7; i /= 2; i %= 2; i <<= 5; i >>= 1; i |= 1; i &= 0xFF; i ^= 5; Console.WriteLine(i);
+        long l = 1; l += i; l <<= 40; Console.WriteLine(l);
+        float f = 1; f += 1; f += i; Console.WriteLine(f);
+        double d = 1; d += f; d /= 3; Console.WriteLine(d);
+        nint ni = 5; ni += 3; ni <<= 2; Console.WriteLine(ni);
+        nuint nu = 5; nu -= 6; Console.WriteLine(nu == 18446744073709551615);
+        string str = "x"; str += 1; str += 'c'; str += 1.5; str += E.B; str += true; str += null; Console.WriteLine(str);
+        E e = E.A; e += 1; e |= E.C; e -= 1; Console.WriteLine(e);
+        F ff = F.C; ff += 10; Console.WriteLine((int)ff);
+        ff = F.A; ff -= 3; Console.WriteLine((int)ff);
+        P p = new P(); p.B = 250; p.B += 10; Console.WriteLine(p.B);
+        p[0] = 32767; p[0] += 1; Console.WriteLine(p[0]);
+        p.Fb = 250; p.Fb += 10; Console.WriteLine(p.Fb);
+        sb += 10; Console.WriteLine(sb);
+        byte[] arr = { 250, 1 }; arr[0] += 10; arr[1] <<= 9; Console.WriteLine(arr[0] + " " + arr[1]);
+        int idx = 0; arr[idx++] += 7; Console.WriteLine(arr[0] + " " + idx);
+        byte? nb = 250; nb += 10; Console.WriteLine(nb);
+        byte? nn = null; nn += 10; Console.WriteLine(nn.HasValue);
+        int? ni2 = 2147483647; ni2 += 1; Console.WriteLine(ni2);
+        try { checked { byte cb = 250; cb += 10; Console.WriteLine(cb); } } catch (Exception) { Console.WriteLine("overflow"); }
+        try { byte cb = 250; checked { cb += 10; } Console.WriteLine(cb); } catch (Exception) { Console.WriteLine("overflow2"); }
+        try { checked { int ci = 2147483647; ci += 1; Console.WriteLine(ci); } } catch (Exception) { Console.WriteLine("overflow3"); }
+        try { checked { char cc = 'a'; cc -= (char)100; Console.WriteLine((int)cc); } } catch (Exception) { Console.WriteLine("overflow4"); }
+        try { checked { uint cu = 0; cu -= 1; Console.WriteLine(cu); } } catch (Exception) { Console.WriteLine("overflow5"); }
+        try { checked { short cs = 1; cs <<= 20; Console.WriteLine(cs); } } catch (Exception) { Console.WriteLine("overflow6"); }
+        try { checked { F cf = F.C; cf += 10; Console.WriteLine(cf); } } catch (Exception) { Console.WriteLine("overflow7"); }
+        try { byte cb = 250; unchecked { cb += 10; } Console.WriteLine(cb); } catch (Exception) { Console.WriteLine("overflow8"); }
+        short sx = 5; sx += b; Console.WriteLine(sx);
+    }
+}
+"#,
+        "4\n251\n144\n144\n31\n-128\n-32766\n-31072\nd\n0\n0\n65535\n4294967295\n205032704\n1\n-2147483648\n20\n23089744183296\n22\n7.666666666666667\n32\nTrue\nx1c1.5BTrue\nC\n4\n254\n4\n-32768\n4\n4\n4 0\n11 1\n4\nFalse\n-2147483648\noverflow\noverflow2\noverflow3\noverflow4\noverflow5\noverflow6\noverflow7\n4\n36\n",
+    );
+}

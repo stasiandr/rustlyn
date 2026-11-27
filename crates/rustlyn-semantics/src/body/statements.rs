@@ -864,14 +864,7 @@ impl BodyBinder<'_> {
                 Some(SpecialType::Decimal) => Some("M"),
                 _ => None,
             };
-            let mut literal = original.clone();
-            while literal.kind() == SyntaxKind::ParenthesizedExpression
-                && let Some(inner) = literal
-                    .children()
-                    .find(|child| child.kind().is_expression())
-            {
-                literal = inner;
-            }
+            let literal = inside_wrappers(original);
             if self.binder.special_of(from) == Some(SpecialType::Double)
                 && literal.kind() == SyntaxKind::NumericLiteralExpression
                 && let Some(suffix) = suffix

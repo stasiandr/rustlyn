@@ -1869,6 +1869,7 @@ impl BodyBinder<'_> {
 
         // `new[] { 1, 2 }` has no type of its own; the elements say what it
         // is: the best common type of them (§12.6.3.16).
+        let declared_element = matches!(ty, Type::Array { .. });
         let element_type = match &ty {
             Type::Array { element, .. } => (**element).clone(),
             _ => self.best_common_type(&elements).unwrap_or_else(|| {
@@ -1930,6 +1931,25 @@ impl BodyBinder<'_> {
                 .collect();
         }
 
+        // Each value is an assignment to an element of the type the array
+        // is written with; `new[] { ... }` takes its type from the values.
+        if declared_element {
+            for (element, node) in elements.iter().zip(&written) {
+                // A type or a namespace named where a value is wanted has
+                // been said so, and a `stackalloc` takes the type of what
+                // it is put in.
+                if node.kind() != SyntaxKind::ArrayInitializerExpression
+                    && !matches!(
+                        element.kind,
+                        BoundExpressionKind::TypeExpression(_)
+                            | BoundExpressionKind::NamespaceExpression(_)
+                            | BoundExpressionKind::StackAlloc { .. }
+                    )
+                {
+                    self.check_assignable(node, element, &element_type);
+                }
+            }
+        }
         let elements = elements
             .into_iter()
             .map(|element| self.convert(element, &element_type))

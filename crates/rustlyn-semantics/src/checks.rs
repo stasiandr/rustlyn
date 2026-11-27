@@ -211,11 +211,10 @@ impl Checker<'_> {
         self.found.extend(sink);
     }
 
-    /// CS0133: a `const` field set from a call or a property, which is
-    /// never a constant: `const nint Max = nint.MaxValue;`. Only a value
-    /// written as a member access or a call, perhaps cast or in parentheses,
-    /// is looked at, and only these two are said not to be constants; what
-    /// else may not be is left to whatever else says so.
+    /// CS0133: a `const` field set from what is certainly no constant: a
+    /// call, a property (`const nint Max = nint.MaxValue;`), an element, or a
+    /// `string` joined to a value that is not one. What else may not be is
+    /// left to whatever else says so.
     fn constant_initializer(&self, field: SymbolId, sink: &mut Diagnostics) {
         let compilation = self.compilation;
         let Some((tree, span)) = compilation.declaration_nodes(field).first().copied() else {
@@ -234,24 +233,36 @@ impl Checker<'_> {
         else {
             return;
         };
-        let mut inner = expression.clone();
-        while matches!(
-            inner.kind(),
-            SyntaxKind::ParenthesizedExpression | SyntaxKind::CastExpression
-        ) && let Some(next) = inner
-            .children()
-            .filter(|child| child.kind().is_expression())
-            .last()
-        {
-            inner = next;
-        }
-        if !matches!(
-            inner.kind(),
-            SyntaxKind::SimpleMemberAccessExpression
-                | SyntaxKind::InvocationExpression
-                | SyntaxKind::IdentifierName
-        ) {
-            return;
+        // An enum member is judged only where it is written as a call or a
+        // member access: binding what else it may hold (`B + F.B`) takes up
+        // the circularity that is reported elsewhere.
+        let in_enum = compilation
+            .symbols()
+            .get(field)
+            .container
+            .is_some_and(|container| {
+                compilation.symbols().get(container).type_kind() == Some(TypeKind::Enum)
+            });
+        if in_enum {
+            let mut inner = expression.clone();
+            while matches!(
+                inner.kind(),
+                SyntaxKind::ParenthesizedExpression | SyntaxKind::CastExpression
+            ) && let Some(next) = inner
+                .children()
+                .filter(|child| child.kind().is_expression())
+                .last()
+            {
+                inner = next;
+            }
+            if !matches!(
+                inner.kind(),
+                SyntaxKind::SimpleMemberAccessExpression
+                    | SyntaxKind::InvocationExpression
+                    | SyntaxKind::IdentifierName
+            ) {
+                return;
+            }
         }
         let body = crate::body::BodyBinder::bind_member(&self.binder, tree, &node);
         let Some(mut value) = body
@@ -271,14 +282,15 @@ impl Checker<'_> {
             value = *operand;
         }
         let symbols = compilation.symbols();
-        let not_constant = match &value.kind {
-            BoundExpressionKind::Property { .. } => true,
-            BoundExpressionKind::Call { method, .. } => {
-                !symbols.get(*method).name.starts_with("op_")
-            }
-            _ => false,
-        };
-        if not_constant {
+        // An interpolated string is a constant only of holes that are
+        // constant strings, written without an alignment or a format.
+        let formatted = expression.descendants().any(|part| {
+            matches!(
+                part.kind(),
+                SyntaxKind::InterpolationAlignmentClause | SyntaxKind::InterpolationFormatClause
+            )
+        });
+        if formatted || crate::constant::certainly_not_constant(&self.binder, &value) {
             let name = symbols.get(field).name.clone();
             sink.push((
                 tree,
@@ -2027,7 +2039,7 @@ fn is_null(expression: &BoundExpression) -> bool {
 
 /// Whether a bound expression has a part that did not bind, which has been
 /// complained about already.
-fn has_error_part(expression: &BoundExpression) -> bool {
+pub(crate) fn has_error_part(expression: &BoundExpression) -> bool {
     let mut found = false;
     crate::definite::each_child_of(expression, &mut |child| {
         found |= has_error_part(child);

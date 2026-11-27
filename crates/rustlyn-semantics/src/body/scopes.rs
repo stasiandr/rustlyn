@@ -71,6 +71,21 @@ impl BodyBinder<'_> {
                     if let Some(constant) = self.binder.folded(value) {
                         self.constant_locals.insert(*local, constant);
                     }
+                    // `const int n = text.Length;` is no constant: said where
+                    // nothing else is wrong with the value.
+                    if !value.ty.is_error()
+                        && !crate::checks::has_error_part(value)
+                        && !self.body.diagnostics.iter().any(|(tree, diagnostic)| {
+                            *tree == self.tree
+                                && diagnostic.is_error()
+                                && value.span.start() <= diagnostic.span().start()
+                                && diagnostic.span().end() <= value.span.end()
+                        })
+                        && crate::constant::certainly_not_constant(self.binder, value)
+                    {
+                        let name = self.body.locals[local.0 as usize].name.clone();
+                        self.report(ErrorCode::ErrNotConstantExpression, value.span, &[&name]);
+                    }
                 }
                 BoundStatementKind::Block(inner) => self.note_constant_locals(inner),
                 _ => {}

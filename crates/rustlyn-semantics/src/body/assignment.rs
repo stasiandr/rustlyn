@@ -4,10 +4,12 @@ use rustlyn_diagnostics::ErrorCode;
 use rustlyn_syntax::{SyntaxKind, SyntaxNode};
 use rustlyn_text::TextSpan;
 
+use super::operators::{operator_method_name, operator_token_text};
 use super::{BodyBinder, compound_operator, identifier_text, typeless};
 use crate::binder::Diagnostics;
-use crate::bound::{BoundExpression, BoundExpressionKind, ConversionKind};
+use crate::bound::{BoundExpression, BoundExpressionKind, ConstantValue, ConversionKind};
 use crate::conversions::BinaryOperator;
+use crate::corlib::SpecialType;
 use crate::symbol::{MethodKind, Modifiers, SymbolId, SymbolKind, TypeKind};
 use crate::types::Type;
 
@@ -465,6 +467,361 @@ impl BodyBinder<'_> {
         Some((prelude, place))
     }
 
+    /// Whether the target of an assignment is a place that can be assigned:
+    /// a variable, an element, or a member of one or of a reference. What
+    /// is not (a member of a value that is only a value, `default(T).P`) is
+    /// said to be so before anything about the operator is.
+    fn is_variable_place(&self, target: &BoundExpression) -> bool {
+        let symbols = self.binder.compilation().symbols();
+        let held = |receiver: &Option<Box<BoundExpression>>| {
+            receiver.as_deref().is_none_or(|receiver| {
+                self.is_variable_place(receiver) || receiver.ty.is_reference_type(symbols)
+            })
+        };
+        match &target.kind {
+            BoundExpressionKind::Local(_)
+            | BoundExpressionKind::Parameter(_)
+            | BoundExpressionKind::This
+            | BoundExpressionKind::ArrayAccess { .. } => true,
+            BoundExpressionKind::Field { receiver, .. }
+            | BoundExpressionKind::Property { receiver, .. } => held(receiver),
+            BoundExpressionKind::IndexerAccess { receiver, .. } => {
+                self.is_variable_place(receiver) || receiver.ty.is_reference_type(symbols)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a type is `decimal`, whose operators are metadata methods that the
+    /// language nevertheless treats as predefined.
+    /// Whether a type is one of the numbers, `char` and the native integers.
+    pub(super) fn is_plain_number(&self, ty: &Type) -> bool {
+        self.compound_operand_kind(ty) == Some(CompoundOperand::Number)
+    }
+
+    fn is_decimal(&self, ty: &Type) -> bool {
+        self.binder.special_of(ty) == Some(SpecialType::Decimal)
+    }
+
+    /// Which kind of predefined type a compound assignment is certain about:
+    /// the numbers, `char`, `nint` and `nuint`, `bool`, `string`, `object` and
+    /// enums. Anything else (a type with operators of its own, a nullable, a
+    /// pointer, a delegate) keeps every operator it may find.
+    fn compound_operand_kind(&self, ty: &Type) -> Option<CompoundOperand> {
+        if let Some(special) = self.binder.special_of(ty) {
+            return match special {
+                SpecialType::Boolean => Some(CompoundOperand::Boolean),
+                SpecialType::String => Some(CompoundOperand::Text),
+                SpecialType::Object => Some(CompoundOperand::Object),
+                special if special.is_numeric() => Some(CompoundOperand::Number),
+                _ => None,
+            };
+        }
+        if self.binder.native_int(ty).is_some() {
+            return Some(CompoundOperand::Number);
+        }
+        self.binder
+            .enum_underlying(ty)
+            .map(|_| CompoundOperand::Enumeration)
+    }
+
+    /// The predefined operator `x op y` takes on two operands of the plain
+    /// predefined types (§12.4.5): the candidates both operands reach, and
+    /// the one of them every other candidate is worse than. `None` where an
+    /// operand is something this does not know the operators of.
+    pub(super) fn predefined_operation(
+        &mut self,
+        operator: BinaryOperator,
+        left: &BoundExpression,
+        right: &BoundExpression,
+        span: TextSpan,
+    ) -> Option<PredefinedOperation> {
+        let left_kind = self.compound_operand_kind(&left.ty)?;
+        let right_kind = self.compound_operand_kind(&right.ty)?;
+        let shift = matches!(
+            operator,
+            BinaryOperator::LeftShift
+                | BinaryOperator::RightShift
+                | BinaryOperator::UnsignedRightShift
+        );
+        if left_kind == CompoundOperand::Text || right_kind == CompoundOperand::Text {
+            return Some(if operator == BinaryOperator::Add {
+                PredefinedOperation::Result(self.special(SpecialType::String))
+            } else {
+                PredefinedOperation::Inapplicable
+            });
+        }
+        if left_kind == CompoundOperand::Object || right_kind == CompoundOperand::Object {
+            return Some(PredefinedOperation::Inapplicable);
+        }
+        if left_kind == CompoundOperand::Boolean || right_kind == CompoundOperand::Boolean {
+            return Some(
+                if left_kind == right_kind
+                    && matches!(
+                        operator,
+                        BinaryOperator::BitwiseAnd
+                            | BinaryOperator::BitwiseOr
+                            | BinaryOperator::ExclusiveOr
+                    )
+                {
+                    PredefinedOperation::Result(self.special(SpecialType::Boolean))
+                } else {
+                    PredefinedOperation::Inapplicable
+                },
+            );
+        }
+        if left_kind == CompoundOperand::Enumeration || right_kind == CompoundOperand::Enumeration {
+            // An enum has the `+`, `-` and the bit operators only, which
+            // the binary operator already works out.
+            return match operator {
+                BinaryOperator::Add
+                | BinaryOperator::Subtract
+                | BinaryOperator::BitwiseAnd
+                | BinaryOperator::BitwiseOr
+                | BinaryOperator::ExclusiveOr => {
+                    let floor = self.body.diagnostics.len();
+                    let combined = self.bind_binary_on(operator, left.clone(), right.clone(), span);
+                    if self.body.diagnostics.len() != floor {
+                        Some(PredefinedOperation::Reported)
+                    } else if combined.ty.is_error() {
+                        None
+                    } else {
+                        Some(PredefinedOperation::Result(combined.ty))
+                    }
+                }
+                _ => Some(PredefinedOperation::Inapplicable),
+            };
+        }
+        let int = self.special(SpecialType::Int32);
+        let native = |this: &Self, name: &str| {
+            this.binder
+                .compilation()
+                .type_by_metadata_name(name)
+                .map(Type::named)
+        };
+        let mut candidates = vec![
+            int.clone(),
+            self.special(SpecialType::UInt32),
+            self.special(SpecialType::Int64),
+            self.special(SpecialType::UInt64),
+            native(self, "System.IntPtr")?,
+            native(self, "System.UIntPtr")?,
+        ];
+        let arithmetic = matches!(
+            operator,
+            BinaryOperator::Add
+                | BinaryOperator::Subtract
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide
+                | BinaryOperator::Modulo
+        );
+        if arithmetic {
+            candidates.push(self.special(SpecialType::Single));
+            candidates.push(self.special(SpecialType::Double));
+            candidates.push(self.special(SpecialType::Decimal));
+        }
+        let reaches = |this: &Self, operand: &BoundExpression, to: &Type| {
+            this.binder.converts_implicitly(&operand.ty, to) || this.constant_fits(operand, to)
+        };
+        // The count of a shift is an `int` whatever the candidate.
+        if shift && !reaches(self, right, &int) {
+            return Some(PredefinedOperation::Inapplicable);
+        }
+        let applicable: Vec<Type> = candidates
+            .into_iter()
+            .filter(|candidate| {
+                reaches(self, left, candidate) && (shift || reaches(self, right, candidate))
+            })
+            .collect();
+        let signed = |this: &Self, ty: &Type| {
+            this.binder.native_int(ty) == Some(false)
+                || matches!(
+                    this.binder.special_of(ty),
+                    Some(
+                        SpecialType::SByte
+                            | SpecialType::Int16
+                            | SpecialType::Int32
+                            | SpecialType::Int64
+                    )
+                )
+        };
+        let unsigned = |this: &Self, ty: &Type| {
+            this.binder.native_int(ty) == Some(true)
+                || matches!(
+                    this.binder.special_of(ty),
+                    Some(
+                        SpecialType::Byte
+                            | SpecialType::UInt16
+                            | SpecialType::UInt32
+                            | SpecialType::UInt64
+                    )
+                )
+        };
+        let better = |this: &Self, one: &Type, other: &Type| {
+            (this.binder.converts_implicitly(one, other)
+                && !this.binder.converts_implicitly(other, one))
+                || (signed(this, one) && unsigned(this, other))
+        };
+        let best = applicable.iter().find(|candidate| {
+            applicable
+                .iter()
+                .all(|other| other == *candidate || better(self, candidate, other))
+        });
+        Some(match (best, applicable.is_empty()) {
+            (Some(best), _) => PredefinedOperation::Result(best.clone()),
+            (None, true) => PredefinedOperation::Inapplicable,
+            (None, false) => PredefinedOperation::Ambiguous,
+        })
+    }
+
+    /// `x op= y` on the plain predefined types: CS0019 and CS0034 where no
+    /// operator takes the operands, and CS0266 or CS0029 where the result
+    /// does not fit `x`. It has to convert implicitly, or, for a predefined
+    /// operator, explicitly with `y` converting implicitly to the type of
+    /// `x` (or a shift) (§12.21.4). Where an operand is not one of the
+    /// plain predefined types the rule is not applied. Whether it reported.
+    fn check_compound_result(
+        &mut self,
+        operator: BinaryOperator,
+        target: &BoundExpression,
+        value: &BoundExpression,
+        span: TextSpan,
+    ) -> bool {
+        let stored = &target.ty;
+        // An extension block (C# 14) may give any type an operator, an
+        // `operator +=` too, and where one is in scope nothing is certain.
+        if let Some(name) = operator_method_name(operator)
+            && (!self
+                .binder
+                .extension_members_in_scope(&self.context, name)
+                .is_empty()
+                || !self
+                    .binder
+                    .extension_members_in_scope(&self.context, &format!("{name}Assignment"))
+                    .is_empty())
+        {
+            return false;
+        }
+        if !self.is_variable_place(target)
+            || typeless(value)
+            || matches!(value.ty, Type::Null | Type::Error | Type::Dynamic)
+            || stored.is_error()
+            || value.ty.is_error()
+            || (!self.is_decimal(stored)
+                && !self.is_decimal(&value.ty)
+                && self
+                    .user_defined_operator(operator, target, value, span)
+                    .is_some())
+        {
+            return false;
+        }
+        // A nullable operand lifts the operator (§12.4.8): the plain
+        // types are what the rules are asked about, and the result is a
+        // nullable again.
+        let bare = |this: &Self, operand: &BoundExpression| {
+            let ty = this
+                .binder
+                .nullable_underlying(&operand.ty)
+                .unwrap_or_else(|| operand.ty.clone());
+            BoundExpression::new(operand.kind.clone(), ty, operand.span)
+        };
+        let (target_bare, value_bare) = (bare(self, target), bare(self, value));
+        let lifted_left = target_bare.ty != *stored;
+        let lifted_right = value_bare.ty != value.ty;
+        let Some(operation) = self.predefined_operation(operator, &target_bare, &value_bare, span)
+        else {
+            return false;
+        };
+        let text = format!("{}=", operator_token_text(operator));
+        let result = match operation {
+            PredefinedOperation::Result(result) => result,
+            PredefinedOperation::Reported => return true,
+            PredefinedOperation::Inapplicable | PredefinedOperation::Ambiguous => {
+                let code = if matches!(operation, PredefinedOperation::Ambiguous) {
+                    ErrorCode::ErrAmbigBinaryOps
+                } else {
+                    ErrorCode::ErrBadBinaryOps
+                };
+                let (shown_left, shown_right) = (self.display(stored), self.display(&value.ty));
+                self.report(code, span, &[&text, &shown_left, &shown_right]);
+                return true;
+            }
+        };
+        // `string + int?` is a concatenation, which nothing lifts.
+        let lifted = (lifted_left || lifted_right)
+            && self.binder.special_of(&result) != Some(SpecialType::String);
+        let stored_bare = &target_bare.ty;
+        let fits = |this: &Self, result: &Type| {
+            this.binder.converts_implicitly(result, stored_bare) && (lifted_left || !lifted)
+        };
+        if fits(self, &result) {
+            return false;
+        }
+        let number_like = |kind: Option<CompoundOperand>| {
+            matches!(
+                kind,
+                Some(CompoundOperand::Number | CompoundOperand::Enumeration)
+            )
+        };
+        let shift = matches!(
+            operator,
+            BinaryOperator::LeftShift
+                | BinaryOperator::RightShift
+                | BinaryOperator::UnsignedRightShift
+        );
+        let explicit = number_like(self.compound_operand_kind(stored_bare))
+            && number_like(self.compound_operand_kind(&result));
+        let shown_result = if lifted {
+            let wrapped = self.nullable_of(result.clone());
+            self.display(&wrapped)
+        } else {
+            self.display(&result)
+        };
+        let shown_stored = self.display(stored);
+        if explicit {
+            if lifted_left || !lifted {
+                if shift
+                    || self.binder.converts_implicitly(&value_bare.ty, stored_bare)
+                    || self.constant_fits(&value_bare, stored_bare)
+                {
+                    return false;
+                }
+                // An `int` constant outside the small integer on the left
+                // is said to be that, not to need a cast.
+                if !lifted
+                    && let Some(ConstantValue::Int32(constant)) = self.binder.folded(value)
+                    && matches!(
+                        self.binder.special_of(stored_bare),
+                        Some(
+                            SpecialType::SByte
+                                | SpecialType::Byte
+                                | SpecialType::Int16
+                                | SpecialType::UInt16
+                                | SpecialType::UInt32
+                        )
+                    )
+                    && self.binder.special_of(&value.ty) == Some(SpecialType::Int32)
+                {
+                    let text = constant.to_string();
+                    self.report(ErrorCode::ErrConstOutOfRange, span, &[&text, &shown_stored]);
+                    return true;
+                }
+            }
+            self.report(
+                ErrorCode::ErrNoImplicitConvCast,
+                span,
+                &[&shown_result, &shown_stored],
+            );
+        } else {
+            self.report(
+                ErrorCode::ErrNoImplicitConv,
+                span,
+                &[&shown_result, &shown_stored],
+            );
+        }
+        true
+    }
+
     pub(super) fn bind_compound_assignment(&mut self, node: &SyntaxNode) -> BoundExpression {
         let span = node.span();
         let Some(operator) = compound_operator(node.kind()) else {
@@ -548,6 +905,21 @@ impl BodyBinder<'_> {
         // store of what it gives back (§12.21.4).
         if operator != BinaryOperator::Coalesce
             && (matches!(stored, Type::Dynamic) || matches!(value.ty, Type::Dynamic))
+        {
+            return BoundExpression::new(
+                BoundExpressionKind::CompoundAssignment {
+                    target: Box::new(target),
+                    operator,
+                    value: Box::new(value),
+                },
+                stored,
+                span,
+            );
+        }
+        // `a += b` on predefined types is `a = (T)(a + b)` only where the
+        // cast is one the language writes for the programmer (§12.21.4).
+        if operator != BinaryOperator::Coalesce
+            && self.check_compound_result(operator, &target, &value, span)
         {
             return BoundExpression::new(
                 BoundExpressionKind::CompoundAssignment {
@@ -788,4 +1160,23 @@ fn assigned_through(target: &BoundExpression) -> &BoundExpression {
         }
         _ => target,
     }
+}
+
+/// What a predefined operator makes of two operands.
+pub(super) enum PredefinedOperation {
+    Result(Type),
+    Inapplicable,
+    Ambiguous,
+    /// Working it out reported the mistake already.
+    Reported,
+}
+
+/// What kind of predefined type one side of a compound assignment is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompoundOperand {
+    Number,
+    Boolean,
+    Text,
+    Object,
+    Enumeration,
 }

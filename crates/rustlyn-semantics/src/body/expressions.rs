@@ -1372,6 +1372,7 @@ impl BodyBinder<'_> {
                 // thing was a pattern all along.
                 if !self.names_a_type(&written) {
                     let value = self.bind_expression(&written);
+                    self.require_constant(&value, &operand.ty);
                     let pattern =
                         match self.union_constant_test(&operand.ty.clone(), value, written.span()) {
                             Ok(pattern) => pattern,

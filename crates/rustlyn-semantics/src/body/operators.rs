@@ -1512,7 +1512,10 @@ impl BodyBinder<'_> {
                     .binder
                     .nullable_underlying(&left.ty)
                     .and_then(|inner| self.binder.enum_underlying(&inner))
-                    .is_some_and(|underlying| right.ty == underlying)
+                    .is_some_and(|underlying| {
+                        right.ty == underlying
+                            || (operator == BinaryOperator::Add && is_zero(self, &right))
+                    })
                 {
                     // `x - (short)0` on an `E?` over `short` is the lifted
                     // `E - U`, which takes the `short` exactly.
@@ -1532,6 +1535,16 @@ impl BodyBinder<'_> {
                     } else {
                         left
                     }
+                } else if operator == BinaryOperator::Add
+                    && zero
+                    && self
+                        .binder
+                        .nullable_underlying(&right.ty)
+                        .is_some_and(|inner| self.binder.enum_underlying(&inner).is_some())
+                {
+                    // `0 + e` on an `E?` adds the `0` to the enum, as it
+                    // does on an `E`.
+                    left
                 } else {
                     self.meet_constant(left, &right.ty)
                 };
@@ -1924,6 +1937,23 @@ impl BodyBinder<'_> {
                             | BinaryOperator::RightShift
                             | BinaryOperator::UnsignedRightShift
                     );
+                // `long + ulong` is the same: the `float`, `double` and
+                // `decimal` operators take both, and none is the best.
+                let bare = |this: &Self, operand: &BoundExpression| {
+                    let ty = this
+                        .binder
+                        .nullable_underlying(&operand.ty)
+                        .unwrap_or_else(|| operand.ty.clone());
+                    BoundExpression::new(operand.kind.clone(), ty, operand.span)
+                };
+                let (bare_left, bare_right) = (bare(self, &left), bare(self, &right));
+                let ambiguous = ambiguous
+                    || (self.is_plain_number(&bare_left.ty)
+                        && self.is_plain_number(&bare_right.ty)
+                        && matches!(
+                            self.predefined_operation(operator, &bare_left, &bare_right, span),
+                            Some(super::assignment::PredefinedOperation::Ambiguous)
+                        ));
                 // Roslyn names them as they are written.
                 let shown = |this: &Self, ty: &Type| match this.binder.native_int(ty) {
                     Some(false) => "nint".to_string(),
@@ -2638,7 +2668,7 @@ fn utf8_literal_text(node: &SyntaxNode) -> Option<String> {
 
 /// The name metadata gives an operator, which is how a type declares one and
 /// how a call finds it.
-const fn operator_method_name(operator: BinaryOperator) -> Option<&'static str> {
+pub(super) const fn operator_method_name(operator: BinaryOperator) -> Option<&'static str> {
     Some(match operator {
         BinaryOperator::Add => "op_Addition",
         BinaryOperator::Subtract => "op_Subtraction",
@@ -2666,7 +2696,7 @@ const fn operator_method_name(operator: BinaryOperator) -> Option<&'static str> 
 }
 
 /// How an operator is spelled, for a diagnostic about it.
-fn operator_token_text(operator: BinaryOperator) -> &'static str {
+pub(super) fn operator_token_text(operator: BinaryOperator) -> &'static str {
     match operator {
         BinaryOperator::Add => "+",
         BinaryOperator::Subtract => "-",

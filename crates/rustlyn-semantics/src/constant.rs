@@ -1294,3 +1294,49 @@ fn integer_like(ty: &crate::types::Type, value: i64, binder: &Binder<'_>) -> Con
         _ => ConstantValue::Int32(value as i32),
     }
 }
+
+/// Whether an initializer written for a `const` certainly is no constant:
+/// it calls something, reads a property or an element, or joins a `string`
+/// to a value that is not one (`"a" + 1` is `string.Concat`, never folded).
+/// What cannot be told from the tree is not said to be one.
+pub(crate) fn certainly_not_constant(binder: &Binder<'_>, value: &BoundExpression) -> bool {
+    let string = |ty: &Type| binder.special_of(ty) == Some(SpecialType::String);
+    match &value.kind {
+        BoundExpressionKind::Conversion { operand, .. }
+        | BoundExpressionKind::Unary { operand, .. } => certainly_not_constant(binder, operand),
+        BoundExpressionKind::Property { .. }
+        | BoundExpressionKind::ArrayAccess { .. }
+        | BoundExpressionKind::IndexerAccess { .. } => true,
+        BoundExpressionKind::Call { method, .. } => !binder
+            .compilation()
+            .symbols()
+            .get(*method)
+            .name
+            .starts_with("op_"),
+        BoundExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            (*operator == BinaryOperator::Add
+                && string(&value.ty)
+                && [left, right].iter().any(|operand| {
+                    !string(&operand.ty)
+                        && !operand.ty.is_error()
+                        && !matches!(operand.ty, Type::Null)
+                }))
+                || certainly_not_constant(binder, left)
+                || certainly_not_constant(binder, right)
+        }
+        BoundExpressionKind::Conditional {
+            condition,
+            consequence,
+            alternative,
+        } => {
+            certainly_not_constant(binder, condition)
+                || certainly_not_constant(binder, consequence)
+                || certainly_not_constant(binder, alternative)
+        }
+        _ => false,
+    }
+}

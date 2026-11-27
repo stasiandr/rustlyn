@@ -272,6 +272,18 @@ pub(super) fn is_value_expression(context: &mut Context<'_, '_>, node: &SyntaxNo
     if is_written(node) {
         return false;
     }
+    // What a `const` is set from has to be a constant: a call or a variable
+    // in its place is CS0133.
+    if node.ancestors().any(|ancestor| {
+        matches!(
+            ancestor.kind(),
+            K::LocalDeclarationStatement | K::FieldDeclaration
+        ) && ancestor
+            .child_tokens()
+            .any(|token| token.kind() == K::ConstKeyword)
+    }) {
+        return false;
+    }
     let Some(parent) = node.parent() else {
         return false;
     };

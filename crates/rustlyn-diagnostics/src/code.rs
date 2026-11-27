@@ -127,6 +127,7 @@ error_codes! {
     ErrIntDivByZero = 20, Error, "Division by constant zero";
     ErrDecimalConstantFailed = 463, Error, "Evaluation of the decimal constant expression failed";
     ErrNotConstantExpression = 133, Error, "The expression being assigned to '{0}' must be constant";
+    ErrConstantValueExpected = 9135, Error, "A constant value of type '{0}' is expected";
     ErrLiteralDoubleCast = 664, Error, "Literal of type double cannot be implicitly converted to type '{1}'; use an '{0}' suffix to create a literal of this type";
     ErrCircConstValue = 110, Error, "The evaluation of the constant value for '{0}' involves a circular definition";
     ErrConstOutOfRangeChecked = 221, Error, "Constant value '{0}' cannot be converted to a '{1}' (use 'unchecked' syntax to override)";

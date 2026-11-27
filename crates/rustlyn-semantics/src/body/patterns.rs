@@ -13,7 +13,7 @@ use crate::bound::{
 };
 use crate::conversions::BinaryOperator;
 use crate::corlib::SpecialType;
-use crate::symbol::{SymbolId, SymbolKind, TypeKind};
+use crate::symbol::{Modifiers, SymbolId, SymbolKind, TypeKind};
 use crate::types::Type;
 use crate::unions::UnionMembers;
 
@@ -30,6 +30,48 @@ impl BodyBinder<'_> {
             .binder
             .resolve_type(node, &self.context, &mut sink)
             .is_error()
+    }
+
+    /// CS9135: what a constant or relational pattern holds has to be a
+    /// constant. Said only of what is certainly none: a call, a property, an
+    /// element, a parameter or a `readonly` field.
+    pub(super) fn require_constant(&mut self, value: &BoundExpression, input: &Type) {
+        if value.ty.is_error() || input.is_error() {
+            return;
+        }
+        let symbols = self.binder.compilation().symbols();
+        let mut held = value;
+        while let BoundExpressionKind::Conversion { operand, .. } = &held.kind {
+            held = operand;
+        }
+        let certain = match &held.kind {
+            BoundExpressionKind::Property { .. }
+            | BoundExpressionKind::ArrayAccess { .. }
+            | BoundExpressionKind::ArrayLength { .. }
+            | BoundExpressionKind::IndexerAccess { .. }
+            | BoundExpressionKind::Parameter(_) => true,
+            BoundExpressionKind::Call { method, .. } => {
+                !symbols.get(*method).name.starts_with("op_")
+            }
+            BoundExpressionKind::Field { field, .. } => {
+                let modifiers = symbols.get(*field).modifiers;
+                // A `decimal` constant of the framework is a `readonly`
+                // field with an attribute that makes it one.
+                modifiers.contains(Modifiers::READONLY)
+                    && !modifiers.contains(Modifiers::CONST)
+                    && self.binder.special_constant(*field).is_none()
+            }
+            _ => false,
+        };
+        if certain && self.binder.folded(held).is_none() {
+            let shown = self.display(
+                &self
+                    .binder
+                    .nullable_underlying(input)
+                    .unwrap_or_else(|| input.clone()),
+            );
+            self.report(ErrorCode::ErrConstantValueExpected, value.span, &[&shown]);
+        }
     }
 
     pub(super) fn bind_pattern(&mut self, node: &SyntaxNode, input: &Type) -> BoundPattern {
@@ -396,6 +438,7 @@ impl BodyBinder<'_> {
                     } else {
                         value
                     };
+                    self.require_constant(&value, input);
                     match self.span_string_test(&value, input, span) {
                         Some(test) => at(test),
                         None => at(BoundPatternKind::Constant(value)),
@@ -414,6 +457,7 @@ impl BodyBinder<'_> {
                     .map(|value| self.bind_expression(&value));
                 match (operator, value) {
                     (Some(operator), Some(value)) => {
+                        self.require_constant(&value, input);
                         at(BoundPatternKind::Relational { operator, value })
                     }
                     _ => at(BoundPatternKind::Unsupported(node.kind())),
@@ -429,6 +473,7 @@ impl BodyBinder<'_> {
                 // C# says a name that is not a type is a constant.
                 if !self.names_a_type(&written) {
                     let value = self.bind_expression(&written);
+                    self.require_constant(&value, input);
                     return at(BoundPatternKind::Constant(value));
                 }
                 let ty = self.resolve(&written);
