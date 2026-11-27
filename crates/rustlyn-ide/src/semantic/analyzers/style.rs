@@ -209,6 +209,14 @@ fn member_access(view: &mut View<'_>, node: &SyntaxNode, found: &mut Vec<Analyze
                 ));
                 return;
             }
+            // In an expression a variable or a member of that name comes
+            // before the type: with `int Console` in sight, `Console.WriteLine`
+            // is a member of an `int`, and the qualified name is needed.
+            if is_hidden_by_variable(view, node, token.value_text())
+                || is_hidden_by_member(view, node, token.value_text())
+            {
+                return;
+            }
             let context = view.context_at(node);
             let shorter = view
                 .model
@@ -307,6 +315,21 @@ fn is_hidden_by_variable(view: &mut View<'_>, node: &SyntaxNode, name: &str) -> 
         symbols.get(member).members.iter().any(|&child| {
             symbols.get(child).kind == SymbolKind::Parameter && symbols.get(child).name == name
         })
+    })
+}
+
+/// Whether a type around `node` has a member called `name` that is not a
+/// type: a field, a property, a method or an event, which a simple name in
+/// an expression means before it means a type from a namespace.
+fn is_hidden_by_member(view: &mut View<'_>, node: &SyntaxNode, name: &str) -> bool {
+    let context = view.context_at(node);
+    let binder = view.model.binder();
+    let symbols = view.compilation().symbols();
+    context.enclosing_types().into_iter().any(|ty| {
+        binder
+            .lookup_member(ty, name)
+            .into_iter()
+            .any(|member| symbols.get(member).kind != SymbolKind::NamedType)
     })
 }
 
@@ -510,5 +533,25 @@ mod tests {
             found_with(text, "IDE0004"),
             vec!["(int)", "(string)", "(int)"]
         );
+    }
+
+    /// In an expression a variable or a member of the name comes before a
+    /// type from a namespace: with `int Console` in sight, the shorter
+    /// `Console.WriteLine` would be a member of an `int`, and the fix did
+    /// not compile.
+    #[test]
+    fn a_name_a_variable_or_a_member_hides_is_left_qualified() {
+        let text = "using System;\n\
+                    class Q {\n\
+                      int Math = 3;\n\
+                      void F() { var Console = 1; System.Console.WriteLine(Console); }\n\
+                      void G(int Console) { System.Console.WriteLine(Console); }\n\
+                      void H() { foreach (var Console in new[] { 1 }) System.Console.WriteLine(Console); }\n\
+                      int J() { return System.Math.Max(1, Math); }\n\
+                      void L(object o) { if (o is int Console) System.Console.WriteLine(Console); }\n\
+                      void K() { Action<int> a = Console => System.Console.WriteLine(Console); a(1); }\n\
+                      void Plain() { System.Console.WriteLine(1); }\n\
+                    }\n";
+        assert_eq!(found_with(text, "IDE0002"), vec!["System."]);
     }
 }

@@ -1001,4 +1001,41 @@ mod tests {
             .expect("CS0612");
         assert_eq!(gone.message, "'C.Gone()' is obsolete");
     }
+
+    /// The name in a property pattern is a read of the member: `p is { a:
+    /// 1 }` reads `a`. It was passed over as the name of an argument is,
+    /// and a field read only so was reported unused — and offered for
+    /// removal.
+    #[test]
+    fn a_member_read_in_a_property_pattern_is_used() {
+        let text = "class P {\n\
+                      private int a; private int b; private string c;\n\
+                      private int E { get; }\n\
+                      private int gone;\n\
+                      public P(int x, string s) { a = x; b = x; c = s; E = x; }\n\
+                      static bool One(P p) => p is { a: 1 };\n\
+                      public bool Two(P p) => One(p) && p switch { { b: > 3 } => true, _ => false };\n\
+                      public bool Three(P p) => p is { c: \"x\" or \"y\" } or { E: 3 };\n\
+                      public void Call(int a) { Take(a: a); }\n\
+                      static void Take(int a) { System.Console.WriteLine(a); }\n\
+                    }\n";
+        assert_eq!(found_with(text, "IDE0051"), vec!["gone"]);
+        assert!(found_with(text, "IDE0052").is_empty());
+    }
+
+    /// A field handed out by reference may be written by whoever holds the
+    /// reference: `ref int r = ref count; r = 3;`. Made `readonly` it would
+    /// not compile (CS0192).
+    #[test]
+    fn a_field_handed_out_by_reference_cannot_be_readonly() {
+        let text = "class C {\n\
+                      private int count = 1;\n\
+                      private int slot = 2;\n\
+                      private int fixedOne = 3;\n\
+                      public int Bump() { ref int r = ref count; r = 3; return r; }\n\
+                      public ref int Slot() => ref slot;\n\
+                      public int Read() => fixedOne;\n\
+                    }\n";
+        assert_eq!(found_with(text, "IDE0044"), vec!["fixedOne"]);
+    }
 }

@@ -289,9 +289,16 @@ impl Facts {
                 continue;
             }
             // `Add(b: 4)` names the parameter to pass to; it does not read it.
+            // `p is { a: 1 }` does read `a`: the name in a property pattern
+            // is the member the pattern looks at.
             if std::iter::once(token.parent().clone())
                 .chain(token.parent().parent().cloned())
-                .any(|node| node.kind() == SyntaxKind::NameColon)
+                .any(|node| {
+                    node.kind() == SyntaxKind::NameColon
+                        && node
+                            .parent()
+                            .is_none_or(|holder| holder.kind() != SyntaxKind::Subpattern)
+                })
             {
                 continue;
             }
@@ -425,6 +432,11 @@ fn access_of(token: &SyntaxToken) -> Access {
                 }
             }
             SyntaxKind::TupleExpression => node = parent,
+            // `ref int r = ref field;`, `return ref field;` and `&field` hand
+            // out the variable itself: whoever holds it may write it.
+            SyntaxKind::RefExpression | SyntaxKind::AddressOfExpression => {
+                return Access::ReadWrite;
+            }
             _ => return Access::Read,
         }
     }
