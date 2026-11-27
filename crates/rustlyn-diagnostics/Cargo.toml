@@ -1,6 +1,6 @@
 [package]
 name = "rustlyn-diagnostics"
-description = "Diagnostics and C# error codes for the Rustlyn compiler"
+description = "Diagnostics and C# error codes for Rustlyn, the C# analyzer and compiler"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

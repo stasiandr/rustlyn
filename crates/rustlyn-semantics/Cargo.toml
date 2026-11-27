@@ -1,6 +1,6 @@
 [package]
 name = "rustlyn-semantics"
-description = "Symbols, declarations and semantic analysis for the Rustlyn C# compiler"
+description = "Symbols, declarations and semantic analysis for Rustlyn, the C# analyzer and compiler"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

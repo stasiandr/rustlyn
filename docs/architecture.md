@@ -1,8 +1,11 @@
 # Architecture
 
-Rustlyn follows Roslyn's layering: text, syntax, symbols and binding, then backends that
-consume the bound tree. The editor-facing layer reuses the same pieces, arranged so that
-each can answer before the next one starts (see [editor.md](editor.md)).
+Rustlyn is an analyzer built on a compiler: what it says about a project is read off the
+same symbols and bound trees the code is compiled from. It follows Roslyn's layering:
+text, syntax, symbols and binding, then backends that consume the bound tree. The
+editor-facing layer reuses the same pieces, arranged so that each can answer before the
+next one starts (see [editor.md](editor.md)), and the whole-project analyses sit on top
+of it (see [analyzer.md](analyzer.md)).
 
 ```
 source text ─► tokens ─► green/red tree ─► declarations (symbols) ─► bound tree ─┬─► IL + metadata (.dll)

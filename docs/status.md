@@ -1,8 +1,8 @@
 # What works
 
 This page is the long form of "What it does" in the [top-level README](../README.md):
-how each part of the compiler is checked against real code, and what each part
-supports.
+how each part of the compiler underneath the analyzer is checked against real code,
+and what each part supports.
 
 ## Validation on Roslyn's own sources
 

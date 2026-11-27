@@ -1,16 +1,43 @@
 # Rustlyn
 
-A C# compiler and editor engine written in Rust, following the architecture of
-[Roslyn](https://github.com/dotnet/roslyn).
+A static analyzer for C#, written in Rust, that happens to be a compiler as well. It
+follows the architecture of [Roslyn](https://github.com/dotnet/roslyn).
 
-Rustlyn compiles Roslyn itself, and the `Roslyn.dll` it builds compiles Rustlyn's build
-of Roslyn again, identical byte for byte. It builds the Roslyn compiler about 1.7 times
-faster than a warm `csc` server. It compiles a 45,000-file production Unity project the way
-Unity does, with no false errors. On top of the compiler it gives an editor engine, a
-decompiler, hot reload into a running Unity editor, and whole-project analyses that
-Roslyn does not have.
+Rustlyn answers questions about a whole C# project: what a change reaches, whether it
+leads to a given SDK, where a value comes from, how a method can fail and under which
+conditions, which field two threads touch with no lock between them. An analysis is
+worth what its reading of the code is worth, so Rustlyn reads C# the way the compiler
+does, and to keep that honest it is one. It compiles Roslyn itself, and the
+`Roslyn.dll` it builds compiles Rustlyn's build of Roslyn again, identical byte for
+byte. It compiles a 45,000-file production Unity project the way Unity does, with no
+false errors. The same engine serves an editor, a decompiler and hot reload into a
+running Unity editor.
 
 ## What it does
+
+### The analyzer
+
+* **Whole-project analyses.** `rustlyn-analyzer` computes the blast radius of a change,
+  says whether a change leads to a given SDK through calls, fields and ECS components,
+  traces where a value comes from, and explains how a method can fail and under which
+  conditions. It also reads Unity assets and their references, and NuGet packages. Its
+  command-line tools are `rustlyn-blast` (also an MCP server for coding agents),
+  `rustlyn-reach`, `rustlyn-graph` and `rustlyn-fail`. See [docs/analyzer.md](docs/analyzer.md).
+* **Diagnostics.** The compiler's own errors and warnings, the IDE analyzers
+  (IDE0001–IDE0090, IDE1006) with severities from `.editorconfig`, and analyses Roslyn
+  does not have: thread safety (a field two threads touch with no lock, Unity's
+  main-thread API reached from a background thread) and failability. An error is
+  reported only where it is certain: on real code a false one costs more than a missed
+  one.
+* **Editor services.** `rustlyn-ide` arranges the analysis in cached layers for an
+  editor: colouring, outline, project index, go to definition, references, completion,
+  rename, code actions, formatting and more. It loads `.sln`/`.csproj` and Unity
+  projects, and `rustlyn-ffi` exposes it through a C ABI.
+* **Reading assemblies.** A metadata reader, an IL disassembler and a decompiler
+  (`rustlyn-decompile`). The decompiler turns assemblies back into readable C#,
+  reconstructing lambdas, iterators and `async` state machines.
+
+### The compiler underneath
 
 * **Parsing.** A full-fidelity lexer, preprocessor and parser for the whole language
   through C# 14/15. On all 18,224 source files of Roslyn, the tree reproduces the source
@@ -31,19 +58,6 @@ Roslyn does not have.
   5,198 of the 5,505 warnings Unity's own compile reports, and adds none of its own.
 * **Hot reload.** An edited method runs in a live Unity editor 1.4 s after you save,
   with no domain reload. The same edit through Unity's own compile takes 53 s.
-* **Reading assemblies.** A metadata reader, an IL disassembler and a decompiler
-  (`rustlyn-decompile`). The decompiler turns assemblies back into readable C#,
-  reconstructing lambdas, iterators and `async` state machines.
-* **Editor services.** `rustlyn-ide` arranges the compiler in cached layers for an editor:
-  colouring, outline, project index, go to definition, references, completion,
-  diagnostics with IDE analyzers, rename, code actions, formatting and more. It loads
-  `.sln`/`.csproj` and Unity projects, and `rustlyn-ffi` exposes it through a C ABI.
-* **Whole-project analyses.** `rustlyn-analyzer` computes the blast radius of a change,
-  says whether a change leads to a given SDK through calls, fields and ECS components,
-  traces where a value comes from, and explains how a method can fail and under which
-  conditions. It also reads Unity assets and their references, and NuGet packages. Its
-  command-line tools are `rustlyn-blast` (also an MCP server for coding agents),
-  `rustlyn-reach`, `rustlyn-graph` and `rustlyn-fail`. See [docs/analyzer.md](docs/analyzer.md).
 
 The APIs are pre-1.0 and may still change. Behaviour that knowingly differs from Roslyn
 is listed in [docs/differences-from-roslyn.md](docs/differences-from-roslyn.md), and
@@ -59,6 +73,15 @@ to compile against the real framework, a .NET SDK or shared framework directory.
 git clone https://github.com/stasiandr/rustlyn
 cd rustlyn
 cargo build --release
+```
+
+Ask what a change reaches, and how a method can fail:
+
+```sh
+cargo build --release -p rustlyn-analyzer
+target/release/rustlyn-blast <project root>                  # the working copy against HEAD, with risks
+target/release/rustlyn-fail <project root> Player.cs:42      # how the member at that line can fail
+target/release/rustlyn-graph <project root> Player.cs:42:17  # where the value there comes from
 ```
 
 Compile a C# file to an assembly and run it:
@@ -130,6 +153,7 @@ More entry points are listed in [docs/development.md](docs/development.md#exampl
 
 ## Documentation
 
+* [docs/analyzer.md](docs/analyzer.md): the whole-project analyses and their command-line tools
 * [docs/status.md](docs/status.md): what works, in detail, and how it is validated
 * [docs/architecture.md](docs/architecture.md): the pipeline and design decisions
 * [docs/performance.md](docs/performance.md): benchmark against `csc`

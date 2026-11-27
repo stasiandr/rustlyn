@@ -1,6 +1,6 @@
 [package]
 name = "rustlyn-text"
-description = "Source text, spans and line mapping for the Rustlyn C# compiler"
+description = "Source text, spans and line mapping for Rustlyn, the C# analyzer and compiler"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
