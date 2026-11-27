@@ -24742,3 +24742,58 @@ class P {
 ",
     );
 }
+
+/// A compound shift asks nothing of its count: `a <<= b` with an `int? b` on a
+/// plain `int` is `a = (int)(a << b)`, the count's own value or an
+/// `InvalidOperationException` where there is none. Judged like the other
+/// operators it was a CS0266, and before that the count was shifted by as the
+/// struct it is, which gave another number.
+#[test]
+fn a_compound_shift_takes_a_nullable_count_by_its_value() {
+    check(
+        "NullableShiftCount",
+        r#"
+using System;
+enum E { A = 1 }
+class P
+{
+    static int Count(string tag, int? v) { Console.Write(tag + " "); return v ?? 0; }
+    static int? N(int? v) { Console.Write("n "); return v; }
+    int f = 1; int[] arr = { 1, 2 }; int Prop { get; set; } = 1;
+    static void Main()
+    {
+        int a = 1; int? b = 3; a <<= b; Console.WriteLine(a);
+        long l = 256; byte? c = 2; l >>= c; Console.WriteLine(l);
+        uint u = 0x80000000; int? d = 1; u >>>= d; Console.WriteLine(u);
+        sbyte sb = 1; int? e = 2; sb <<= e; Console.WriteLine(sb);
+        byte by = 1; char? ch = (char)3; by <<= ch; Console.WriteLine(by);
+        ulong ul = 1; short? sh = 40; ul <<= sh; Console.WriteLine(ul);
+        nint ni = 1; int? k = 4; ni <<= k; Console.WriteLine(ni);
+        char cc = 'a'; int? one = 1; cc >>= one; Console.WriteLine((int)cc);
+        int? n = null; try { a <<= n; } catch (InvalidOperationException) { Console.WriteLine("IOE"); }
+        Console.WriteLine(a);
+        int? na = 1; na <<= b; Console.WriteLine(na); na <<= n; Console.WriteLine(na.HasValue);
+        var p = new P(); p.f <<= b; p.arr[1] <<= N(2); p.Prop <<= b; Console.WriteLine(p.f + " " + p.arr[1] + " " + p.Prop);
+        int x = 1; x <<= N(1) ; x >>= 0; checked { x <<= b; } Console.WriteLine(x);
+        var r = a << b; Console.WriteLine(r.GetType() + " " + r + " " + ((a << n) == null));
+    }
+}
+"#,
+        "8
+64
+1073741824
+4
+8
+1099511627776
+16
+48
+IOE
+8
+8
+False
+n 8 8 8
+n 16
+System.Int32 64 True
+",
+    );
+}

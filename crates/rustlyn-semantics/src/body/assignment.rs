@@ -785,9 +785,13 @@ impl BodyBinder<'_> {
         };
         let shown_stored = self.display(stored);
         if explicit {
+            // A shift asks nothing of its count: `a <<= b` with an `int? b`
+            // is `a = (int)(a << b)`, which throws where `b` is null.
+            if shift {
+                return false;
+            }
             if lifted_left || !lifted {
-                if shift
-                    || self.binder.converts_implicitly(&value_bare.ty, stored_bare)
+                if self.binder.converts_implicitly(&value_bare.ty, stored_bare)
                     || self.constant_fits(&value_bare, stored_bare)
                 {
                     return false;
@@ -985,6 +989,21 @@ impl BodyBinder<'_> {
                     ty = underlying;
                 }
                 self.convert(value, &stored)
+            } else if matches!(
+                operator,
+                BinaryOperator::LeftShift
+                    | BinaryOperator::RightShift
+                    | BinaryOperator::UnsignedRightShift
+            ) && self.binder.nullable_underlying(&stored).is_none()
+                && self.compound_operand_kind(&stored).is_some()
+                && let Some(count) = self.binder.nullable_underlying(&value.ty)
+                && self.compound_operand_kind(&count).is_some()
+            {
+                // `a <<= b` with an `int? b` on a plain `int` is `a = (int)(a
+                // << b)`: the shift is lifted and the cast back takes its
+                // value, which is the count's own value, or the exception
+                // where there is none.
+                self.convert_explicitly(value, &count)
             } else {
                 value
             };
