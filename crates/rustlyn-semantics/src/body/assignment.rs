@@ -702,6 +702,12 @@ impl BodyBinder<'_> {
         {
             return false;
         }
+        // A `switch` expression goes to the type on the left arm by arm, as
+        // it would in `x = y`: `b |= k switch { K.A => 1, _ => 0 }` asks no
+        // cast of a `byte`, though the arms alone would make an `int`.
+        if matches!(value.kind, BoundExpressionKind::Switch { .. }) {
+            return false;
+        }
         if !self.is_variable_place(target)
             || typeless(value)
             || matches!(value.ty, Type::Null | Type::Error | Type::Dynamic)

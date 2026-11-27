@@ -615,3 +615,33 @@ fn a_pattern_that_may_miss_a_value_still_leaves_a_variable_unassigned() {
         );
     }
 }
+
+/// A `switch` expression on the right of a compound assignment goes to the
+/// type on the left arm by arm, as it does in a plain assignment: the arms
+/// alone would make an `int`, and judging that `int` against a `byte` was a
+/// CS0266 Roslyn does not report. A conditional has a type of its own, and
+/// is judged by it.
+#[test]
+fn a_switch_expression_on_the_right_of_a_compound_assignment_is_not_judged_by_its_arms() {
+    clean(
+        "enum K { A, B }
+         class C {
+             void M(K k, byte b, short s, sbyte sb) {
+                 b |= k switch { K.A => 1, K.B => 0, _ => 2 };
+                 b += k switch { K.A => 1, _ => 2 };
+                 s *= k switch { K.A => 3, _ => 4 };
+                 sb ^= (k switch { K.A => 1, _ => 2 });
+             }
+         }",
+    );
+    assert_eq!(
+        errors(
+            "class C {
+                 void M(bool f, byte b) {
+                     b |= f ? 1 : 0;
+                 }
+             }"
+        ),
+        ["CS0266"]
+    );
+}
