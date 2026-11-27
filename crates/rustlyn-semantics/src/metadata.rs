@@ -136,6 +136,11 @@ pub struct Reference {
     pub name: String,
     /// Major, minor, build, revision.
     pub version: [u16; 4],
+    /// The public key token, which the assembly's own public key hashes to;
+    /// `None` for an assembly that is not strong-named. A reference that
+    /// names the wrong one is an assembly the loader and the other compilers
+    /// cannot tell is the one they have.
+    pub public_key_token: Option<[u8; 8]>,
 }
 
 impl std::fmt::Display for Reference {
@@ -2829,6 +2834,19 @@ impl<'a> Loader<'a> {
                                     row.number(2) as u16,
                                     row.number(3) as u16,
                                 ],
+                                // An `AssemblyRef` holds the key itself when
+                                // its flags say so and the token otherwise.
+                                public_key_token: assembly
+                                    .heaps()
+                                    .blob(row.number(5))
+                                    .ok()
+                                    .and_then(|blob| {
+                                        if row.number(4) & 1 != 0 {
+                                            rustlyn_metadata::public_key_token(blob)
+                                        } else {
+                                            <[u8; 8]>::try_from(blob).ok()
+                                        }
+                                    }),
                             })
                     }
                 };
@@ -3180,6 +3198,11 @@ fn reference_of(assembly: &Assembly<'_>) -> Option<Reference> {
             row.number(3) as u16,
             row.number(4) as u16,
         ],
+        public_key_token: assembly
+            .heaps()
+            .blob(row.number(6))
+            .ok()
+            .and_then(rustlyn_metadata::public_key_token),
     })
 }
 

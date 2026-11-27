@@ -346,6 +346,11 @@ pub struct Method {
     /// Whether it ends in `__arglist`: a varargs method, called with the
     /// types of what it is given past its parameters written at the call.
     pub is_vararg: bool,
+    /// Whether the language declared it rather than the source: the
+    /// constructor of a type that wrote none. Whether the metadata carries
+    /// it is the emitter's to decide, since a struct and a static class have
+    /// no such constructor there.
+    pub is_implicit: bool,
 }
 
 /// What a method is for, which decides both its name and how it can be called.

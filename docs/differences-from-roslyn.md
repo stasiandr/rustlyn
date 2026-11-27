@@ -126,6 +126,20 @@ implements the behaviour.
   reported (CS0146, CS0529); what walks the bases of such a type stops where a definition
   comes back, as Roslyn's `BaseTypeAnalysis` finds the circularity, and the program is
   emitted as written. `class L<T> : Base<L<L<T>>>`, whose bases are `Base`'s, is no cycle.
+* Type arguments are checked against `class`, `struct` and named constraints (CS0311,
+  CS0315, CS0452, CS0453) where the check can be made for certain: an argument that is or
+  holds a type parameter, a tuple, a pointer or a type that did not resolve, a constraint
+  that still names a type parameter and a nullable value type under an interface
+  constraint are taken as met, and so is a type nested in a generic one. `new()` (CS0310),
+  `unmanaged` (CS8377) and the nullable-specific CS0312 and CS0313 are not reported. A
+  generic method with one candidate is reported where it is called; with several, a
+  candidate whose inferred type arguments break its constraints is not a candidate.
+* The metadata Rustlyn writes differs from Roslyn's, in ways reflection could tell, in
+  these: a `scoped` or `params` span parameter has no `[ScopedRef]`; a `[ComImport]`
+  class's constructor has an IL body and not the runtime-implemented flags; a
+  destructor has no `MethodImpl` row for `Finalize`; the state machines of `async`
+  methods and iterators have other member names, accessibilities and `MethodImpl`
+  rows; and `[module: UnverifiableCode]` is not written for `--unsafe`.
 
 ## Interpreter
 

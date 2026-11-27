@@ -459,3 +459,205 @@ fn a_constraint_is_as_wide_as_the_largest_type_table() {
         .collect();
     assert_eq!(constraints, ["T : IConstraint"]);
 }
+
+// MARK: - the assemblies a program says it was built against
+
+/// The shared framework to compile against, or `None` where there is none:
+/// `RUSTLYN_FRAMEWORK`, or the newest one beside the .NET host that
+/// `RUSTLYN_DOTNET`, `DOTNET_ROOT` or the path names. A missing framework is
+/// no failure unless `RUSTLYN_REQUIRE_DOTNET` is set, as CI sets it.
+fn framework_images() -> Option<Vec<Vec<u8>>> {
+    let directory = if let Ok(path) = std::env::var("RUSTLYN_FRAMEWORK") {
+        Some(std::path::PathBuf::from(path))
+    } else {
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(host) = std::env::var("RUSTLYN_DOTNET") {
+            roots.extend(std::path::Path::new(&host).parent().map(Into::into));
+        }
+        if let Ok(root) = std::env::var("DOTNET_ROOT") {
+            roots.push(root.into());
+        }
+        if let Ok(paths) = std::env::var("PATH") {
+            roots.extend(std::env::split_paths(&paths));
+        }
+        roots
+            .into_iter()
+            .map(|root| std::fs::canonicalize(root.join("dotnet")).unwrap_or(root.join("dotnet")))
+            .find(|host| host.is_file())
+            .and_then(|host| {
+                let shared = host.parent()?.join("shared/Microsoft.NETCore.App");
+                let mut versions: Vec<_> = std::fs::read_dir(shared)
+                    .ok()?
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .collect();
+                versions.sort_by_key(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .map(|name| {
+                            name.split(['.', '-'])
+                                .map(|part| part.parse::<u32>().unwrap_or(0))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                });
+                versions.pop()
+            })
+    };
+    let Some(directory) = directory.filter(|directory| directory.is_dir()) else {
+        assert!(
+            std::env::var_os("RUSTLYN_REQUIRE_DOTNET").is_none(),
+            "RUSTLYN_REQUIRE_DOTNET is set, but no .NET framework was found"
+        );
+        return None;
+    };
+    let mut paths: Vec<_> = std::fs::read_dir(directory)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|extension| extension == "dll"))
+        .collect();
+    paths.sort();
+    Some(
+        paths
+            .iter()
+            .filter_map(|path| std::fs::read(path).ok())
+            .collect(),
+    )
+}
+
+/// What an `AssemblyRef` row says, as `Name Version token`: the token as hex,
+/// empty where the assembly has none.
+fn assembly_refs(assembly: &Assembly<'_>) -> Vec<String> {
+    let heaps = assembly.heaps();
+    let mut refs: Vec<String> = assembly
+        .table(table::ASSEMBLY_REF)
+        .iter()
+        .map(|row| {
+            let token: String = heaps
+                .blob(row.number(5))
+                .expect("the token")
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!(
+                "{} {}.{}.{}.{} {token}",
+                heaps.string(row.number(6)),
+                row.number(0),
+                row.number(1),
+                row.number(2),
+                row.number(3)
+            )
+        })
+        .collect();
+    refs.sort();
+    refs
+}
+
+/// What an assembly says it is, as `assembly_refs` words a reference to it:
+/// its own `Assembly` row, with the token its public key hashes to.
+fn identity(assembly: &Assembly<'_>) -> String {
+    let heaps = assembly.heaps();
+    let row = assembly.table(table::ASSEMBLY).row(1).expect("a name");
+    let token: String =
+        rustlyn_metadata::public_key_token(heaps.blob(row.number(6)).expect("the public key"))
+            .map(|token| token.iter().map(|byte| format!("{byte:02x}")).collect())
+            .unwrap_or_default();
+    format!(
+        "{} {}.{}.{}.{} {token}",
+        heaps.string(row.number(7)),
+        row.number(1),
+        row.number(2),
+        row.number(3),
+        row.number(4)
+    )
+}
+
+#[test]
+fn the_token_of_a_public_key_is_the_end_of_its_sha1_reversed() {
+    // The key `mscorlib` and the other ECMA assemblies are signed with.
+    let key = [0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0];
+    assert_eq!(
+        rustlyn_metadata::public_key_token(&key),
+        Some([0xb7, 0x7a, 0x5c, 0x56, 0x19, 0x34, 0xe0, 0x89])
+    );
+    // No key, no token.
+    assert_eq!(rustlyn_metadata::public_key_token(&[]), None);
+}
+
+#[test]
+fn an_assembly_reference_names_the_assembly_it_was_made_against() {
+    let Some(images) = framework_images() else {
+        println!("note: skipped; no .NET shared framework was found");
+        return;
+    };
+    let refs: Vec<&[u8]> = images.iter().map(Vec::as_slice).collect();
+    let compile = |source: &str, extra: &[&[u8]]| {
+        let all: Vec<&[u8]> = refs.iter().chain(extra).copied().collect();
+        Compilation::create_with_references(
+            vec![parse(SourceText::new("Program.cs", source))],
+            &all,
+        )
+    };
+    let library = compile(
+        "public class Widget { public int Size = 3; public event System.EventHandler Changed; }",
+        &[],
+    );
+    let library = rustlyn_emit::emit_library(&library, "Widgets")
+        .expect("the library")
+        .assembly;
+    let program = compile(
+        "using System; using System.Collections.Generic; using System.Linq;
+class P { static void Main() {
+    var list = new List<int> { 1, 2 }; var stack = new Stack<int>();
+    var w = new Widget(); w.Changed += (s, e) => { };
+    Console.WriteLine(list.Count + stack.Count + w.Size + list.Select(x => x).Count());
+} }",
+        &[&library],
+    );
+    let diagnostics: Vec<String> = program
+        .source_diagnostics()
+        .into_iter()
+        .map(|entry| program.render(entry))
+        .chain(
+            program
+                .semantic_diagnostics()
+                .iter()
+                .filter(|entry| entry.diagnostic.is_error())
+                .map(|entry| program.render(entry)),
+        )
+        .collect();
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let bytes = rustlyn_emit::emit(&program, "Program")
+        .expect("the program")
+        .assembly;
+    let emitted = Assembly::read(&bytes).expect("the program reads back");
+
+    // Each reference is what the referenced assembly says it is: the core
+    // library signed with its own key and `System.Console` with the
+    // framework's, the library beside the program with none.
+    let mut known: Vec<String> = images
+        .iter()
+        .filter_map(|image| Assembly::read(image).ok())
+        .map(|assembly| identity(&assembly).trim_end().to_string())
+        .collect();
+    known.push(
+        identity(&Assembly::read(&library).expect("the library reads back"))
+            .trim_end()
+            .to_string(),
+    );
+    let refs = assembly_refs(&emitted);
+    assert!(
+        refs.iter()
+            .any(|row| row.starts_with("System.Private.CoreLib ")),
+        "{refs:#?}"
+    );
+    for row in &refs {
+        assert!(
+            known.contains(&row.trim_end().to_string()),
+            "{row:?} is no assembly that was referenced"
+        );
+    }
+    assert!(refs.iter().any(
+        |row| row.starts_with("System.Private.CoreLib ") && row.ends_with(" 7cec85d7bea7798e")
+    ));
+    assert!(refs.iter().any(|row| row.starts_with("Widgets 0.0.0.0")));
+}

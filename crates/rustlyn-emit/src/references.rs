@@ -48,6 +48,7 @@ fn assembly_by_name(qualified_name: &str) -> Reference {
     Reference {
         name: name.to_string(),
         version: FRAMEWORK_VERSION,
+        public_key_token: Some(ECMA_PUBLIC_KEY_TOKEN),
     }
 }
 
@@ -122,8 +123,17 @@ impl References {
         if let Some(token) = self.assemblies.get(&reference.name) {
             return *token;
         }
-        let token =
-            metadata.add_assembly_ref(&reference.name, reference.version, &ECMA_PUBLIC_KEY_TOKEN);
+        // The token is the referenced assembly's own: the core library and
+        // `System.Runtime` are signed with different keys, and a library
+        // beside the program with none at all.
+        let token = metadata.add_assembly_ref(
+            &reference.name,
+            reference.version,
+            reference
+                .public_key_token
+                .as_ref()
+                .map_or(&[][..], |token| &token[..]),
+        );
         self.assemblies.insert(reference.name.clone(), token);
         token
     }

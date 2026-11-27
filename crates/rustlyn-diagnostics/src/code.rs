@@ -101,6 +101,10 @@ error_codes! {
     ErrNoConvToIDisp = 1674, Error, "'{0}': type used in a using statement must implement 'System.IDisposable'.";
     ErrNoConvToIAsyncDisp = 8410, Error, "'{0}': type used in an asynchronous using statement must implement 'System.IAsyncDisposable' or implement a suitable 'DisposeAsync' method.";
     ErrSpecialTypeAsBound = 702, Error, "Constraint cannot be special class '{0}'";
+    ErrGenericConstraintNotSatisfiedRefType = 311, Error, "The type '{3}' cannot be used as type parameter '{2}' in the generic type or method '{0}'. There is no implicit reference conversion from '{3}' to '{1}'.";
+    ErrGenericConstraintNotSatisfiedValType = 315, Error, "The type '{3}' cannot be used as type parameter '{2}' in the generic type or method '{0}'. There is no boxing conversion from '{3}' to '{1}'.";
+    ErrRefConstraintNotSatisfied = 452, Error, "The type '{2}' must be a reference type in order to use it as parameter '{1}' in the generic type or method '{0}'";
+    ErrValConstraintNotSatisfied = 453, Error, "The type '{2}' must be a non-nullable value type in order to use it as parameter '{1}' in the generic type or method '{0}'";
     ErrDefaultValueMustBeConstant = 1736, Error, "Default parameter value for '{0}' must be a compile-time constant";
     ErrBadMemberFlag = 106, Error, "The modifier '{0}' is not valid for this item";
     ErrStaticNotVirtual = 112, Error, "A static member cannot be marked as '{0}'";

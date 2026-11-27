@@ -456,6 +456,7 @@ impl<'a> BodyBinder<'a> {
         body_binder.propagate_local_function_captures();
         crate::flow::check(binder, tree, declaration, member, &mut body_binder.body);
         crate::obsolete::check(binder, tree, declaration, member, &mut body_binder.body);
+        crate::constraints::check_body(binder, tree, declaration, &mut body_binder.body);
         body_binder.body
     }
 

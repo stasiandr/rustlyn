@@ -1776,8 +1776,15 @@ impl Emitter<'_> {
                     SymbolKind::Property => {
                         // `static int X { get; } = 5;` needs a class
                         // constructor as much as a static field with an
-                        // initializer does.
+                        // initializer does; `static int X => 5;` has no
+                        // initializer, only a getter.
                         if detail.modifiers.contains(Modifiers::STATIC)
+                            && self
+                                .compilation
+                                .declaration_node(member)
+                                .is_some_and(|node| {
+                                    node.child_of_kind(SyntaxKind::EqualsValueClause).is_some()
+                                })
                             && self
                                 .body_of(member)
                                 .is_some_and(|body| !body.statements.is_empty())
@@ -1811,6 +1818,16 @@ impl Emitter<'_> {
                     SymbolKind::Method => {
                         if detail.name == ".ctor" {
                             has_constructor = true;
+                            // The one the language gives a struct stands in
+                            // for `new S()` in the binder and is no row: a
+                            // value type needs none to be zeroed, and Roslyn
+                            // writes a constructor only for one the source
+                            // declared.
+                            if detail.as_method().is_some_and(|method| method.is_implicit)
+                                && matches!(type_kind, TypeKind::Struct | TypeKind::RecordStruct)
+                            {
+                                continue;
+                            }
                         }
                         // A type that writes its own class constructor gets no
                         // second one: the field initializers are emitted into
@@ -1903,9 +1920,12 @@ impl Emitter<'_> {
             // An interface has no constructor to synthesise. Neither does a
             // struct: the runtime zeroes a value type, and `new S()` is
             // `initobj` rather than a call.
+            // A static class has no instance constructor either: it is
+            // `abstract sealed`, and nothing may create one.
             if !has_constructor
                 && !interface
                 && !matches!(type_kind, TypeKind::Struct | TypeKind::RecordStruct)
+                && !symbols.get(symbol).modifiers.contains(Modifiers::STATIC)
             {
                 let token = Token::new(table::METHOD_DEF, next_method);
                 next_method += 1;
@@ -2492,7 +2512,9 @@ impl Emitter<'_> {
             };
         if let Some(import) = import {
             flags |= method_attributes::PINVOKE_IMPL;
-            impl_flags |= method_impl::PRESERVE_SIG;
+            if import.preserve_sig {
+                impl_flags |= method_impl::PRESERVE_SIG;
+            }
             self.note_pinvoke(token, import);
         }
         let source = self.closure_source(key, instance, hosted);
@@ -2582,7 +2604,14 @@ impl Emitter<'_> {
             if optional {
                 flags |= param_attributes::OPTIONAL;
             }
-            if has_default {
+            // `[DefaultParameterValue(v)]` without `[Optional]` gives the
+            // row its constant and leaves the parameter required.
+            let attributed = if optional {
+                None
+            } else {
+                self.attributed_default_value(symbol)
+            };
+            if has_default || attributed.is_some() {
                 flags |= param_attributes::HAS_DEFAULT;
             }
             let param = self.metadata.param_token(method, index);
@@ -2625,7 +2654,11 @@ impl Emitter<'_> {
                 continue;
             }
             self.metadata.set_param_flags(param, flags);
-            if has_default {
+            if let Some(constant) = attributed {
+                let special = self.constant_width(&parameter.ty);
+                let (element, value) = encode_constant_as(&constant, special);
+                self.metadata.add_param_constant(param, element, &value);
+            } else if has_default {
                 // A default that is no constant — `default(CancellationToken)`
                 // — is recorded as a null, which is what csc writes for it.
                 let special = self.constant_width(&parameter.ty);
@@ -2637,6 +2670,34 @@ impl Emitter<'_> {
             }
         }
         Ok(())
+    }
+
+    /// The constant a `[DefaultParameterValue(v)]` on a parameter writes,
+    /// bound to be sure of what it names.
+    fn attributed_default_value(&mut self, parameter: SymbolId) -> Option<ConstantValue> {
+        for (tree, span) in self.compilation.declaration_nodes(parameter).to_vec() {
+            let Some(node) = self
+                .compilation
+                .trees()
+                .get(tree)
+                .and_then(|tree| tree.root().find_node(span))
+            else {
+                continue;
+            };
+            for attribute in attributes_for(&node, AttributeTarget::Parameter) {
+                let Some(bound) = self.binder.bind_attribute(tree, &node, &attribute) else {
+                    continue;
+                };
+                let named = bound.ty.symbol().is_some_and(|ty| {
+                    self.compilation.symbols().qualified_name(ty)
+                        == "System.Runtime.InteropServices.DefaultParameterValueAttribute"
+                });
+                if named {
+                    return self.binder.folded(bound.arguments.first()?);
+                }
+            }
+        }
+        None
     }
 
     /// The `In` and `Out` flags `[In]` and `[Out]` written on a parameter
@@ -3046,6 +3107,54 @@ impl Emitter<'_> {
             .add_custom_attribute(parent, ((constructor.0 & 0x00FF_FFFF) << 3) | 3, &blob);
     }
 
+    /// Whether a method of a struct promises not to change the value it is
+    /// called on: what `[IsReadOnly]` says, so that another compiler need not
+    /// copy a `readonly` field or an `in` argument to call it.
+    ///
+    /// A member is one by writing `readonly` on it or on the property or
+    /// event it is an accessor of. The language adds the getter of an
+    /// automatic property and each member of a record struct. In a
+    /// `readonly struct` every member is one, which the type says once.
+    fn is_readonly_method(&self, ty: SymbolId, method: &MethodPlan) -> bool {
+        let symbols = self.compilation.symbols();
+        let owner = symbols.get(ty);
+        if !method.instance
+            || !matches!(
+                owner.type_kind(),
+                Some(TypeKind::Struct | TypeKind::RecordStruct)
+            )
+            || owner.modifiers.contains(Modifiers::READONLY)
+        {
+            return false;
+        }
+        let readonly =
+            |symbol: SymbolId| symbols.get(symbol).modifiers.contains(Modifiers::READONLY);
+        // The property or event an accessor belongs to, which may carry the
+        // modifier for both.
+        let member_readonly = |symbol: SymbolId| {
+            readonly(symbol)
+                || symbols.get(symbol).container.is_some_and(|container| {
+                    matches!(
+                        symbols.get(container).kind,
+                        SymbolKind::Property | SymbolKind::Event
+                    ) && readonly(container)
+                })
+        };
+        match method.source {
+            MethodSource::Declared(symbol)
+            | MethodSource::IteratorStart(MachineKey::Member(symbol))
+            | MethodSource::AsyncStart(MachineKey::Member(symbol)) => member_readonly(symbol),
+            MethodSource::PropertyGetter { property, backing } => {
+                backing
+                    || readonly(property)
+                    || self.accessors_of(property).into_iter().any(readonly)
+            }
+            MethodSource::PropertySetter { property } => readonly(property),
+            MethodSource::RecordMember(_) => true,
+            _ => false,
+        }
+    }
+
     /// The attributes of a method's own row, in the order Roslyn writes
     /// them: `[IsReadOnly]` for a `readonly` member of a struct, its
     /// `[NullableContext]`, the state machine its body became, the marks of
@@ -3095,14 +3204,7 @@ impl Emitter<'_> {
             );
         }
         let written = method.source.written_member();
-        if let Some(symbol) = written
-            && self
-                .compilation
-                .symbols()
-                .get(symbol)
-                .modifiers
-                .contains(Modifiers::READONLY)
-        {
+        if self.is_readonly_method(ty, method) {
             self.mark_with(
                 parent,
                 "System.Runtime.CompilerServices.IsReadOnlyAttribute",
@@ -3110,6 +3212,22 @@ impl Emitter<'_> {
         }
         if let Some(value) = shape.and_then(|shape| shape.context) {
             self.mark_nullable_context(parent, value);
+        }
+        // An instance `+=` (C# 14) is one an older compiler would not
+        // understand as an operator, and is kept from it.
+        if method.name.starts_with("op_") && method.name.ends_with("Assignment") {
+            self.mark_compiler_feature_required(parent, "UserDefinedCompoundAssignmentOperators");
+        }
+        // The stub an `async` method becomes only starts the machine, and
+        // the debugger has nothing in it to step through, in a build made to
+        // be debugged. An async iterator's stub does not carry the mark.
+        if let MethodSource::AsyncStart(key) = method.source
+            && !self.compilation.options().optimize
+            && !self.asyncs.get(&key).is_some_and(|plan| {
+                matches!(plan.kind, crate::async_machine::AsyncKind::Iterator { .. })
+            })
+        {
+            self.mark_with(parent, "System.Diagnostics.DebuggerStepThroughAttribute");
         }
         if let MethodSource::IteratorStart(key) | MethodSource::AsyncStart(key) = method.source {
             self.mark_state_machine(
@@ -3131,11 +3249,25 @@ impl Emitter<'_> {
                 )
                 | MethodSource::AsyncStart(MachineKey::Lambda { .. } | MachineKey::Function { .. })
         );
+        // The setter of an abstract property, or of an interface's, is
+        // only a slot: no body was made for it.
+        let slot = match method.source {
+            MethodSource::PropertySetter { property } => {
+                let symbols = self.compilation.symbols();
+                let symbol = symbols.get(property);
+                symbol.modifiers.contains(Modifiers::ABSTRACT)
+                    || (!symbol.modifiers.contains(Modifiers::STATIC)
+                        && symbol.container.is_some_and(|container| {
+                            symbols.get(container).type_kind() == Some(TypeKind::Interface)
+                        }))
+            }
+            _ => false,
+        };
         let made = (declared_type && closure)
+            || (matches!(method.source, MethodSource::PropertySetter { .. }) && !slot)
             || matches!(
                 method.source,
                 MethodSource::PropertyGetter { backing: true, .. }
-                    | MethodSource::PropertySetter { .. }
                     | MethodSource::EventAccessor { .. }
                     | MethodSource::RecordMember(_)
                     | MethodSource::RecordBaseEquals
@@ -4322,8 +4454,15 @@ impl Emitter<'_> {
         ty: &Type,
         argument: &BoundExpression,
     ) -> Result<bool, EmitError> {
-        let written = written_value(argument);
         let special = self.special_type_of(ty);
+        // A value boxed into an `object` is written as the type it was
+        // before: `(byte)3` is a `byte` in the blob, not the `int` the
+        // literal under the cast is.
+        let written = if special == Some(SpecialType::Object) {
+            self.boxed_value(argument)
+        } else {
+            written_value(argument)
+        };
         if special == Some(SpecialType::Object) {
             // A null boxed is written as a null string.
             if matches!(written.ty, Type::Null) {
@@ -4420,6 +4559,19 @@ impl Emitter<'_> {
         Ok(true)
     }
 
+    /// What an argument written for an `object` holds: the expression
+    /// under the conversions to `object` and nothing under the others.
+    fn boxed_value<'b>(&self, value: &'b BoundExpression) -> &'b BoundExpression {
+        match &value.kind {
+            BoundExpressionKind::Conversion { operand, .. }
+                if self.special_type_of(&value.ty) == Some(SpecialType::Object) =>
+            {
+                self.boxed_value(operand)
+            }
+            _ => value,
+        }
+    }
+
     /// The `FieldOrPropType` of a named argument, or of a value boxed into
     /// an `object` (§II.23.3): an element type for the primitives, `0x50`
     /// for `System.Type`, `0x51` for `object`, `0x1D` and the element for an
@@ -4485,11 +4637,10 @@ impl Emitter<'_> {
         // that declares a `System.Int32` of its own would find that.
         if let Some(reference) = self.home_assembly(ty) {
             let [major, minor, build, revision] = reference.version;
-            let token = if crate::references::is_framework(&reference.name) {
-                "b03f5f7f11d50a3a"
-            } else {
-                "null"
-            };
+            let token = reference.public_key_token.map_or_else(
+                || "null".to_string(),
+                |token| token.iter().map(|byte| format!("{byte:02x}")).collect(),
+            );
             name.push_str(&format!(
                 ", {}, Version={major}.{minor}.{build}.{revision}, Culture=neutral, \
                  PublicKeyToken={token}",
@@ -6825,12 +6976,11 @@ impl Emitter<'_> {
     fn struct_layout(&self, ty: SymbolId) -> Option<StructLayout> {
         let attribute = self.bound_attribute_on(ty, "StructLayout")?;
         let mut layout = StructLayout {
-            // `LayoutKind.Explicit` is 2 (§II.10.1.2).
-            explicit: attribute
+            kind: attribute
                 .arguments
                 .first()
                 .and_then(|kind| folded_integer(self.binder.folded(kind)))
-                == Some(2),
+                .unwrap_or(0),
             ..StructLayout::default()
         };
         for (member, value) in &attribute.named {
@@ -6839,6 +6989,15 @@ impl Emitter<'_> {
             match self.compilation.symbols().get(*member).name.as_str() {
                 "Size" => layout.size = number,
                 "Pack" => layout.pack = number.and_then(|pack| u16::try_from(pack).ok()),
+                // `CharSet.Unicode` is 3 and `Auto` 4; `Ansi` and `None` are
+                // the default of the type's flags.
+                "CharSet" => {
+                    layout.string_format = match number {
+                        Some(3) => type_attributes::UNICODE_CLASS,
+                        Some(4) => type_attributes::AUTO_CLASS,
+                        _ => 0,
+                    };
+                }
                 _ => {}
             }
         }
@@ -6880,6 +7039,7 @@ impl Emitter<'_> {
         let mut library = None;
         let mut entry = symbols.get(method).name.clone();
         let mut flags: u16 = 0x0100;
+        let mut preserve_sig = true;
         for argument in arguments
             .children()
             .filter(|child| child.kind() == SyntaxKind::AttributeArgument)
@@ -6927,6 +7087,25 @@ impl Emitter<'_> {
                 Some("SetLastError") if value.kind() == SyntaxKind::TrueLiteralExpression => {
                     flags |= 0x0040;
                 }
+                // Each of these says "yes" or "no" with a pair of bits, and
+                // saying nothing is neither.
+                Some("BestFitMapping") => {
+                    flags |= match value.kind() {
+                        SyntaxKind::TrueLiteralExpression => 0x0010,
+                        SyntaxKind::FalseLiteralExpression => 0x0020,
+                        _ => 0,
+                    };
+                }
+                Some("ThrowOnUnmappableChar") => {
+                    flags |= match value.kind() {
+                        SyntaxKind::TrueLiteralExpression => 0x1000,
+                        SyntaxKind::FalseLiteralExpression => 0x2000,
+                        _ => 0,
+                    };
+                }
+                Some("PreserveSig") if value.kind() == SyntaxKind::FalseLiteralExpression => {
+                    preserve_sig = false;
+                }
                 Some("ExactSpelling") if value.kind() == SyntaxKind::TrueLiteralExpression => {
                     flags |= 0x0001;
                 }
@@ -6937,6 +7116,7 @@ impl Emitter<'_> {
             library: library?,
             entry,
             flags,
+            preserve_sig,
         })
     }
 
@@ -7803,14 +7983,14 @@ impl Emitter<'_> {
         // `int X { get; }` written in an interface, or after `abstract`, has
         // no body and no field: it *looks* automatic, because an automatic
         // property is written the same way. What tells them apart is where it
-        // sits, not how it reads.
-        let abstract_property = instance
-            && (symbol.modifiers.contains(Modifiers::ABSTRACT)
-                || (interface
-                    && self
-                        .compilation
-                        .interface_member_modifiers(property)
-                        .contains(Modifiers::ABSTRACT)));
+        // sits, not how it reads. A `static abstract` one is a slot as an
+        // instance one is: nothing declares storage for it.
+        let abstract_property = symbol.modifiers.contains(Modifiers::ABSTRACT)
+            || (interface
+                && self
+                    .compilation
+                    .interface_member_modifiers(property)
+                    .contains(Modifiers::ABSTRACT));
         let automatic = !is_indexer
             && !abstract_property
             && !(interface && instance)
@@ -8110,6 +8290,16 @@ impl Emitter<'_> {
         ))
     }
 
+    /// Whether a constructor is the one the language gave its type because
+    /// the source wrote none.
+    pub(crate) fn is_implicit_constructor(&self, constructor: SymbolId) -> bool {
+        self.compilation
+            .symbols()
+            .get(constructor)
+            .as_method()
+            .is_some_and(|method| method.is_implicit)
+    }
+
     fn plan_method(
         &mut self,
         method: SymbolId,
@@ -8200,7 +8390,9 @@ impl Emitter<'_> {
         let mut impl_flags = 0;
         if let Some(import) = self.dll_import(method) {
             flags |= method_attributes::PINVOKE_IMPL;
-            impl_flags |= method_impl::PRESERVE_SIG;
+            if import.preserve_sig {
+                impl_flags |= method_impl::PRESERVE_SIG;
+            }
             self.note_pinvoke(token, import);
         }
         // A record's own members have symbols but no source: what they do
@@ -8892,10 +9084,9 @@ impl Emitter<'_> {
                 // unless `[StructLayout(LayoutKind.Explicit)]` puts each where
                 // its `[FieldOffset]` says.
                 flags |= type_attributes::SEALED;
-                flags |= match self.struct_layout(plan.symbol) {
-                    Some(layout) if layout.explicit => type_attributes::EXPLICIT_LAYOUT,
-                    _ => type_attributes::SEQUENTIAL_LAYOUT,
-                };
+                if self.struct_layout(plan.symbol).is_none() {
+                    flags |= type_attributes::SEQUENTIAL_LAYOUT;
+                }
                 if !declares_static_constructor {
                     flags |= type_attributes::BEFORE_FIELD_INIT;
                 }
@@ -8936,6 +9127,17 @@ impl Emitter<'_> {
             }
             if self.binder.is_com_import(plan.symbol) {
                 flags |= type_attributes::IMPORT;
+            }
+            // `[StructLayout]` is the layout and string-format bits of the
+            // flags on a class as on a struct: `Auto` is the absence of
+            // either layout bit.
+            if let Some(layout) = self.struct_layout(plan.symbol) {
+                flags |= match layout.kind {
+                    0 => type_attributes::SEQUENTIAL_LAYOUT,
+                    2 => type_attributes::EXPLICIT_LAYOUT,
+                    _ => 0,
+                };
+                flags |= layout.string_format;
             }
             // `Box<T>` is `Box`1` in metadata: the arity is part of the name,
             // which is how two types of the same name are told apart.
@@ -10685,6 +10887,48 @@ impl Emitter<'_> {
             }
             return Ok(written);
         }
+        let (value_type, unmanaged) = self
+            .compilation
+            .symbols()
+            .get(parameter)
+            .as_type_parameter()
+            .map_or((false, false), |detail| {
+                (detail.value_type, detail.unmanaged)
+            });
+        // `unmanaged` is `System.ValueType` under a `modreq(UnmanagedType)`,
+        // written ahead of the constraints the source lists, and the
+        // parameter says so again with `[IsUnmanaged]`: that is how a
+        // compiler reading the assembly knows it is not `struct`.
+        if unmanaged {
+            let corlib_value_type = self
+                .references
+                .type_ref_coded(&mut self.metadata, "System.ValueType");
+            let modifier = self.references.type_ref_coded(
+                &mut self.metadata,
+                "System.Runtime.InteropServices.UnmanagedType",
+            );
+            let mut blob = Vec::new();
+            SigType::Required {
+                modifier,
+                inner: Box::new(SigType::Named {
+                    value_type: false,
+                    coded: corlib_value_type,
+                }),
+            }
+            .write(&mut blob);
+            let spec = self.references.type_spec(&mut self.metadata, &blob);
+            self.metadata.add_generic_param_constraint(
+                owner,
+                number,
+                type_def_or_ref(2, spec.0 & 0x00FF_FFFF),
+            );
+            written.push(None);
+            let parent = self.metadata.generic_param_parent(owner, number);
+            self.mark_with(
+                parent,
+                "System.Runtime.CompilerServices.IsUnmanagedAttribute",
+            );
+        }
         for reference in references {
             let mut sink = rustlyn_semantics::Diagnostics::new();
             let ty = self.binder.resolve_type_ref(reference, &mut sink);
@@ -10695,6 +10939,17 @@ impl Emitter<'_> {
             self.metadata
                 .add_generic_param_constraint(owner, number, coded);
             written.push(Some(reference));
+        }
+        // `struct` is a constraint on `System.ValueType` as well as a flag,
+        // last of the rows, and a loader that reads constraints alone finds
+        // the parameter a value type by it.
+        if value_type && !unmanaged {
+            let coded = self
+                .references
+                .type_ref_coded(&mut self.metadata, "System.ValueType");
+            self.metadata
+                .add_generic_param_constraint(owner, number, coded);
+            written.push(None);
         }
         Ok(written)
     }
@@ -11219,6 +11474,44 @@ impl Emitter<'_> {
         }
     }
 
+    /// Whether a planned method is the setter of a property written `init`.
+    fn is_init_setter(&self, source: &MethodSource) -> bool {
+        let symbols = self.compilation.symbols();
+        let property = match source {
+            MethodSource::PropertySetter { property } => *property,
+            MethodSource::Declared(accessor) => {
+                let symbol = symbols.get(*accessor);
+                let is_setter = symbol.as_method().is_some_and(|detail| {
+                    detail.method_kind == rustlyn_semantics::MethodKind::PropertySet
+                });
+                match symbol.container {
+                    Some(container) if is_setter => container,
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        };
+        symbols
+            .get(property)
+            .as_property()
+            .is_some_and(|detail| detail.has_init)
+    }
+
+    /// A setter's return type under the `modreq(IsExternalInit)` that makes
+    /// it init-only: it is all a compiler reading the assembly has to tell
+    /// `init` from `set`, and it is part of the signature the runtime
+    /// matches a call by.
+    fn init_only(&mut self, returns: SigType) -> SigType {
+        let modifier = self.references.type_ref_coded(
+            &mut self.metadata,
+            "System.Runtime.CompilerServices.IsExternalInit",
+        );
+        SigType::Required {
+            modifier,
+            inner: Box::new(returns),
+        }
+    }
+
     fn method_signature_of(&mut self, plan: &MethodPlan) -> Result<Vec<u8>, EmitError> {
         if let Some(signature) = &plan.signature {
             return Ok(signature.clone());
@@ -11260,6 +11553,9 @@ impl Emitter<'_> {
         // `ref readonly T` comes back under a `modreq(InAttribute)`.
         if let Some(member) = self.declared_member(&plan.source) {
             return_type = self.returned_sig(member, return_type);
+        }
+        if self.is_init_setter(&plan.source) {
+            return_type = self.init_only(return_type);
         }
         let mut parameters = Vec::new();
         for parameter in &plan.parameters.clone() {
@@ -12184,6 +12480,10 @@ impl Emitter<'_> {
             )
         };
         let instance = !symbols.get(property).modifiers.contains(Modifiers::STATIC);
+        let init_only = symbols
+            .get(property)
+            .as_property()
+            .is_some_and(|detail| detail.has_init);
 
         let element = self.type_of(property);
         let element = self.sig_type(&element)?;
@@ -12197,11 +12497,18 @@ impl Emitter<'_> {
         let signature = if setter {
             // A setter takes the value last, after any arguments.
             parameters.push(element);
-            method_signature(
-                instance,
-                &SigType::Primitive(ElementType::Void),
-                &parameters,
-            )
+            let void = SigType::Primitive(ElementType::Void);
+            // Whether it is init-only is in its return type: what the
+            // loaded accessor says, or what `init` says of one written here.
+            let returns = match declared_accessor {
+                Some(accessor) => match self.written_modifiers(accessor, 0) {
+                    Some(modifiers) => self.with_modifiers(void, &modifiers),
+                    None => void,
+                },
+                None if init_only => self.init_only(void),
+                None => void,
+            };
+            method_signature(instance, &returns, &parameters)
         } else {
             method_signature(instance, &read, &parameters)
         };
@@ -13910,6 +14217,15 @@ pub(crate) fn method_flags(
     if modifiers.contains(Modifiers::SEALED) {
         flags |= method_attributes::FINAL;
     }
+    // `internal virtual` is overridden by the types that see it and by no
+    // others: without `strict` the runtime lets a type of another assembly
+    // that writes a method of the same name and signature take the slot.
+    if flags & method_attributes::VIRTUAL != 0
+        && flags & method_attributes::FINAL == 0
+        && matches!(accessibility, A::Internal | A::ProtectedAndInternal)
+    {
+        flags |= method_attributes::STRICT;
+    }
     flags
 }
 
@@ -14113,7 +14429,11 @@ fn folded_integer(value: Option<ConstantValue>) -> Option<i64> {
 /// What a `[StructLayout]` says.
 #[derive(Clone, Copy, Debug, Default)]
 struct StructLayout {
-    explicit: bool,
+    /// The `LayoutKind`: 0 sequential, 2 explicit, 3 auto (§II.10.1.2).
+    kind: i64,
+    /// The `CharSet`'s bits of the type's flags: how its strings are
+    /// marshalled by default.
+    string_format: u32,
     size: Option<u32>,
     pack: Option<u16>,
 }
@@ -14124,6 +14444,10 @@ pub(crate) struct DllImport {
     pub(crate) library: String,
     pub(crate) entry: String,
     pub(crate) flags: u16,
+    /// Whether the method keeps the native signature, which is the method
+    /// body's `PreserveSig`: `PreserveSig = false` turns an `HRESULT` into
+    /// an exception.
+    pub(crate) preserve_sig: bool,
 }
 
 /// The last identifier of a name: `CharSet.Unicode` gives `Unicode`, and

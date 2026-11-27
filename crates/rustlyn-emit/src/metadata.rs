@@ -79,6 +79,10 @@ pub(crate) mod type_attributes {
     /// `[ComImport]`, which is one too.
     pub(crate) const IMPORT: u32 = 0x0000_1000;
     pub(crate) const AUTO_LAYOUT_ANSI_CLASS: u32 = 0x0000_0000;
+    /// `CharSet.Unicode`: the string format of the type's flags.
+    pub(crate) const UNICODE_CLASS: u32 = 0x0001_0000;
+    /// `CharSet.Auto`.
+    pub(crate) const AUTO_CLASS: u32 = 0x0002_0000;
 }
 
 /// The `MethodAttributes` of §II.23.1.10.

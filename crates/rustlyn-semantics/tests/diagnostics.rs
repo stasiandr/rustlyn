@@ -2933,3 +2933,205 @@ class Color
 static class X { extension(Color c) { public static int S => 2; } }",
     );
 }
+
+// MARK: - type arguments against constraints
+
+/// The types the constraint tests build on.
+const CONSTRAINED: &str = "interface IFoo { }
+class Foo : IFoo { }
+class Bar { }
+struct SFoo : IFoo { }
+struct SBar { }
+class Base { }
+class Derived : Base { }
+class OnInterface<T> where T : IFoo { }
+class OnClass<T> where T : class { }
+class OnStruct<T> where T : struct { }
+class OnBase<T> where T : Base { }
+class OnBoth<T, U> where U : T { }
+interface IAdd<T> where T : IAdd<T> { static abstract T operator +(T a, T b); }
+struct Money : IAdd<Money> { public static Money operator +(Money a, Money b) => a; }
+static class Calls
+{
+    public static T Make<T>() where T : IFoo => default;
+    public static T Ref<T>() where T : class => default;
+    public static T Val<T>() where T : struct => default;
+    public static T Add<T>(T a, T b) where T : IAdd<T> => a + b;
+    public static T Either<T>(T a) where T : IFoo => a;
+    public static T Either<T>(T a, int n) where T : class => a;
+}
+";
+
+/// The constraint diagnostics of a source, as `diagnose` words them.
+fn constraint_errors(source: &str) -> Vec<String> {
+    diagnose(source)
+        .into_iter()
+        .filter(|line| {
+            ["CS0311", "CS0315", "CS0452", "CS0453"]
+                .iter()
+                .any(|code| line.starts_with(code))
+        })
+        .collect()
+}
+
+#[test]
+fn a_type_argument_that_does_not_convert_to_its_constraint_is_cs0311_and_cs0315() {
+    let source = format!(
+        "{CONSTRAINED}class P {{ void M() {{
+    OnInterface<Bar> a = null;
+    OnInterface<SBar> b = null;
+    OnBase<Bar> c = null;
+    OnBoth<Base, Bar> d = null;
+    var e = new OnInterface<Bar>();
+    var f = typeof(OnInterface<SBar>);
+    var g = new System.Collections.Generic.List<OnInterface<Bar>>();
+}} }}"
+    );
+    assert_eq!(
+        constraint_errors(&source),
+        [
+            "CS0311 'Bar': The type 'Bar' cannot be used as type parameter 'T' in the generic type or method 'OnInterface<T>'. There is no implicit reference conversion from 'Bar' to 'IFoo'.",
+            "CS0315 'SBar': The type 'SBar' cannot be used as type parameter 'T' in the generic type or method 'OnInterface<T>'. There is no boxing conversion from 'SBar' to 'IFoo'.",
+            "CS0311 'Bar': The type 'Bar' cannot be used as type parameter 'T' in the generic type or method 'OnBase<T>'. There is no implicit reference conversion from 'Bar' to 'Base'.",
+            "CS0311 'Bar': The type 'Bar' cannot be used as type parameter 'U' in the generic type or method 'OnBoth<T, U>'. There is no implicit reference conversion from 'Bar' to 'Base'.",
+            "CS0311 'Bar': The type 'Bar' cannot be used as type parameter 'T' in the generic type or method 'OnInterface<T>'. There is no implicit reference conversion from 'Bar' to 'IFoo'.",
+            "CS0315 'SBar': The type 'SBar' cannot be used as type parameter 'T' in the generic type or method 'OnInterface<T>'. There is no boxing conversion from 'SBar' to 'IFoo'.",
+            "CS0311 'Bar': The type 'Bar' cannot be used as type parameter 'T' in the generic type or method 'OnInterface<T>'. There is no implicit reference conversion from 'Bar' to 'IFoo'.",
+        ]
+    );
+}
+
+#[test]
+fn a_class_or_struct_constraint_given_the_wrong_kind_of_type_is_cs0452_and_cs0453() {
+    let source = format!(
+        "{CONSTRAINED}class P {{ void M() {{
+    OnClass<int> a = null;
+    OnStruct<string> b = null;
+    OnStruct<int?> c = null;
+    OnClass<SFoo> d = null;
+}} }}"
+    );
+    assert_eq!(
+        constraint_errors(&source),
+        [
+            "CS0452 'int': The type 'int' must be a reference type in order to use it as parameter 'T' in the generic type or method 'OnClass<T>'",
+            "CS0453 'string': The type 'string' must be a non-nullable value type in order to use it as parameter 'T' in the generic type or method 'OnStruct<T>'",
+            "CS0453 'int?': The type 'int?' must be a non-nullable value type in order to use it as parameter 'T' in the generic type or method 'OnStruct<T>'",
+            "CS0452 'SFoo': The type 'SFoo' must be a reference type in order to use it as parameter 'T' in the generic type or method 'OnClass<T>'",
+        ]
+    );
+}
+
+#[test]
+fn a_generic_method_called_with_a_type_that_breaks_its_constraint_reports_at_its_name() {
+    // `string` has no `+` of its own to be an `IAdd<string>`: this call was
+    // accepted, and the program it made was one the runtime refused to run.
+    let source = format!(
+        "{CONSTRAINED}class P {{ void M() {{
+    var a = Calls.Make<Bar>();
+    var b = Calls.Ref<int>();
+    var c = Calls.Val<string>();
+    var d = Calls.Add<string>(\"a\", \"b\");
+    var e = Calls.Add(\"a\", \"b\");
+}} }}"
+    );
+    assert_eq!(
+        constraint_errors(&source),
+        [
+            "CS0311 'Make<Bar>': The type 'Bar' cannot be used as type parameter 'T' in the generic type or method 'Calls.Make<T>()'. There is no implicit reference conversion from 'Bar' to 'IFoo'.",
+            "CS0452 'Ref<int>': The type 'int' must be a reference type in order to use it as parameter 'T' in the generic type or method 'Calls.Ref<T>()'",
+            "CS0453 'Val<string>': The type 'string' must be a non-nullable value type in order to use it as parameter 'T' in the generic type or method 'Calls.Val<T>()'",
+            "CS0311 'Add<string>': The type 'string' cannot be used as type parameter 'T' in the generic type or method 'Calls.Add<T>(T, T)'. There is no implicit reference conversion from 'string' to 'IAdd<string>'.",
+            "CS0311 'Add': The type 'string' cannot be used as type parameter 'T' in the generic type or method 'Calls.Add<T>(T, T)'. There is no implicit reference conversion from 'string' to 'IAdd<string>'.",
+        ]
+    );
+}
+
+#[test]
+fn a_constraint_broken_in_a_signature_is_reported_at_the_name_the_signature_belongs_to() {
+    let source = format!(
+        "{CONSTRAINED}class P : OnClass<int>
+{{
+    void Take(OnInterface<Bar> p) {{ }}
+    OnClass<int> Give() => null;
+    OnInterface<Bar> field;
+    OnStruct<string> first, second;
+}}
+interface IKeep<T> where T : OnInterface<Bar> {{ }}"
+    );
+    let found: Vec<String> = constraint_errors(&source)
+        .into_iter()
+        .map(|line| line[..line.find(':').unwrap()].to_string())
+        .collect();
+    assert_eq!(
+        found,
+        [
+            "CS0452 'P'",
+            "CS0311 'p'",
+            "CS0452 'Give'",
+            "CS0311 'field'",
+            "CS0453 'first'",
+            "CS0453 'second'",
+            "CS0311 'T'",
+        ]
+    );
+}
+
+#[test]
+fn type_arguments_that_meet_their_constraints_are_quiet() {
+    // The locals are only there to hold a type: what is left to say about them
+    // is that nothing reads them.
+    let found = diagnose(&format!(
+        "{CONSTRAINED}class Holder<T> where T : IFoo {{ OnInterface<T> inner; }}
+class Chain<T> where T : Chain<T> {{ }}
+class Node : Chain<Node> {{ }}
+class P
+{{
+    static void Use<T>() where T : class, IFoo {{ OnInterface<T> a = null; OnClass<T> b = null; }}
+    void M()
+    {{
+        OnInterface<Foo> a = null; OnInterface<SFoo> b = null; OnInterface<IFoo> c = null;
+        OnClass<string> d = null; OnClass<int[]> e = null; OnClass<IFoo> f = null;
+        OnStruct<int> g = null; OnStruct<SBar> h = null; OnBase<Derived> i = null;
+        OnBoth<Base, Derived> j = null; OnBoth<IFoo, Foo> k = null;
+        var m = Calls.Make<Foo>(); var n = Calls.Ref<string>(); var o = Calls.Val<int>();
+        var p = Calls.Add<Money>(new Money(), new Money()); var q = Calls.Add(new Money(), new Money());
+        var r = Calls.Either(new Foo()); var s = Calls.Either(new Bar(), 1);
+        var t = new OnInterface<SFoo>(); var u = typeof(OnClass<object>);
+    }}
+}}"
+    ));
+    assert!(
+        found.iter().all(|line| line.starts_with("CS0219")),
+        "expected nothing but unused variables, found {found:#?}"
+    );
+}
+
+#[test]
+fn a_constraint_broken_in_top_level_statements_and_in_a_member_is_reported_once_each() {
+    let source = format!(
+        "var a = new OnInterface<Bar>();
+{CONSTRAINED}class Q {{ void M() {{ var b = new OnInterface<Bar>(); }} }}"
+    );
+    let found = constraint_errors(&source);
+    assert_eq!(found.len(), 2, "{found:#?}");
+    assert!(found.iter().all(|line| line.starts_with("CS0311 'Bar'")));
+}
+
+#[test]
+fn a_candidate_whose_written_type_arguments_break_its_constraint_is_none_while_another_is_left() {
+    // `Take<Bar>(null)` is the `object` overload: the one for `OnInterface<T>`
+    // needs `Bar` to be an `IFoo`, so it is no candidate. Alone, it is an error.
+    let source = format!(
+        "{CONSTRAINED}static class Pick
+{{
+    public static void Take<T>(object x) {{ }}
+    public static void Take<T>(OnInterface<T> x) where T : IFoo {{ }}
+    public static void Only<T>(OnInterface<T> x) where T : IFoo {{ }}
+}}
+class P {{ void M() {{ Pick.Take<Bar>(null); Pick.Take<Foo>(null); Pick.Only<Bar>(null); }} }}"
+    );
+    let found = constraint_errors(&source);
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert!(found[0].starts_with("CS0311 'Only<Bar>'"), "{found:#?}");
+}

@@ -26159,3 +26159,570 @@ public static class Ops {
         "[+]3\n[-]-1\n[checked +]3\n[+=]31\n[--]26\n[++]27\n[++]27 28\n[==]False\n[!=]True\n[true]true\n[false][&]0\n[false]0\n[+]30\n[Box+String]s\n",
     );
 }
+
+/// `[StructLayout]` is the layout and string-format bits of the type's flags
+/// and a `ClassLayout` row, `[FieldOffset]` a `FieldLayout` row, `[MarshalAs]`
+/// a `FieldMarshal` row, and `[DllImport]`'s options bits of its `ImplMap`
+/// row: none of them is an attribute on the type or member, and a program that
+/// asks `Marshal` for a size or an offset gets what the flags and rows say.
+/// The charset, `Auto` layout and `Pack` were lost, `[DefaultParameterValue]`
+/// without `[Optional]` wrote no default and `PreserveSig = false` kept the
+/// native signature.
+#[test]
+fn struct_and_class_layout_charset_pack_size_offsets_and_marshalling_reach_the_metadata() {
+    check(
+        "struct_and_class_layout_charset_pack_size_offsets_and_marshalling_reach_the_metadata",
+        r##"using System;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
+using System.Security.Permissions;
+
+[StructLayout(LayoutKind.Sequential, Pack = 1, CharSet = CharSet.Unicode)] public struct Pk { public byte A; public int B; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 8)] public string S; }
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)] public struct Pa { public byte A; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 8)] public string S; }
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode, Size = 64)] public struct Ps { public char C; }
+[StructLayout(LayoutKind.Auto)] public struct Au { public int A; }
+[StructLayout(LayoutKind.Explicit, Size = 16, Pack = 4)] public struct Ex { [FieldOffset(0)] public int A; [FieldOffset(4)] public long B; [FieldOffset(8)] public byte C; }
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto, Pack = 2)] public class Cl { public short A; public int B; }
+[StructLayout(LayoutKind.Auto)] public class ClAuto { public short A; public int B; }
+[StructLayout(LayoutKind.Sequential, Pack = 8, Size = 40)] public struct Pz { public int A; }
+[StructLayout(LayoutKind.Sequential, Pack = 16)] public struct P16 { public byte A; public double B; }
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.None)] public struct CNone { public int A; }
+[StructLayout(LayoutKind.Sequential)] public struct Plain { public int A; public byte B; }
+public struct Marsh {
+  [MarshalAs(UnmanagedType.I1)] public bool B1;
+  [MarshalAs(UnmanagedType.Bool)] public bool B2;
+  [MarshalAs(UnmanagedType.U1)] public byte U;
+  [MarshalAs(UnmanagedType.LPStr)] public string S1;
+  [MarshalAs(UnmanagedType.LPWStr)] public string S2;
+  [MarshalAs(UnmanagedType.LPTStr)] public string S3;
+  [MarshalAs(UnmanagedType.BStr)] public string S4;
+  [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)] public int[] Arr;
+  [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4, ArraySubType = UnmanagedType.U2)] public ushort[] Arr2;
+  [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 16)] public string Tstr;
+  [MarshalAs(UnmanagedType.SysInt)] public IntPtr Ip;
+  [MarshalAs(UnmanagedType.FunctionPtr)] public Action Fp;
+  [MarshalAs(UnmanagedType.Interface)] public object Obj;
+  [MarshalAs(UnmanagedType.Struct)] public object Obj2;
+  [MarshalAs(UnmanagedType.VariantBool)] public bool Vb;
+  [MarshalAs(UnmanagedType.R4)] public float F;
+  [MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 3)] public int[] La;
+  [MarshalAs(UnmanagedType.CustomMarshaler, MarshalType = "My.Marshaler", MarshalCookie = "ck")] public object Cm;
+  [MarshalAs(UnmanagedType.SafeArray, SafeArraySubType = VarEnum.VT_I4)] public Array Sa;
+  [MarshalAs((short)5)] public int Short;
+}
+[ComImport, Guid("00000000-0000-0000-C000-000000000046")] public interface IUnk { void M(); }
+[ComImport, Guid("00000000-0000-0000-C000-000000000047")] public class CoThing { }
+[Serializable] public class Ser { [NonSerialized] public int N; public int M; }
+[Serializable] public struct SerS { public int A; }
+[Serializable] public enum SerE { A }
+[Serializable] public delegate void SerD();
+public class Imp {
+  [DllImport("libc", CharSet = CharSet.Ansi, EntryPoint = "getpid", SetLastError = true, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true, BestFitMapping = false, ThrowOnUnmappableChar = true, PreserveSig = true)] public static extern int GetPid();
+  [DllImport("libc", EntryPoint = "puts")] public static extern int Puts([In, MarshalAs(UnmanagedType.LPStr)] string s);
+  [DllImport("libc", CharSet = CharSet.Unicode)] public static extern int wcslen([MarshalAs(UnmanagedType.LPWStr)] string s);
+  [DllImport("libc", CharSet = CharSet.Auto, PreserveSig = false)] public static extern void NoPreserve();
+  [DllImport("libc", CallingConvention = CallingConvention.StdCall)] public static extern int Std();
+  [DllImport("libc", CallingConvention = CallingConvention.ThisCall)] public static extern int This();
+  [DllImport("libc", CallingConvention = CallingConvention.FastCall)] public static extern int Fast();
+  [DllImport("libc", CallingConvention = CallingConvention.Winapi)] public static extern int Win();
+  [DllImport("libc")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool Ret();
+  [DllImport("libc", BestFitMapping = true)] public static extern int Bf();
+  [DllImport("libc", ThrowOnUnmappableChar = false)] public static extern int Th();
+  [DllImport("libc", CharSet = CharSet.None)] public static extern int Cn();
+  [DllImport("libc", EntryPoint = "#12")] public static extern int Ord();
+  public void Params([In] int[] a, [Out] int[] b, [In, Out] int[] c, [Optional] object o, [Optional, DefaultParameterValue(5)] int d, [DefaultParameterValue("x")] string s, [MarshalAs(UnmanagedType.IUnknown)] object u = null) { }
+  [MethodImpl(MethodImplOptions.NoInlining)] public void NoInl() { }
+  [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)] public void Agg() { }
+  [MethodImpl(MethodImplOptions.Synchronized)] public void Sync() { }
+  [MethodImpl(MethodImplOptions.PreserveSig)] public void Pres() { }
+  [MethodImpl(MethodImplOptions.NoOptimization)] public void NoOpt() { }
+  [MethodImpl((MethodImplOptions)0x200)] public void Raw() { }
+  public int Prop { [MethodImpl(MethodImplOptions.AggressiveInlining)] get; set; }
+  [SpecialName] public void Special() { }
+  [SpecialName] public int SpecialField;
+  [SpecialName] public class SpecialNested { }
+  [SpecialName] public struct SpecialStruct { }
+  [SpecialName] public int SpecialProp { get; set; }
+  [SpecialName] public event Action SpecialEv;
+  [PreserveSig] public void PS() { }
+  [return: MarshalAs(UnmanagedType.I1)] public bool RetM() => true;
+  public void DefaultVals([DefaultParameterValue(null)] object o) { }
+}
+[Serializable, StructLayout(LayoutKind.Sequential)] public struct Both { public int A; }
+[StructLayout(LayoutKind.Explicit)] public struct Un { [FieldOffset(0)] public int A; [FieldOffset(0)] public float B; [FieldOffset(4)] [MarshalAs(UnmanagedType.I1)] public bool C; }
+[StructLayout(LayoutKind.Explicit)] public class UnC { [FieldOffset(8)] public int A; [FieldOffset(0)] public long B; }
+public class G<T> { [StructLayout(LayoutKind.Sequential, Pack = 2)] public struct Inner { public byte A; public int B; } }
+
+class P {
+  static string Mod(Type[] t) => string.Join(",", t.Select(x => x.Name));
+  static void Main() {
+    foreach (var t in new[] { typeof(Pk), typeof(Pa), typeof(Ps), typeof(Au), typeof(Ex), typeof(Cl), typeof(ClAuto), typeof(Pz), typeof(P16), typeof(CNone), typeof(Plain), typeof(Marsh), typeof(Both), typeof(Un), typeof(UnC), typeof(Ser), typeof(SerS), typeof(SerE), typeof(SerD), typeof(Imp), typeof(G<>.Inner) }) {
+      var sl = t.StructLayoutAttribute;
+      Console.WriteLine(t.Name + " " + t.Attributes + " layout=" + sl.Value + " pack=" + sl.Pack + " size=" + sl.Size + " charset=" + sl.CharSet + " attrs=" + string.Join(",", t.GetCustomAttributesData().Select(a => a.AttributeType.Name).OrderBy(x => x)));
+      foreach (var f in t.GetFields(BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic).OrderBy(f => f.Name)) {
+        var cad = string.Join(",", f.GetCustomAttributesData().Select(a => a.AttributeType.Name).OrderBy(x => x));
+        var off = t.IsExplicitLayout ? ((FieldOffsetAttribute)f.GetCustomAttribute(typeof(FieldOffsetAttribute)))?.Value.ToString() : "-";
+        var ma = f.GetCustomAttribute<MarshalAsAttribute>();
+        Console.WriteLine("  " + f.Name + " " + f.Attributes + " off=" + off + " attrs=" + cad + (ma == null ? "" : " ma=" + ma.Value + "/" + ma.SizeConst + "/" + ma.ArraySubType + "/" + ma.SizeParamIndex + "/" + ma.SafeArraySubType + "/" + ma.MarshalType + "/" + ma.MarshalCookie + "/" + ma.IidParameterIndex));
+      }
+    }
+    foreach (var m in typeof(Imp).GetMethods(BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.DeclaredOnly).OrderBy(m => m.Name)) {
+      var di = m.GetCustomAttribute<DllImportAttribute>();
+      var rm = m.ReturnParameter.GetCustomAttribute<MarshalAsAttribute>();
+      Console.WriteLine(m.Name + " " + m.Attributes + " impl=" + m.GetMethodImplementationFlags() + " attrs=" + string.Join(",", m.GetCustomAttributesData().Select(a => a.AttributeType.Name).OrderBy(x => x)) +
+        (di == null ? "" : " dll=" + di.Value + "/" + di.EntryPoint + "/" + di.CharSet + "/" + di.SetLastError + "/" + di.CallingConvention + "/" + di.ExactSpelling + "/" + di.BestFitMapping + "/" + di.ThrowOnUnmappableChar + "/" + di.PreserveSig) +
+        (rm == null ? "" : " ret=" + rm.Value));
+      foreach (var p in m.GetParameters()) {
+        var ma = p.GetCustomAttribute<MarshalAsAttribute>();
+        Console.WriteLine("    " + p.Name + " " + p.Attributes + " def=" + (p.HasDefaultValue ? p.RawDefaultValue ?? "null" : "-") + " attrs=" + string.Join(",", p.GetCustomAttributesData().Select(a => a.AttributeType.Name).OrderBy(x => x)) + (ma == null ? "" : " ma=" + ma.Value));
+      }
+    }
+    foreach (var t in new[] { typeof(Imp.SpecialNested), typeof(Imp.SpecialStruct) }) Console.WriteLine(t.Name + " " + t.Attributes + " " + string.Join(",", t.GetCustomAttributesData().Select(a => a.AttributeType.Name)));
+    var ev = typeof(Imp).GetEvent("SpecialEv"); Console.WriteLine(ev.Attributes + " " + string.Join(",", ev.GetCustomAttributesData().Select(a => a.AttributeType.Name)));
+    var pr = typeof(Imp).GetProperty("SpecialProp"); Console.WriteLine(pr.Attributes + " " + string.Join(",", pr.GetCustomAttributesData().Select(a => a.AttributeType.Name)));
+    Console.WriteLine(Marshal.SizeOf<Pk>() + " " + Marshal.SizeOf<Pa>() + " " + Marshal.SizeOf<Ps>() + " " + Marshal.SizeOf<Ex>() + " " + Marshal.SizeOf<Pz>() + " " + Marshal.SizeOf<P16>() + " " + Marshal.SizeOf<Plain>() + " " + Marshal.SizeOf<Un>());
+    Console.WriteLine(Marshal.OffsetOf<Pk>("B") + " " + Marshal.OffsetOf<Pk>("S") + " " + Marshal.OffsetOf<Pa>("S") + " " + Marshal.OffsetOf<Ex>("B") + " " + Marshal.OffsetOf<Ex>("C") + " " + Marshal.OffsetOf<Un>("C") + " " + Marshal.OffsetOf<P16>("B"));
+    try { Console.WriteLine(Marshal.SizeOf<Marsh>()); } catch (Exception e) { Console.WriteLine(e.GetType().Name); }
+  }
+}
+"##,
+        r"Pk Public, SequentialLayout, Sealed, UnicodeClass, BeforeFieldInit layout=Sequential pack=1 size=0 charset=Unicode attrs=
+  A Public off=- attrs=
+  B Public off=- attrs=
+  S Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=ByValTStr/8/0/0/VT_EMPTY///0
+Pa Public, SequentialLayout, Sealed, BeforeFieldInit layout=Sequential pack=0 size=0 charset=Ansi attrs=
+  A Public off=- attrs=
+  S Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=ByValTStr/8/0/0/VT_EMPTY///0
+Ps Public, SequentialLayout, Sealed, UnicodeClass, BeforeFieldInit layout=Sequential pack=0 size=64 charset=Unicode attrs=
+  C Public off=- attrs=
+Au Public, Sealed, BeforeFieldInit layout=Auto pack=0 size=0 charset=Ansi attrs=
+  A Public off=- attrs=
+Ex Public, ExplicitLayout, Sealed, BeforeFieldInit layout=Explicit pack=4 size=16 charset=Ansi attrs=
+  A Public off=0 attrs=FieldOffsetAttribute
+  B Public off=4 attrs=FieldOffsetAttribute
+  C Public off=8 attrs=FieldOffsetAttribute
+Cl Public, SequentialLayout, AutoClass, BeforeFieldInit layout=Sequential pack=2 size=0 charset=Auto attrs=
+  A Public off=- attrs=
+  B Public off=- attrs=
+ClAuto Public, BeforeFieldInit layout=Auto pack=0 size=0 charset=Ansi attrs=
+  A Public off=- attrs=
+  B Public off=- attrs=
+Pz Public, SequentialLayout, Sealed, BeforeFieldInit layout=Sequential pack=8 size=40 charset=Ansi attrs=
+  A Public off=- attrs=
+P16 Public, SequentialLayout, Sealed, BeforeFieldInit layout=Sequential pack=16 size=0 charset=Ansi attrs=
+  A Public off=- attrs=
+  B Public off=- attrs=
+CNone Public, SequentialLayout, Sealed, BeforeFieldInit layout=Sequential pack=0 size=0 charset=Ansi attrs=
+  A Public off=- attrs=
+Plain Public, SequentialLayout, Sealed, BeforeFieldInit layout=Sequential pack=0 size=0 charset=Ansi attrs=
+  A Public off=- attrs=
+  B Public off=- attrs=
+Marsh Public, SequentialLayout, Sealed, BeforeFieldInit layout=Sequential pack=0 size=0 charset=Ansi attrs=
+  Arr Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=ByValArray/4/0/0/VT_EMPTY///0
+  Arr2 Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=ByValArray/4/U2/0/VT_EMPTY///0
+  B1 Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=I1/0/0/0/VT_EMPTY///0
+  B2 Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=Bool/0/0/0/VT_EMPTY///0
+  Cm Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=CustomMarshaler/0/0/0/VT_EMPTY/My.Marshaler/ck/0
+  F Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=R4/0/0/0/VT_EMPTY///0
+  Fp Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=FunctionPtr/0/0/0/VT_EMPTY///0
+  Ip Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=SysInt/0/0/0/VT_EMPTY///0
+  La Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=LPArray/0/80/3/VT_EMPTY///0
+  Obj Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=Interface/0/0/0/VT_EMPTY///0
+  Obj2 Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=Struct/0/0/0/VT_EMPTY///0
+  S1 Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=LPStr/0/0/0/VT_EMPTY///0
+  S2 Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=LPWStr/0/0/0/VT_EMPTY///0
+  S3 Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=LPTStr/0/0/0/VT_EMPTY///0
+  S4 Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=BStr/0/0/0/VT_EMPTY///0
+  Sa Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=SafeArray/0/0/0/VT_EMPTY///0
+  Short Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=I2/0/0/0/VT_EMPTY///0
+  Tstr Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=ByValTStr/16/0/0/VT_EMPTY///0
+  U Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=U1/0/0/0/VT_EMPTY///0
+  Vb Public, HasFieldMarshal off=- attrs=MarshalAsAttribute ma=VariantBool/0/0/0/VT_EMPTY///0
+Both Public, SequentialLayout, Sealed, Serializable, BeforeFieldInit layout=Sequential pack=0 size=0 charset=Ansi attrs=SerializableAttribute
+  A Public off=- attrs=
+Un Public, ExplicitLayout, Sealed, BeforeFieldInit layout=Explicit pack=0 size=0 charset=Ansi attrs=
+  A Public off=0 attrs=FieldOffsetAttribute
+  B Public off=0 attrs=FieldOffsetAttribute
+  C Public, HasFieldMarshal off=4 attrs=FieldOffsetAttribute,MarshalAsAttribute ma=I1/0/0/0/VT_EMPTY///0
+UnC Public, ExplicitLayout, BeforeFieldInit layout=Explicit pack=0 size=0 charset=Ansi attrs=
+  A Public off=8 attrs=FieldOffsetAttribute
+  B Public off=0 attrs=FieldOffsetAttribute
+Ser Public, Serializable, BeforeFieldInit layout=Auto pack=0 size=0 charset=Ansi attrs=SerializableAttribute
+  M Public off=- attrs=
+  N Public, NotSerialized off=- attrs=NonSerializedAttribute
+SerS Public, SequentialLayout, Sealed, Serializable, BeforeFieldInit layout=Sequential pack=0 size=0 charset=Ansi attrs=SerializableAttribute
+  A Public off=- attrs=
+SerE Public, Sealed, Serializable layout=Auto pack=0 size=0 charset=Ansi attrs=SerializableAttribute
+  A Public, Static, Literal, HasDefault off=- attrs=
+  value__ Public, SpecialName, RTSpecialName off=- attrs=
+SerD Public, Sealed, Serializable layout=Auto pack=0 size=0 charset=Ansi attrs=SerializableAttribute
+  _methodBase Assembly off=- attrs=
+  _methodPtr Assembly off=- attrs=
+  _methodPtrAux Assembly off=- attrs=
+  _target Assembly off=- attrs=
+Imp Public, BeforeFieldInit layout=Auto pack=0 size=0 charset=Ansi attrs=
+  <Prop>k__BackingField Private off=- attrs=CompilerGeneratedAttribute,DebuggerBrowsableAttribute
+  <SpecialProp>k__BackingField Private off=- attrs=CompilerGeneratedAttribute,DebuggerBrowsableAttribute
+  SpecialEv Private off=- attrs=CompilerGeneratedAttribute,DebuggerBrowsableAttribute
+  SpecialField Public, SpecialName off=- attrs=
+Inner NestedPublic, SequentialLayout, Sealed, BeforeFieldInit layout=Sequential pack=2 size=0 charset=Ansi attrs=
+  A Public off=- attrs=
+  B Public off=- attrs=
+add_SpecialEv Public, HideBySig, SpecialName impl=IL attrs=CompilerGeneratedAttribute
+    value None def=- attrs=
+Agg Public, HideBySig impl=768 attrs=
+Bf Public, Static, HideBySig, PinvokeImpl impl=PreserveSig attrs=DllImportAttribute,PreserveSigAttribute dll=libc/Bf/None/False/Winapi/False/True/False/True
+Cn Public, Static, HideBySig, PinvokeImpl impl=PreserveSig attrs=DllImportAttribute,PreserveSigAttribute dll=libc/Cn/None/False/Winapi/False/False/False/True
+DefaultVals Public, HideBySig impl=IL attrs=
+    o HasDefault def=null attrs=
+Fast Public, Static, HideBySig, PinvokeImpl impl=PreserveSig attrs=DllImportAttribute,PreserveSigAttribute dll=libc/Fast/None/False/FastCall/False/False/False/True
+get_Prop Public, HideBySig, SpecialName impl=AggressiveInlining attrs=CompilerGeneratedAttribute
+get_SpecialProp Public, HideBySig, SpecialName impl=IL attrs=CompilerGeneratedAttribute
+GetPid Public, Static, HideBySig, PinvokeImpl impl=PreserveSig attrs=DllImportAttribute,PreserveSigAttribute dll=libc/getpid/Ansi/True/Cdecl/True/False/True/True
+NoInl Public, HideBySig impl=NoInlining attrs=
+NoOpt Public, HideBySig impl=NoOptimization attrs=
+NoPreserve Public, Static, HideBySig, PinvokeImpl impl=IL attrs=DllImportAttribute dll=libc/NoPreserve/Auto/False/Winapi/False/False/False/False
+Ord Public, Static, HideBySig, PinvokeImpl impl=PreserveSig attrs=DllImportAttribute,PreserveSigAttribute dll=libc/#12/None/False/Winapi/False/False/False/True
+Params Public, HideBySig impl=IL attrs=
+    a In def=- attrs=InAttribute
+    b Out def=- attrs=OutAttribute
+    c In, Out def=- attrs=InAttribute,OutAttribute
+    o Optional def=- attrs=OptionalAttribute
+    d Optional, HasDefault def=5 attrs=OptionalAttribute
+    s HasDefault def=x attrs=
+    u Optional, HasDefault, HasFieldMarshal def=null attrs=MarshalAsAttribute,OptionalAttribute ma=IUnknown
+Pres Public, HideBySig impl=PreserveSig attrs=PreserveSigAttribute
+PS Public, HideBySig impl=PreserveSig attrs=PreserveSigAttribute
+Puts Public, Static, HideBySig, PinvokeImpl impl=PreserveSig attrs=DllImportAttribute,PreserveSigAttribute dll=libc/puts/None/False/Winapi/False/False/False/True
+    s In, HasFieldMarshal def=- attrs=InAttribute,MarshalAsAttribute ma=LPStr
+Raw Public, HideBySig impl=AggressiveOptimization attrs=
+remove_SpecialEv Public, HideBySig, SpecialName impl=IL attrs=CompilerGeneratedAttribute
+    value None def=- attrs=
+Ret Public, Static, HideBySig, PinvokeImpl impl=PreserveSig attrs=DllImportAttribute,PreserveSigAttribute dll=libc/Ret/None/False/Winapi/False/False/False/True ret=Bool
+RetM Public, HideBySig impl=IL attrs= ret=I1
+set_Prop Public, HideBySig, SpecialName impl=IL attrs=CompilerGeneratedAttribute
+    value None def=- attrs=
+set_SpecialProp Public, HideBySig, SpecialName impl=IL attrs=CompilerGeneratedAttribute
+    value None def=- attrs=
+Special Public, HideBySig, SpecialName impl=IL attrs=
+Std Public, Static, HideBySig, PinvokeImpl impl=PreserveSig attrs=DllImportAttribute,PreserveSigAttribute dll=libc/Std/None/False/StdCall/False/False/False/True
+Sync Public, HideBySig impl=Synchronized attrs=
+Th Public, Static, HideBySig, PinvokeImpl impl=PreserveSig attrs=DllImportAttribute,PreserveSigAttribute dll=libc/Th/None/False/Winapi/False/False/False/True
+This Public, Static, HideBySig, PinvokeImpl impl=PreserveSig attrs=DllImportAttribute,PreserveSigAttribute dll=libc/This/None/False/ThisCall/False/False/False/True
+wcslen Public, Static, HideBySig, PinvokeImpl impl=PreserveSig attrs=DllImportAttribute,PreserveSigAttribute dll=libc/wcslen/Unicode/False/Winapi/False/False/False/True
+    s HasFieldMarshal def=- attrs=MarshalAsAttribute ma=LPWStr
+Win Public, Static, HideBySig, PinvokeImpl impl=PreserveSig attrs=DllImportAttribute,PreserveSigAttribute dll=libc/Win/None/False/Winapi/False/False/False/True
+SpecialNested NestedPublic, SpecialName, BeforeFieldInit 
+SpecialStruct NestedPublic, SequentialLayout, Sealed, SpecialName, BeforeFieldInit 
+SpecialName 
+SpecialName 
+21 9 64 16 40 16 8 8
+1 5 1 4 8 4 8
+ArgumentException
+",
+    );
+}
+
+/// A struct has no constructor but the ones its source declares and a static
+/// class none at all: it is `abstract sealed`, and `Activator` cannot make
+/// one. A parameterless one was written for each.
+#[test]
+fn a_struct_and_a_static_class_have_no_constructor_they_did_not_declare() {
+    check(
+        "a_struct_and_a_static_class_have_no_constructor_they_did_not_declare",
+        r#"using System;
+using System.Linq;
+using System.Reflection;
+static class SC { public static int X; }
+struct S { public int A; }
+struct S2 { public int A; public S2(int a) { A = a; } }
+enum E { A }
+interface I { }
+abstract class AC { }
+class P { static void Main() {
+  foreach (var t in new[] { typeof(SC), typeof(S), typeof(S2), typeof(E), typeof(I), typeof(AC), typeof(Action), typeof(Func<int>) }) Console.WriteLine(t.Name + ": " + string.Join(" | ", t.GetConstructors(BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic).Select(c => c.ToString() + " " + c.Attributes)));
+  try { Activator.CreateInstance(typeof(SC)); Console.WriteLine("created static class"); } catch (Exception e) { Console.WriteLine(e.GetType().Name); }
+}}
+"#,
+        r"SC: 
+S: 
+S2: Void .ctor(Int32) Public, HideBySig, SpecialName, RTSpecialName
+E: 
+I: 
+AC: Void .ctor() Family, HideBySig, SpecialName, RTSpecialName
+Action: Void .ctor(System.Object, IntPtr) Public, HideBySig, SpecialName, RTSpecialName
+Func`1: Void .ctor(System.Object, IntPtr) Public, HideBySig, SpecialName, RTSpecialName
+MissingMethodException
+",
+    );
+}
+
+/// What another compiler or reflection reads of a member rather than of its
+/// code: `[IsReadOnly]` on a struct's `readonly` members, on the getters of
+/// its automatic properties and on every member a record struct writes for
+/// itself; the `modreq(IsExternalInit)` of an `init` setter; `System.ValueType`
+/// as a constraint of `struct` and, under `modreq(UnmanagedType)` and with
+/// `[IsUnmanaged]`, of `unmanaged`; `strict` on an `internal` virtual method;
+/// `[DebuggerStepThrough]` on an `async` method's stub; no storage and no
+/// class constructor for a `static abstract` property or an expression-bodied
+/// static one; the lower bounds of an array type; and the type of a boxed
+/// number in an attribute argument.
+#[test]
+fn readonly_init_unmanaged_and_struct_members_say_so_in_their_metadata() {
+    check(
+        "readonly_init_unmanaged_and_struct_members_say_so_in_their_metadata",
+        r#"using System;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+
+public interface IFoo { }
+public struct Plain { public int A; public int B { get; set; } public readonly int C => A; public void Bump() { A++; } public readonly void Peek() { } public int Auto { get; } public int Mixed { readonly get => A; set { A = value; } } public static int S { get; set; } }
+public readonly struct Ro { public readonly int A; public int B { get; } public void M() { } }
+public record struct RS(int A, string B) { public int Z { get; set; } }
+public readonly record struct ROS(int A, string B);
+public record class RC(int A) { public int Q { get; init; } }
+public class Init { public int A { get; init; } public int B { get; set; } public string C { get; init; } = "c"; public int this[int i] { get => i; init { } } }
+public class Gen<T> where T : struct { public void M<U>() where U : unmanaged { } public void N<U>() where U : struct, IFoo { } public void K<U>() where U : class, new() { } }
+public class Un<T> where T : unmanaged { }
+public class Vol { public volatile int V; public static volatile bool S; }
+public class VolG<T> { public volatile T[] V; }
+public class Vis { internal virtual void I() { } private protected virtual void P() { } protected internal virtual void PI() { } public virtual void Pub() { } internal virtual int Prop { get; set; } }
+public class Asy { public async System.Threading.Tasks.Task A() { await System.Threading.Tasks.Task.Yield(); } public System.Collections.Generic.IEnumerable<int> It() { yield return 1; } public async System.Collections.Generic.IAsyncEnumerable<int> AI() { yield return 1; await System.Threading.Tasks.Task.Yield(); } }
+public interface IStat { static abstract int Z { get; } static virtual int V => 1; int P { get; set; } }
+public class Statics { public static int Expr => 5; public static int Init { get; } = 6; public static readonly int F = 7; }
+public class NoStatics { public static int Expr => 5; }
+public class Arrays { public int[,] M(int[,,] a) => null; }
+public class Prm { public void M([System.Runtime.InteropServices.DefaultParameterValue(5)] int a, [System.Runtime.InteropServices.DefaultParameterValue("x")] string s) { } }
+[AttributeUsage(AttributeTargets.All)] public class Box : Attribute { public Box(object o) { O = o; } public object O; }
+[Box((byte)3)] public class B1 { }
+[Box((short)-4)] public class B2 { }
+[Box(5L)] public class B3 { }
+[Box((sbyte)-1)] public class B4 { }
+[Box((ushort)7)] public class B5 { }
+[Box('c')] public class B6 { }
+[Box(9u)] public class B7 { }
+public class Program {
+  static string Names(ICustomAttributeProvider p) => string.Join(",", p.GetCustomAttributes(false).Select(a => a.GetType().Name).OrderBy(x => x));
+  static string Mods(Type[] t) => string.Join("+", t.Select(x => x.Name));
+  static void Dump(Type t) {
+    var all = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
+    Console.WriteLine(t.Name + " [" + Names(t) + "]");
+    if (t.IsGenericTypeDefinition) foreach (var g in t.GetGenericArguments()) Console.WriteLine("  gp " + g.Name + " " + g.GenericParameterAttributes + " c=" + string.Join(",", g.GetGenericParameterConstraints().Select(c => c.Name)) + " req=" + Mods(g.GetRequiredCustomModifiers()) + " [" + Names(g) + "]");
+    foreach (var f in t.GetFields(all).OrderBy(f => f.Name)) Console.WriteLine("  f " + f.Name + " " + f.Attributes + " req=" + Mods(f.GetRequiredCustomModifiers()));
+    foreach (var c in t.GetConstructors(all)) Console.WriteLine("  ctor " + c.Attributes);
+    if (t.TypeInitializer != null) Console.WriteLine("  cctor");
+    foreach (var m in t.GetMethods(all).OrderBy(m => m.Name)) {
+      Console.WriteLine("  m " + m.Name + " " + m.Attributes + " [" + Names(m) + "] ret=" + Mods(m.ReturnParameter.GetRequiredCustomModifiers()) + " " + m.ReturnType.Name);
+      if (m.IsGenericMethodDefinition) foreach (var g in m.GetGenericArguments()) Console.WriteLine("    gp " + g.Name + " " + g.GenericParameterAttributes + " c=" + string.Join(",", g.GetGenericParameterConstraints().Select(c => c.Name)) + " req=" + Mods(g.GetRequiredCustomModifiers()) + " [" + Names(g) + "]");
+      foreach (var p in m.GetParameters()) Console.WriteLine("    p " + p.Name + " " + p.Attributes + " def=" + (p.HasDefaultValue ? p.RawDefaultValue ?? "null" : "-") + " [" + Names(p) + "]" + " " + p.ParameterType.Name);
+    }
+  }
+  static void Main() {
+    foreach (var t in new[] { typeof(Plain), typeof(Ro), typeof(RS), typeof(ROS), typeof(RC), typeof(Init), typeof(Gen<>), typeof(Un<>), typeof(Vol), typeof(VolG<>), typeof(Vis), typeof(Asy), typeof(IStat), typeof(Statics), typeof(NoStatics), typeof(Arrays), typeof(Prm) }) Dump(t);
+    foreach (var t in new[] { typeof(B1), typeof(B2), typeof(B3), typeof(B4), typeof(B5), typeof(B6), typeof(B7) }) { var a = t.GetCustomAttributes(typeof(Box), false).Cast<Box>().Single(); Console.WriteLine(t.Name + " " + a.O.GetType().Name + " " + a.O); }
+  }
+}
+"#,
+        r"Plain []
+  f <Auto>k__BackingField Private, InitOnly req=
+  f <B>k__BackingField Private req=
+  f <S>k__BackingField Private, Static req=
+  f A Public req=
+  m Bump Public, HideBySig [] ret= Void
+  m get_Auto Public, HideBySig, SpecialName [CompilerGeneratedAttribute,IsReadOnlyAttribute] ret= Int32
+  m get_B Public, HideBySig, SpecialName [CompilerGeneratedAttribute,IsReadOnlyAttribute] ret= Int32
+  m get_C Public, HideBySig, SpecialName [IsReadOnlyAttribute] ret= Int32
+  m get_Mixed Public, HideBySig, SpecialName [IsReadOnlyAttribute] ret= Int32
+  m get_S Public, Static, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Int32
+  m Peek Public, HideBySig [IsReadOnlyAttribute] ret= Void
+  m set_B Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Void
+    p value None def=- [] Int32
+  m set_Mixed Public, HideBySig, SpecialName [] ret= Void
+    p value None def=- [] Int32
+  m set_S Public, Static, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Void
+    p value None def=- [] Int32
+Ro [IsReadOnlyAttribute]
+  f <B>k__BackingField Private, InitOnly req=
+  f A Public, InitOnly req=
+  m get_B Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Int32
+  m M Public, HideBySig [] ret= Void
+RS []
+  f <A>k__BackingField Private req=
+  f <B>k__BackingField Private req=
+  f <Z>k__BackingField Private req=
+  ctor Public, HideBySig, SpecialName, RTSpecialName
+  m Deconstruct Public, HideBySig [CompilerGeneratedAttribute,IsReadOnlyAttribute] ret= Void
+    p A Out def=- [OutAttribute] Int32&
+    p B Out def=- [OutAttribute] String&
+  m Equals Public, Virtual, HideBySig [CompilerGeneratedAttribute,IsReadOnlyAttribute] ret= Boolean
+    p obj None def=- [] Object
+  m Equals Public, Final, Virtual, HideBySig, VtableLayoutMask [CompilerGeneratedAttribute,IsReadOnlyAttribute] ret= Boolean
+    p other None def=- [] RS
+  m get_A Public, HideBySig, SpecialName [CompilerGeneratedAttribute,IsReadOnlyAttribute] ret= Int32
+  m get_B Public, HideBySig, SpecialName [CompilerGeneratedAttribute,IsReadOnlyAttribute] ret= String
+  m get_Z Public, HideBySig, SpecialName [CompilerGeneratedAttribute,IsReadOnlyAttribute] ret= Int32
+  m GetHashCode Public, Virtual, HideBySig [CompilerGeneratedAttribute,IsReadOnlyAttribute] ret= Int32
+  m op_Equality Public, Static, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Boolean
+    p left None def=- [] RS
+    p right None def=- [] RS
+  m op_Inequality Public, Static, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Boolean
+    p left None def=- [] RS
+    p right None def=- [] RS
+  m PrintMembers Private, HideBySig [CompilerGeneratedAttribute,IsReadOnlyAttribute] ret= Boolean
+    p builder None def=- [] StringBuilder
+  m set_A Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Void
+    p value None def=- [] Int32
+  m set_B Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Void
+    p value None def=- [] String
+  m set_Z Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Void
+    p value None def=- [] Int32
+  m ToString Public, Virtual, HideBySig [CompilerGeneratedAttribute,IsReadOnlyAttribute] ret= String
+ROS [IsReadOnlyAttribute]
+  f <A>k__BackingField Private, InitOnly req=
+  f <B>k__BackingField Private, InitOnly req=
+  ctor Public, HideBySig, SpecialName, RTSpecialName
+  m Deconstruct Public, HideBySig [CompilerGeneratedAttribute] ret= Void
+    p A Out def=- [OutAttribute] Int32&
+    p B Out def=- [OutAttribute] String&
+  m Equals Public, Virtual, HideBySig [CompilerGeneratedAttribute] ret= Boolean
+    p obj None def=- [] Object
+  m Equals Public, Final, Virtual, HideBySig, VtableLayoutMask [CompilerGeneratedAttribute] ret= Boolean
+    p other None def=- [] ROS
+  m get_A Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Int32
+  m get_B Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= String
+  m GetHashCode Public, Virtual, HideBySig [CompilerGeneratedAttribute] ret= Int32
+  m op_Equality Public, Static, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Boolean
+    p left None def=- [] ROS
+    p right None def=- [] ROS
+  m op_Inequality Public, Static, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Boolean
+    p left None def=- [] ROS
+    p right None def=- [] ROS
+  m PrintMembers Private, HideBySig [CompilerGeneratedAttribute] ret= Boolean
+    p builder None def=- [] StringBuilder
+  m set_A Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret=IsExternalInit Void
+    p value None def=- [] Int32
+  m set_B Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret=IsExternalInit Void
+    p value None def=- [] String
+  m ToString Public, Virtual, HideBySig [CompilerGeneratedAttribute] ret= String
+RC [NullableAttribute,NullableContextAttribute]
+  f <A>k__BackingField Private, InitOnly req=
+  f <Q>k__BackingField Private, InitOnly req=
+  ctor Public, HideBySig, SpecialName, RTSpecialName
+  ctor Family, HideBySig, SpecialName, RTSpecialName
+  m <Clone>$ Public, Virtual, HideBySig, VtableLayoutMask [CompilerGeneratedAttribute] ret= RC
+  m Deconstruct Public, HideBySig [CompilerGeneratedAttribute] ret= Void
+    p A Out def=- [OutAttribute] Int32&
+  m Equals Public, Virtual, HideBySig [CompilerGeneratedAttribute,NullableContextAttribute] ret= Boolean
+    p obj None def=- [] Object
+  m Equals Public, Virtual, HideBySig, VtableLayoutMask [CompilerGeneratedAttribute,NullableContextAttribute] ret= Boolean
+    p other None def=- [] RC
+  m get_A Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Int32
+  m get_EqualityContract Family, Virtual, HideBySig, VtableLayoutMask, SpecialName [CompilerGeneratedAttribute] ret= Type
+  m get_Q Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Int32
+  m GetHashCode Public, Virtual, HideBySig [CompilerGeneratedAttribute] ret= Int32
+  m op_Equality Public, Static, HideBySig, SpecialName [CompilerGeneratedAttribute,NullableContextAttribute] ret= Boolean
+    p left None def=- [] RC
+    p right None def=- [] RC
+  m op_Inequality Public, Static, HideBySig, SpecialName [CompilerGeneratedAttribute,NullableContextAttribute] ret= Boolean
+    p left None def=- [] RC
+    p right None def=- [] RC
+  m PrintMembers Family, Virtual, HideBySig, VtableLayoutMask [CompilerGeneratedAttribute] ret= Boolean
+    p builder None def=- [] StringBuilder
+  m set_A Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret=IsExternalInit Void
+    p value None def=- [] Int32
+  m set_Q Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret=IsExternalInit Void
+    p value None def=- [] Int32
+  m ToString Public, Virtual, HideBySig [CompilerGeneratedAttribute] ret= String
+Init [DefaultMemberAttribute]
+  f <A>k__BackingField Private, InitOnly req=
+  f <B>k__BackingField Private req=
+  f <C>k__BackingField Private, InitOnly req=
+  ctor Public, HideBySig, SpecialName, RTSpecialName
+  m get_A Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Int32
+  m get_B Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Int32
+  m get_C Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= String
+  m get_Item Public, HideBySig, SpecialName [] ret= Int32
+    p i None def=- [] Int32
+  m set_A Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret=IsExternalInit Void
+    p value None def=- [] Int32
+  m set_B Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Void
+    p value None def=- [] Int32
+  m set_C Public, HideBySig, SpecialName [CompilerGeneratedAttribute] ret=IsExternalInit Void
+    p value None def=- [] String
+  m set_Item Public, HideBySig, SpecialName [] ret=IsExternalInit Void
+    p i None def=- [] Int32
+    p value None def=- [] Int32
+Gen`1 []
+  gp T NotNullableValueTypeConstraint, DefaultConstructorConstraint c=ValueType req= []
+  ctor Public, HideBySig, SpecialName, RTSpecialName
+  m K Public, HideBySig [] ret= Void
+    gp U ReferenceTypeConstraint, DefaultConstructorConstraint c= req= []
+  m M Public, HideBySig [] ret= Void
+    gp U NotNullableValueTypeConstraint, DefaultConstructorConstraint c=ValueType req= [IsUnmanagedAttribute]
+  m N Public, HideBySig [] ret= Void
+    gp U NotNullableValueTypeConstraint, DefaultConstructorConstraint c=IFoo,ValueType req= []
+Un`1 []
+  gp T NotNullableValueTypeConstraint, DefaultConstructorConstraint c=ValueType req= [IsUnmanagedAttribute]
+  ctor Public, HideBySig, SpecialName, RTSpecialName
+Vol []
+  f S Public, Static req=IsVolatile
+  f V Public req=IsVolatile
+  ctor Public, HideBySig, SpecialName, RTSpecialName
+VolG`1 []
+  gp T None c= req= []
+  f V Public req=IsVolatile
+  ctor Public, HideBySig, SpecialName, RTSpecialName
+Vis []
+  f <Prop>k__BackingField Private req=
+  ctor Public, HideBySig, SpecialName, RTSpecialName
+  m get_Prop Assembly, Virtual, HideBySig, VtableLayoutMask, CheckAccessOnOverride, SpecialName [CompilerGeneratedAttribute] ret= Int32
+  m I Assembly, Virtual, HideBySig, VtableLayoutMask, CheckAccessOnOverride [] ret= Void
+  m P FamANDAssem, Virtual, HideBySig, VtableLayoutMask, CheckAccessOnOverride [] ret= Void
+  m PI FamORAssem, Virtual, HideBySig, VtableLayoutMask [] ret= Void
+  m Pub Public, Virtual, HideBySig, VtableLayoutMask [] ret= Void
+  m set_Prop Assembly, Virtual, HideBySig, VtableLayoutMask, CheckAccessOnOverride, SpecialName [CompilerGeneratedAttribute] ret= Void
+    p value None def=- [] Int32
+Asy []
+  ctor Public, HideBySig, SpecialName, RTSpecialName
+  m A Public, HideBySig [AsyncStateMachineAttribute,DebuggerStepThroughAttribute] ret= Task
+  m AI Public, HideBySig [AsyncIteratorStateMachineAttribute] ret= IAsyncEnumerable`1
+  m It Public, HideBySig [IteratorStateMachineAttribute] ret= IEnumerable`1
+IStat []
+  m get_P Public, Virtual, HideBySig, VtableLayoutMask, Abstract, SpecialName [] ret= Int32
+  m get_V Public, Static, Virtual, HideBySig, SpecialName [] ret= Int32
+  m get_Z Public, Static, Virtual, HideBySig, Abstract, SpecialName [] ret= Int32
+  m set_P Public, Virtual, HideBySig, VtableLayoutMask, Abstract, SpecialName [] ret= Void
+    p value None def=- [] Int32
+Statics []
+  f <Init>k__BackingField Private, Static, InitOnly req=
+  f F Public, Static, InitOnly req=
+  ctor Public, HideBySig, SpecialName, RTSpecialName
+  ctor Private, Static, HideBySig, SpecialName, RTSpecialName
+  cctor
+  m get_Expr Public, Static, HideBySig, SpecialName [] ret= Int32
+  m get_Init Public, Static, HideBySig, SpecialName [CompilerGeneratedAttribute] ret= Int32
+NoStatics []
+  ctor Public, HideBySig, SpecialName, RTSpecialName
+  m get_Expr Public, Static, HideBySig, SpecialName [] ret= Int32
+Arrays []
+  ctor Public, HideBySig, SpecialName, RTSpecialName
+  m M Public, HideBySig [] ret= Int32[,]
+    p a None def=- [] Int32[,,]
+Prm []
+  ctor Public, HideBySig, SpecialName, RTSpecialName
+  m M Public, HideBySig [] ret= Void
+    p a HasDefault def=5 [] Int32
+    p s HasDefault def=x [] String
+B1 Byte 3
+B2 Int16 -4
+B3 Int64 5
+B4 SByte -1
+B5 UInt16 7
+B6 Char c
+B7 UInt32 9
+",
+    );
+}

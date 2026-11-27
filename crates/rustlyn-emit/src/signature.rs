@@ -133,14 +133,18 @@ impl SigType {
                 element.write(blob);
             }
             // §II.23.2.13: the rank, then how many sizes are given and then
-            // how many lower bounds are. C# gives neither: `new int[2, 3]`
-            // says its sizes at run time, not in the type.
+            // how many lower bounds are. C# gives no size: `new int[2, 3]`
+            // says its sizes at run time, not in the type. It gives every
+            // dimension the lower bound 0, as Roslyn writes it.
             Self::MultiArray(element, rank) => {
                 blob.push(ElementType::Array as u8);
                 element.write(blob);
                 compress(blob, *rank);
                 compress(blob, 0);
-                compress(blob, 0);
+                compress(blob, *rank);
+                for _ in 0..*rank {
+                    compress(blob, 0);
+                }
             }
             Self::TypeParameter(index) => {
                 blob.push(ElementType::Var as u8);

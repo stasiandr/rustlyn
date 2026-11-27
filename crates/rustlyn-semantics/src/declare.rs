@@ -1540,6 +1540,7 @@ impl<'a> Declarer<'a> {
             Some(owner),
             Detail::Method(Method {
                 method_kind: MethodKind::Constructor,
+                is_implicit: true,
                 ..Method::default()
             }),
         );
@@ -3142,6 +3143,14 @@ impl<'a> Declarer<'a> {
             let symbol = self.symbols.get_mut(id);
             symbol.locations.push(location);
             symbol.modifiers = modifiers;
+            // `readonly get` makes the one accessor readonly, whatever the
+            // property says.
+            if accessor
+                .child_tokens()
+                .any(|token| token.kind() == SyntaxKind::ReadOnlyKeyword)
+            {
+                symbol.modifiers.insert(Modifiers::READONLY);
+            }
             symbol.accessibility = accessibility;
             self.record(&accessor, id);
             // A getter with a block is a body like any other, and may declare

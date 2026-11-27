@@ -38,7 +38,7 @@ use crate::trees::Trees;
 use crate::types::{TupleElement, Type};
 
 /// Changes whenever the layout below does.
-const FORMAT: u32 = 26;
+const FORMAT: u32 = 27;
 const MAGIC: &[u8; 8] = b"RLNCOMP\0";
 
 impl Compilation {
@@ -329,6 +329,7 @@ fn write_symbol(out: &mut Writer, symbol: &Symbol) {
             out.option_type_ref(detail.extended);
             out.bool(detail.takes_receiver);
             out.bool(detail.is_vararg);
+            out.bool(detail.is_implicit);
         }
         Detail::Field(detail) => {
             out.u8(3);
@@ -455,6 +456,7 @@ fn read_symbol(input: &mut Reader<'_>) -> Option<Symbol> {
             extended: input.option_type_ref()?,
             takes_receiver: input.bool()?,
             is_vararg: input.bool()?,
+            is_implicit: input.bool()?,
         }),
         3 => Detail::Field(Field {
             ty: input.option_type_ref()?,
@@ -578,6 +580,7 @@ fn write_loaded(out: &mut Writer, loaded: &Loaded) {
         for part in reference.version {
             out.u32(u32::from(part));
         }
+        out.token(reference.public_key_token);
     }
     let mut constants: Vec<_> = loaded.constants.iter().collect();
     constants.sort_by_key(|(id, _)| id.0);
@@ -679,6 +682,7 @@ fn write_loaded(out: &mut Writer, loaded: &Loaded) {
                     for part in assembly.version {
                         out.u32(u32::from(part));
                     }
+                    out.token(assembly.public_key_token);
                 }
                 None => out.u8(0),
             }
@@ -764,7 +768,15 @@ fn read_loaded(input: &mut Reader<'_>) -> Option<Loaded> {
         for part in &mut version {
             *part = u16::try_from(input.u32()?).ok()?;
         }
-        loaded.assemblies.insert(id, Reference { name, version });
+        let public_key_token = input.token()?;
+        loaded.assemblies.insert(
+            id,
+            Reference {
+                name,
+                version,
+                public_key_token,
+            },
+        );
     }
     for _ in 0..input.usize()? {
         let id = input.id()?;
@@ -835,6 +847,7 @@ fn read_loaded(input: &mut Reader<'_>) -> Option<Loaded> {
                         Some(Reference {
                             name: assembly,
                             version,
+                            public_key_token: input.token()?,
                         })
                     }
                 };
@@ -1059,6 +1072,17 @@ impl Writer {
         self.u8(u8::from(value));
     }
 
+    /// A public key token, or nothing for an assembly without one.
+    fn token(&mut self, token: Option<[u8; 8]>) {
+        match token {
+            Some(bytes) => {
+                self.u8(1);
+                self.bytes.extend_from_slice(&bytes);
+            }
+            None => self.u8(0),
+        }
+    }
+
     fn u64(&mut self, mut value: u64) {
         loop {
             let byte = (value & 0x7f) as u8;
@@ -1275,6 +1299,16 @@ impl<'a> Reader<'a> {
 
     fn u8(&mut self) -> Option<u8> {
         Some(self.take(1)?[0])
+    }
+
+    /// Reads what `Writer::token` wrote: `None` for damage, `Some(None)` for
+    /// an assembly without a token.
+    fn token(&mut self) -> Option<Option<[u8; 8]>> {
+        match self.u8()? {
+            0 => Some(None),
+            1 => <[u8; 8]>::try_from(self.take(8)?).ok().map(Some),
+            _ => None,
+        }
     }
 
     fn bool(&mut self) -> Option<bool> {

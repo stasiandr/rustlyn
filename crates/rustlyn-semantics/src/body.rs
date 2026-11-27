@@ -175,6 +175,10 @@ pub struct BodyBinder<'a> {
     /// Whether this binding is an editor's: a lambda no delegate took is
     /// bound all the same (see `recover_lambdas_in`).
     recover_lambdas: bool,
+    /// Whether the call being resolved has one candidate to choose among, so
+    /// that inferred type arguments breaking its constraints are an error to
+    /// report on the call and not a reason to find no method at all.
+    lenient_constraints: std::cell::Cell<bool>,
     /// For an editor's binding, what a lambda of a call that resolved to
     /// nothing was tried with, by the lambda's span (see
     /// `guess_lambda_parameters`).
@@ -551,6 +555,7 @@ impl<'a> BodyBinder<'a> {
             syntax_found: std::cell::RefCell::new(HashMap::new()),
             answers_read: std::cell::Cell::new(usize::MAX),
             recover_lambdas: false,
+            lenient_constraints: std::cell::Cell::new(false),
             lambda_guesses: HashMap::new(),
             local_references: Vec::new(),
         }

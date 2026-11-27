@@ -11,6 +11,7 @@ mod bound;
 mod checks;
 mod compilation;
 mod constant;
+mod constraints;
 mod conversions;
 mod corlib;
 mod decimal;

@@ -71,6 +71,7 @@ impl Compilation {
         for tree in trees {
             crate::obsolete::check_declarations(&checker.binder, tree, &mut checker.found);
             crate::warnings::check(&checker.binder, tree, &mut checker.found);
+            crate::constraints::check_declarations(&checker.binder, tree, &mut checker.found);
         }
         checker.found
     }

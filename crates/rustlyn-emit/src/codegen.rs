@@ -5447,7 +5447,12 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 // A value type with no arguments is not constructed, it is
                 // zeroed; the runtime provides that and no method exists —
                 // unless the struct wrote a parameterless constructor of its
-                // own (C# 10), which is then the one to call.
+                // own (C# 10), which is then the one to call. The one the
+                // language gives a struct has no row to call.
+                let constructor = constructor.filter(|constructor| {
+                    !(self.emitter.is_value_type(&expression.ty)
+                        && self.emitter.is_implicit_constructor(*constructor))
+                });
                 if arguments.is_empty()
                     && constructor.is_none()
                     && self.emitter.is_value_type(&expression.ty)

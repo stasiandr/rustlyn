@@ -26,6 +26,78 @@ pub use reader::{Assembly, Row, Table};
 pub use signature::{Blob, CustomModifier, MethodSig, TypeSig};
 pub use tables::{Coded, Column, table};
 
+/// The public key token of an assembly: the last eight bytes of the SHA-1
+/// of its public key, in reverse (§II.6.2.1.3).
+///
+/// An assembly with no public key has no token, and the caller says so by
+/// passing an empty key.
+#[must_use]
+pub fn public_key_token(public_key: &[u8]) -> Option<[u8; 8]> {
+    if public_key.is_empty() {
+        return None;
+    }
+    let digest = sha1(public_key);
+    let mut token = [0u8; 8];
+    for (slot, byte) in token.iter_mut().zip(digest[12..].iter().rev()) {
+        *slot = *byte;
+    }
+    Some(token)
+}
+
+/// SHA-1, which is only what the token of a public key is defined with.
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut state: [u32; 5] = [
+        0x6745_2301,
+        0xEFCD_AB89,
+        0x98BA_DCFE,
+        0x1032_5476,
+        0xC3D2_E1F0,
+    ];
+    let mut message = data.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&((data.len() as u64) * 8).to_be_bytes());
+    for block in message.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for (i, word) in block.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = state;
+        for (i, word) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5A82_7999),
+                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
+                _ => (b ^ c ^ d, 0xCA62_C1D6),
+            };
+            let next = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = next;
+        }
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e]) {
+            *slot = slot.wrapping_add(value);
+        }
+    }
+    let mut out = [0u8; 20];
+    for (chunk, word) in out.chunks_exact_mut(4).zip(state) {
+        chunk.copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
 /// A metadata token: the table it points into and the row inside it.
 ///
 /// Row numbers start at one, and zero means no row at all — which is how a

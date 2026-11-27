@@ -1496,11 +1496,17 @@ impl BodyBinder<'_> {
             if explicit.len() != type_parameters.len() {
                 return None;
             }
-            type_parameters
+            let written: HashMap<SymbolId, Type> = type_parameters
                 .iter()
                 .copied()
                 .zip(explicit.iter().cloned())
-                .collect()
+                .collect();
+            // Written type arguments that break the constraints make it no
+            // candidate either, where another is left to choose.
+            if !self.satisfies_constraints(&type_parameters, &written) {
+                return None;
+            }
+            written
         };
         method_substitution.extend(settled);
         let type_parameters = all_type_parameters;
@@ -1603,6 +1609,11 @@ impl BodyBinder<'_> {
                     .is_some_and(|detail| detail.allows_ref_struct)
         }) {
             return false;
+        }
+        // A call with nothing else to choose gets the constraint error
+        // Roslyn reports on it rather than none of its candidates.
+        if self.lenient_constraints.get() {
+            return true;
         }
         parameters.iter().all(|parameter| {
             let Some(argument) = inferred.get(parameter) else {
@@ -1710,6 +1721,25 @@ impl BodyBinder<'_> {
     }
 
     pub(super) fn resolve_call(
+        &self,
+        candidates: &[SymbolId],
+        arguments: &[Type],
+        evidence: &Evidence,
+        receiver: &Type,
+        explicit: &[Type],
+    ) -> Option<Resolved> {
+        // Among extension methods a constraint is part of what makes a
+        // method a candidate; among the others, of what is wrong with the
+        // one there is.
+        let lenient = self
+            .lenient_constraints
+            .replace(candidates.len() == 1 && !evidence.extension);
+        let resolved = self.resolve_call_among(candidates, arguments, evidence, receiver, explicit);
+        self.lenient_constraints.set(lenient);
+        resolved
+    }
+
+    fn resolve_call_among(
         &self,
         candidates: &[SymbolId],
         arguments: &[Type],

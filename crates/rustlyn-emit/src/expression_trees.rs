@@ -776,6 +776,12 @@ impl BodyEmitter<'_, '_> {
                         .anonymous_names(symbol)
                         .map(<[String]>::to_vec)
                 });
+                // The constructor the language gives a struct has no row: it
+                // is `new S()` of the type alone.
+                let constructor = constructor.as_ref().filter(|constructor| {
+                    !(self.emitter.is_value_type(&node.ty)
+                        && self.emitter.is_implicit_constructor(**constructor))
+                });
                 match constructor {
                     // `new { a.X, Y = 1 }` names the members the arguments
                     // are of, through their getters, so that a provider can
