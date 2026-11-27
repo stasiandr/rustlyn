@@ -110,6 +110,7 @@ error_codes! {
     ErrCannotInferDelegateType = 8917, Error, "The delegate type could not be inferred.";
     ErrMethodNameExpected = 149, Error, "Method name expected";
     ErrUnsafeOperation = 9360, Error, "This operation may only be used in an unsafe context";
+    ErrExtensionParameterInStaticContext = 9347, Error, "Static members cannot access the value of extension parameter '{0}'.";
     ErrBadUnaryOp = 23, Error, "Operator '{0}' cannot be applied to operand of type '{1}'";
     ErrCannotBeMadeNullable = 8978, Error, "'{0}' cannot be made nullable.";
     ErrNoImplicitConv = 29, Error, "Cannot implicitly convert type '{0}' to '{1}'";

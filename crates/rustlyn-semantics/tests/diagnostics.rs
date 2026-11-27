@@ -2785,3 +2785,151 @@ class C { long M(int i, long l) => i.P + l.P; }",
     );
     assert_eq!(found, ["CS1061"], "{found:?}");
 }
+
+#[test]
+fn an_extension_block_indexer_is_resolved_like_an_extension_method() {
+    // Optional and `params` parameters, a type parameter
+    // inferred from the receiver, a receiver that is a number, an
+    // initializer, and `^1` and `1..2` counted through the block's own
+    // `Length`, indexer and `Slice`.
+    assert_clean(
+        "class B { }
+class G<T> { public T V; }
+class D { }
+static class E
+{
+    extension(B b)
+    {
+        public int this[int i, int j = 5] { get => i + j; set { } }
+        public int this[params int[] xs] => xs.Length;
+        public string this[string s, string m = \"\"] => s + m;
+    }
+    extension<T>(G<T> g) { public T this[int i] { get => g.V; set { g.V = value; } } }
+    extension(int n) { public int this[int j] => n + j; }
+    extension(D d)
+    {
+        public int Length => 3;
+        public int this[int i] => i;
+        public int Slice(int start, int length) => length;
+    }
+}
+class C
+{
+    void M(B b, G<string> g, D d)
+    {
+        int a = b[1] + b[1, 2] + b[1, 2, 3];
+        string s = b[\"x\"];
+        b[1] = 2;
+        b[1, 2] += 3;
+        g[0] = \"hi\";
+        string t = g[0];
+        g[0] += \"!\";
+        int n = 5[1];
+        int e = d[^1];
+        int f = d[1..2];
+        var h = new G<string> { [0] = \"x\" };
+    }
+}",
+    );
+}
+
+#[test]
+fn an_indexer_the_type_has_is_taken_before_an_extension_block_one() {
+    let found = codes(
+        "class C { public int this[long i] => 0; }
+static class E { extension(C c) { public string this[int i] => \"\"; } }
+class D { void M(C c) { int a = c[1]; } }",
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn an_extension_block_indexer_reports_what_fits_none_of_them() {
+    let found = codes(
+        "class B { }
+static class E { extension(B b) { public int this[int i] => i; } }
+class C { void M(B b) { int a = b[\"x\"]; } }",
+    );
+    assert_eq!(found, ["CS0021"], "{found:?}");
+}
+
+#[test]
+fn a_static_member_of_an_extension_block_cannot_read_its_receiver_parameter() {
+    let found = codes(
+        "static class E
+{
+    extension(int p)
+    {
+        static int P1 => p;
+        static int M()
+        {
+            return p;
+        }
+        int Fine() => p;
+    }
+}",
+    );
+    assert_eq!(found, ["CS9347", "CS9347"], "{found:?}");
+}
+
+#[test]
+fn a_static_member_of_a_generic_extension_block_takes_its_type_arguments_from_the_type() {
+    assert_clean(
+        "class C<T> { }
+class Derived : C<object> { }
+class Job<T> { }
+static class E
+{
+    extension<T>(C<T> c) { public static T Make() => default; public static int Size => 1; }
+    extension<T>(Job<T> t) { public static void Run() { } }
+}
+class P
+{
+    void M()
+    {
+        object o = Derived.Make();
+        int n = Derived.Size;
+        Job<bool>.Run();
+    }
+}",
+    );
+}
+
+#[test]
+fn extension_blocks_of_two_receivers_may_both_declare_a_property_of_a_name() {
+    assert_clean(
+        "static class E
+{
+    extension(string s) { public int P => 1; }
+    extension(object o) { public int P => 2; }
+}
+class C { int M(string s) => s.P; }",
+    );
+}
+
+#[test]
+fn an_extension_block_operator_is_found_for_a_unary_operator() {
+    assert_clean(
+        "struct R { }
+static class E { extension(R) { public static R operator !(R r) => r; public static R operator -(R r) => r; } }
+class C { R M(R r) => !r; R N(R r) => -r; }",
+    );
+}
+
+#[test]
+fn an_extension_block_property_is_initialized_and_a_color_color_name_reaches_its_static_members() {
+    assert_clean(
+        "class Item { public int F; }
+class Holder { }
+static class E
+{
+    extension(Holder h) { public Item P => new Item(); public static int S => 1; }
+}
+class Color
+{
+    public static int M(Color Color) => Color.S;
+    static void N() { var h = new Holder { P = { F = 1 } }; }
+}
+static class X { extension(Color c) { public static int S => 2; } }",
+    );
+}

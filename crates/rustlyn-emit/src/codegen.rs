@@ -2580,6 +2580,42 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
 
     // -- receivers ---------------------------------------------------------
 
+    /// The type an extension block's accessor takes its receiver as, where
+    /// the block is generic: the type the receiver has, which is what the
+    /// block's type parameters are instantiated to, and not the `T` they
+    /// are declared with, which no local of the caller can hold.
+    fn extension_taken(
+        &self,
+        member: SymbolId,
+        parameter: Option<SymbolId>,
+        receiver: &Type,
+    ) -> Type {
+        let Some(parameter) = parameter else {
+            return receiver.clone();
+        };
+        let taken = self.emitter.type_of(parameter);
+        let generics = self
+            .emitter
+            .compilation
+            .symbols()
+            .get(member)
+            .as_property()
+            .map(|detail| detail.extension_generics.clone())
+            .unwrap_or_default();
+        if generics.is_empty() {
+            return taken;
+        }
+        let erased: HashMap<SymbolId, Type> = generics
+            .into_iter()
+            .map(|generic| (generic, Type::Error))
+            .collect();
+        if taken.substitute(&erased) == taken {
+            taken
+        } else {
+            receiver.clone()
+        }
+    }
+
     /// Pushes what an instance call needs as its receiver.
     ///
     /// A reference type is passed as the reference it is; a value type has to
@@ -2607,7 +2643,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 self.push_property_receiver(Some(&held), None);
                 return Ok(());
             }
-            let taken = parameter.map_or_else(|| receiver.ty.clone(), |p| self.emitter.type_of(p));
+            let taken = self.extension_taken(member, parameter, &receiver.ty);
             self.emit_value_of(receiver)?;
             if !self.emitter.is_value_type(&taken) && self.emitter.is_value_type(&receiver.ty) {
                 self.box_if_needed(&receiver.ty)?;
@@ -10131,7 +10167,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         if self.emitter.is_by_reference(parameter) {
             return self.address_receiver(receiver);
         }
-        let taken = parameter.map_or_else(|| receiver.ty.clone(), |p| self.emitter.type_of(p));
+        let taken = self.extension_taken(member, parameter, &receiver.ty);
         // A variable that is not a reference is read again for each
         // accessor rather than copied once.
         let symbols = self.emitter.compilation.symbols();

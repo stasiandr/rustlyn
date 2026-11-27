@@ -1103,6 +1103,16 @@ impl Checker<'_> {
                         }
                     }
                     (None, None) => {
+                        // Properties of two extension blocks (C# 14) are
+                        // members of two containers, whatever their names.
+                        let block = |symbol: &crate::symbol::Symbol| {
+                            symbol.as_property().and_then(|detail| detail.extended)
+                        };
+                        if let (Some(here), Some(there)) = (block(symbol), block(other))
+                            && here != there
+                        {
+                            continue;
+                        }
                         self.report(
                             location,
                             ErrorCode::ErrDuplicateNameInClass,

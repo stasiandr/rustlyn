@@ -1,6 +1,8 @@
 //! Element access: arrays, indexers (extension ones included), `^i` and
 //! `a..b`, and what counts as a variable.
 
+use std::collections::HashMap;
+
 use rustlyn_diagnostics::ErrorCode;
 use rustlyn_syntax::{LanguageVersion, SyntaxKind, SyntaxNode};
 use rustlyn_text::TextSpan;
@@ -627,12 +629,28 @@ impl BodyBinder<'_> {
         // `p[inP: 2]` names a parameter, as a call may: only an indexer that
         // has it is meant, and the indices go where the names say.
         let indexers = self.named_candidates(indexers, names);
-        let indices = self.reorder_named(&indexers, names, indices, &other);
-        match self.pick_indexer(&indexers, &indices, &other) {
+        let mut indices = self.reorder_named(&indexers, names, indices, &other);
+        let picked = self.pick_indexer(&indexers, &indices, &other);
+        // An indexer the type has wins where it takes the indices; only where
+        // none does is an extension block's (C# 14) looked for, which takes
+        // the receiver as its first parameter.
+        let mut skip = 0;
+        let mut inferred: HashMap<SymbolId, Type> = HashMap::new();
+        let mut chosen = picked.map(|(indexer, _)| indexer);
+        if !picked.is_some_and(|(_, fits)| fits)
+            && let Some((indexer, found, ordered)) =
+                self.extension_indexer(&receiver, &indices, names, false)
+        {
+            chosen = Some(indexer);
+            inferred = found;
+            indices = ordered;
+            skip = 1;
+        }
+        match chosen {
             Some(indexer) => {
                 // CS0121 where two indexers fit the indices and neither is
                 // better, as two methods do.
-                if names.iter().all(Option::is_none) {
+                if skip == 0 && names.iter().all(Option::is_none) {
                     self.report_if_ambiguous(
                         indexer,
                         &indexers,
@@ -643,7 +661,15 @@ impl BodyBinder<'_> {
                         span,
                     );
                 }
-                let ty = self.member_type(indexer, &other);
+                let ty = if skip == 1 {
+                    let mut sink = Diagnostics::new();
+                    self.binder
+                        .type_of(indexer, &mut sink)
+                        .value()
+                        .substitute(&inferred)
+                } else {
+                    self.member_type(indexer, &other)
+                };
                 // `token[2]` on a `this[object key]` boxes the `2`:
                 // each index converts to the parameter it is for.
                 let parameters: Vec<SymbolId> = self
@@ -652,19 +678,36 @@ impl BodyBinder<'_> {
                     .symbols()
                     .get(indexer)
                     .as_property()
+                    .map(|detail| detail.parameters.iter().copied().skip(skip).collect())
+                    .unwrap_or_default();
+                // An extension block's indexer takes its receiver as its first
+                // parameter, which a handler may be made with by name.
+                let all_parameters: Vec<SymbolId> = self
+                    .binder
+                    .compilation()
+                    .symbols()
+                    .get(indexer)
+                    .as_property()
                     .map(|detail| detail.parameters.clone())
                     .unwrap_or_default();
-                let indices = self.pack_params_indices(indexer, indices, &other, span);
+                let mut receiver = receiver;
+                if skip == 1 {
+                    receiver = self.extension_receiver(receiver, indexer, &inferred);
+                }
+                let indices = self.pack_params_indices(indexer, indices, &other, skip, span);
                 let indices: Vec<BoundExpression> = if parameters.len() >= indices.len() {
                     let given: Vec<Option<TextSpan>> =
                         indices.iter().map(|index| Some(index.span)).collect();
                     // An interpolated string given to a handler may be
                     // made with the indices before it and the receiver
                     // (C# 10), as a call's arguments may.
-                    let mut converted: Vec<BoundExpression> = Vec::with_capacity(indices.len());
+                    let mut converted: Vec<BoundExpression> = Vec::with_capacity(indices.len() + 1);
+                    if skip == 1 {
+                        converted.push(receiver.clone());
+                    }
                     let mut capture = HandlerCapture::default();
                     for (index, parameter) in indices.into_iter().zip(parameters.iter().copied()) {
-                        let wanted = self.member_type(parameter, &other);
+                        let wanted = self.member_type(parameter, &other).substitute(&inferred);
                         let made =
                             if index.is_interpolated_string() && self.is_handler_type(&wanted) {
                                 let at = converted.len();
@@ -673,7 +716,11 @@ impl BodyBinder<'_> {
                                     &wanted,
                                     parameter,
                                     at,
-                                    &parameters,
+                                    if skip == 1 {
+                                        &all_parameters
+                                    } else {
+                                        &parameters
+                                    },
                                     &mut converted,
                                     &mut capture,
                                     &other,
@@ -688,6 +735,10 @@ impl BodyBinder<'_> {
                         converted.push(made);
                     }
                     self.pending_receiver = capture.receiver;
+                    // The receiver, which a handler may have kept.
+                    if skip == 1 {
+                        receiver = converted.remove(0);
+                    }
                     // The parameters left unwritten take their
                     // defaults, caller information included — the
                     // ones of the accessor that is called, which an
@@ -718,12 +769,14 @@ impl BodyBinder<'_> {
                             symbols
                                 .get(owner)
                                 .as_property()
-                                .map(|detail| detail.parameters.clone())
-                                .filter(|found| found.len() == parameters.len())
+                                .map(|detail| {
+                                    detail.parameters.iter().copied().skip(skip).collect()
+                                })
+                                .filter(|found: &Vec<SymbolId>| found.len() == parameters.len())
                         })
                         .unwrap_or_else(|| parameters.clone());
                     for parameter in defaults.iter().skip(converted.len()) {
-                        let wanted = self.member_type(*parameter, &other);
+                        let wanted = self.member_type(*parameter, &other).substitute(&inferred);
                         match self.default_argument(*parameter, &wanted, span, &given) {
                             Some(filled) => converted.push(filled),
                             None => break,
@@ -787,44 +840,6 @@ impl BodyBinder<'_> {
                 )
             }
             None => {
-                // An extension block's indexer (C# 14) takes the
-                // receiver as its first parameter.
-                if let Some((indexer, inferred)) = self.extension_indexer(&other, &indices) {
-                    let mut sink = Diagnostics::new();
-                    let ty = self
-                        .binder
-                        .type_of(indexer, &mut sink)
-                        .substitute(&inferred);
-                    let parameters: Vec<SymbolId> = self
-                        .binder
-                        .compilation()
-                        .symbols()
-                        .get(indexer)
-                        .as_property()
-                        .map(|detail| detail.parameters.clone())
-                        .unwrap_or_default();
-                    let arguments: Vec<BoundExpression> = indices
-                        .into_iter()
-                        .zip(parameters.iter().skip(1).copied())
-                        .map(|(index, parameter)| {
-                            let mut sink = Diagnostics::new();
-                            let wanted = self
-                                .binder
-                                .type_of(parameter, &mut sink)
-                                .substitute(&inferred);
-                            self.convert(index, &wanted)
-                        })
-                        .collect();
-                    return BoundExpression::new(
-                        BoundExpressionKind::IndexerAccess {
-                            receiver: Box::new(receiver),
-                            indexer,
-                            arguments,
-                        },
-                        ty,
-                        span,
-                    );
-                }
                 let found = self.display(&other);
                 self.report(ErrorCode::ErrBadIndexLHS, span, &[&found]);
                 BoundExpression::error(span)
@@ -841,7 +856,7 @@ impl BodyBinder<'_> {
         indexers: &[SymbolId],
         indices: &[BoundExpression],
         receiver: &Type,
-    ) -> Option<SymbolId> {
+    ) -> Option<(SymbolId, bool)> {
         // Overload resolution picks among indexers as among methods
         // (§12.8.12.3), `in` and tie-breaks and all.
         let types: Vec<Type> = indices.iter().map(|index| index.ty.clone()).collect();
@@ -873,7 +888,7 @@ impl BodyBinder<'_> {
                         .contains(Modifiers::OVERRIDE)
                         && signature(*candidate) == wanted)
             });
-            return Some(nearest.unwrap_or(indexer));
+            return Some((nearest.unwrap_or(indexer), true));
         }
         let symbols = self.binder.compilation().symbols();
         let mut best: Option<((bool, usize, usize), SymbolId)> = None;
@@ -974,8 +989,45 @@ impl BodyBinder<'_> {
                 best = Some((score, *indexer));
             }
         }
-        best.map(|(_, indexer)| indexer)
-            .or_else(|| indexers.first().copied())
+        best.map(|(_, indexer)| (indexer, true))
+            .or_else(|| indexers.first().map(|first| (*first, false)))
+    }
+
+    /// The receiver of an extension block's (C# 14) indexer or property, as
+    /// the block takes it: boxed where the block extends a reference type,
+    /// or made a span where it extends one.
+    pub(super) fn extension_receiver(
+        &mut self,
+        receiver: BoundExpression,
+        member: SymbolId,
+        inferred: &HashMap<SymbolId, Type>,
+    ) -> BoundExpression {
+        let Some(first) = self
+            .binder
+            .compilation()
+            .symbols()
+            .get(member)
+            .as_property()
+            .and_then(|detail| detail.parameters.first().copied())
+        else {
+            return receiver;
+        };
+        let mut sink = Diagnostics::new();
+        let taken = self.binder.type_of(first, &mut sink).substitute(inferred);
+        if receiver.ty == taken || taken.is_error() {
+            return receiver;
+        }
+        let symbols = self.binder.compilation().symbols();
+        let boxes = !matches!(
+            receiver.ty,
+            Type::TypeParameter(_) | Type::Error | Type::Null
+        ) && !receiver.ty.is_reference_type(symbols)
+            && !matches!(taken, Type::TypeParameter(_))
+            && taken.is_reference_type(symbols);
+        if self.binder.span_parts(&taken).is_some() || boxes {
+            return self.convert(receiver, &taken);
+        }
+        receiver
     }
 
     /// Whether the expression at `span` is the target of a simple
@@ -1045,12 +1097,14 @@ impl BodyBinder<'_> {
         indexer: SymbolId,
         indices: Vec<BoundExpression>,
         receiver: &Type,
+        skip: usize,
         span: TextSpan,
     ) -> Vec<BoundExpression> {
         let parameters: Vec<Type> = member_parameters(self.binder.compilation().symbols(), indexer)
             .unwrap_or_default()
-            .to_vec()
-            .into_iter()
+            .iter()
+            .skip(skip)
+            .copied()
             .map(|parameter| self.member_type(parameter, receiver))
             .collect();
         let Some(element) = self.params_element(indexer, &parameters) else {
@@ -1097,6 +1151,29 @@ impl BodyBinder<'_> {
         if self.takes_directly(&receiver.ty, &index.ty) {
             return None;
         }
+        // So does an extension block's (C# 14) indexer that takes it — but not
+        // for an array, whose own element access and slicing come first.
+        // And what the type itself counts and indexes or slices with comes
+        // before it.
+        let int = self.special(SpecialType::Int32);
+        let own_pattern = self.length_through(receiver, span, false).is_some()
+            && if is_index {
+                self.takes_directly(&receiver.ty, &int)
+            } else {
+                receiver.ty.symbol().is_some_and(|symbol| {
+                    ["Substring", "Slice"]
+                        .iter()
+                        .any(|name| !self.binder.lookup_member(symbol, name).is_empty())
+                })
+            };
+        if !own_pattern
+            && !matches!(receiver.ty, Type::Array { .. })
+            && self
+                .extension_indexer(receiver, std::slice::from_ref(index), &[None], false)
+                .is_some()
+        {
+            return None;
+        }
         let held = self.declare_synthetic_local("indexed", receiver.ty.clone());
         let local =
             BoundExpression::new(BoundExpressionKind::Local(held), receiver.ty.clone(), span);
@@ -1108,7 +1185,7 @@ impl BodyBinder<'_> {
             receiver.ty.clone(),
             span,
         );
-        let length = self.length_of(&local, span)?;
+        let length = self.length_through(&local, span, true)?;
         // `f[^1]` on a variable — a `ref T` parameter above all — indexes the
         // variable itself: a copy of a struct would not see what `Length`
         // did to it, nor would the struct see what the indexer does.
@@ -1138,9 +1215,9 @@ impl BodyBinder<'_> {
                     .is_reference_type(self.binder.compilation().symbols())
                     && receiver.ty.symbol().is_some()));
         if is_index && variable {
-            let length = self.length_of(receiver, span)?;
+            let length = self.length_through(receiver, span, true)?;
             let offset = self.call_on(index.clone(), "GetOffset", vec![length], span)?;
-            return self.index_by(receiver.clone(), offset, span);
+            return self.index_by(receiver.clone(), offset, span, true);
         }
         if is_index {
             // `i.GetOffset(length)` is what the language says `a[i]` is. The
@@ -1154,7 +1231,7 @@ impl BodyBinder<'_> {
                 local.ty.clone(),
                 span,
             );
-            return self.index_by(stored, offset, span);
+            return self.index_by(stored, offset, span, true);
         }
         // `item[range]` on a variable of a struct, or of a `T` that may be
         // one, slices the variable itself once the range is worked out: its
@@ -1184,9 +1261,9 @@ impl BodyBinder<'_> {
             } else {
                 receiver.clone()
             };
-            let length = self.length_of(&through, span)?;
+            let length = self.length_through(&through, span, true)?;
             let (offset, count) = self.offset_and_count(index, length, &mut steps, span)?;
-            let sliced = self.slice(through, offset, count, span)?;
+            let sliced = self.slice_through(through, offset, count, span, true)?;
             let ty = sliced.ty.clone();
             steps.push(sliced);
             return Some(BoundExpression::new(
@@ -1216,7 +1293,7 @@ impl BodyBinder<'_> {
             // them depends on what is being sliced.
             let mut steps = vec![keep];
             let (offset, count) = self.offset_and_count(index, length, &mut steps, span)?;
-            let sliced = self.slice(local, offset, count, span)?;
+            let sliced = self.slice_through(local, offset, count, span, true)?;
             steps.push(sliced.clone());
             Some(BoundExpression::new(
                 BoundExpressionKind::Sequence(steps),
@@ -1344,6 +1421,17 @@ impl BodyBinder<'_> {
         value: &BoundExpression,
         span: TextSpan,
     ) -> Option<BoundExpression> {
+        self.length_through(value, span, false)
+    }
+
+    /// The same, where a `Length` or `Count` an extension block (C# 14)
+    /// declared counts too, if `extensions` is set.
+    fn length_through(
+        &mut self,
+        value: &BoundExpression,
+        span: TextSpan,
+        extensions: bool,
+    ) -> Option<BoundExpression> {
         if matches!(value.ty, Type::Array { .. }) {
             return Some(BoundExpression::new(
                 BoundExpressionKind::ArrayLength {
@@ -1353,9 +1441,10 @@ impl BodyBinder<'_> {
                 span,
             ));
         }
-        let symbol = value.ty.symbol()?;
+        let symbol = value.ty.symbol();
         for name in ["Length", "Count"] {
-            if let Some(found) = self.binder.lookup_member(symbol, name).first().copied()
+            if let Some(found) =
+                symbol.and_then(|symbol| self.binder.lookup_member(symbol, name).first().copied())
                 && self.kind_of(found) == SymbolKind::Property
             {
                 let ty = self.member_type(found, &value.ty);
@@ -1369,6 +1458,38 @@ impl BodyBinder<'_> {
                 ));
             }
         }
+        if !extensions {
+            return None;
+        }
+        let int = self.special(SpecialType::Int32);
+        for name in ["Length", "Count"] {
+            let Some((access, property, tied)) =
+                self.extension_member_access_checked(value, name, span)
+            else {
+                continue;
+            };
+            // The first of the two names that is there is the one asked, and
+            // it has to be one that can be read here.
+            let readable = self
+                .binder
+                .compilation()
+                .symbols()
+                .get(property)
+                .as_property()
+                .is_some_and(|detail| {
+                    detail.has_get
+                        && detail.get_accessibility != Some(crate::symbol::Accessibility::Private)
+                });
+            // A `ref` one is no count the language can read.
+            let mut sink = Diagnostics::new();
+            let by_reference = matches!(self.binder.type_of(property, &mut sink), Type::ByRef(_));
+            return (access.ty == int
+                && !tied
+                && !by_reference
+                && readable
+                && self.accessible(property))
+            .then_some(access);
+        }
         None
     }
 
@@ -1378,6 +1499,7 @@ impl BodyBinder<'_> {
         receiver: BoundExpression,
         offset: BoundExpression,
         span: TextSpan,
+        extensions: bool,
     ) -> Option<BoundExpression> {
         if let Type::Array { element, .. } = receiver.ty.clone() {
             return Some(BoundExpression::new(
@@ -1389,12 +1511,42 @@ impl BodyBinder<'_> {
                 span,
             ));
         }
-        let symbol = receiver.ty.symbol()?;
-        let indexer = self
-            .binder
-            .lookup_member(symbol, "this[]")
-            .first()
-            .copied()?;
+        let members = receiver
+            .ty
+            .symbol()
+            .map(|symbol| self.binder.lookup_member(symbol, "this[]"))
+            .unwrap_or_default();
+        // Only where no indexer the type has takes the offset is an
+        // extension block's looked for.
+        if extensions
+            && !self
+                .pick_indexer(&members, std::slice::from_ref(&offset), &receiver.ty)
+                .is_some_and(|(_, fits)| fits)
+        {
+            // It has to be one the language can name: a single `int`, no
+            // more, that this code may reach.
+            let found =
+                self.extension_indexer(&receiver, std::slice::from_ref(&offset), &[None], true);
+            let symbols = self.binder.compilation().symbols();
+            let usable = found.as_ref().is_some_and(|(indexer, _, _)| {
+                let parameters = symbols
+                    .get(*indexer)
+                    .as_property()
+                    .map(|detail| detail.parameters.clone())
+                    .unwrap_or_default();
+                let int = self.special(SpecialType::Int32);
+                let mut sink = Diagnostics::new();
+                parameters.len() == 2
+                    && self.binder.type_of(parameters[1], &mut sink) == int
+                    && self.accessible(*indexer)
+            });
+            if !usable {
+                return None;
+            }
+            let ty = receiver.ty.clone();
+            return Some(self.indexer_access(receiver, &ty, &[], vec![offset], &[None], span));
+        }
+        let indexer = members.first().copied()?;
         let ty = self.member_type(indexer, &receiver.ty);
         Some(BoundExpression::new(
             BoundExpressionKind::IndexerAccess {
@@ -1416,6 +1568,19 @@ impl BodyBinder<'_> {
         count: BoundExpression,
         span: TextSpan,
     ) -> Option<BoundExpression> {
+        self.slice_through(receiver, offset, count, span, false)
+    }
+
+    /// The same, where a `Slice` an extension method or block (C# 14)
+    /// declared counts too, if `extensions` is set.
+    fn slice_through(
+        &mut self,
+        receiver: BoundExpression,
+        offset: BoundExpression,
+        count: BoundExpression,
+        span: TextSpan,
+        extensions: bool,
+    ) -> Option<BoundExpression> {
         for name in ["Substring", "Slice"] {
             if let Some(call) = self.call_on(
                 receiver.clone(),
@@ -1425,6 +1590,28 @@ impl BodyBinder<'_> {
             ) {
                 return Some(call);
             }
+        }
+        if extensions {
+            let call = self.extension_call_with("Slice", receiver, vec![offset, count], span)?;
+            // A `Slice` the language can use takes two `int`s and gives
+            // something back.
+            let BoundExpressionKind::Call { method, .. } = &call.kind else {
+                return None;
+            };
+            let symbols = self.binder.compilation().symbols();
+            let int = self.special(SpecialType::Int32);
+            let parameters = symbols
+                .get(*method)
+                .as_method()
+                .map(|detail| detail.parameters.clone())
+                .unwrap_or_default();
+            let mut sink = Diagnostics::new();
+            let shaped = parameters.len() == 3
+                && parameters[1..]
+                    .iter()
+                    .all(|parameter| self.binder.type_of(*parameter, &mut sink) == int)
+                && call.ty != Type::Void;
+            return shaped.then_some(call);
         }
         None
     }

@@ -384,7 +384,7 @@ impl BodyBinder<'_> {
                     }
                     other => (other.clone(), name.clone()),
                 };
-                let Some(member) = holder.symbol().and_then(|symbol| {
+                let found = holder.symbol().and_then(|symbol| {
                     self.binder
                         .lookup_member(symbol, &member_name)
                         .into_iter()
@@ -395,7 +395,20 @@ impl BodyBinder<'_> {
                             ) || (self.kind_of(*candidate) == SymbolKind::Event
                                 && self.event_is_a_field_here(*candidate))
                         })
-                }) else {
+                });
+                // `P = { F = 1 }` initializes what a property an extension
+                // block (C# 14) gave the type holds, where it has no member
+                // of that name.
+                let extension = if found.is_none() {
+                    self.extension_member_access(&placeholder(span), &name, span)
+                        .filter(|(target, _)| {
+                            matches!(target.kind, BoundExpressionKind::Property { .. })
+                        })
+                } else {
+                    None
+                };
+                let Some(member) = found.or(extension.as_ref().map(|(_, property)| *property))
+                else {
                     let container = holder.display(self.binder.compilation().symbols());
                     self.report(
                         ErrorCode::ErrNoSuchMember,
@@ -408,10 +421,23 @@ impl BodyBinder<'_> {
                     .references
                     .insert(name_node.span(), BoundSymbol::Declared(member));
                 self.body.symbols.insert(name_node.span(), member);
-                let member_type = self.member_type(member, &holder);
-                let created = placeholder(span);
-                let read =
-                    self.member_access(member, Some(Box::new(created)), member_type.clone(), span);
+                let (read, member_type) = match extension {
+                    Some((target, _)) => {
+                        let ty = target.ty.clone();
+                        (target, ty)
+                    }
+                    None => {
+                        let member_type = self.member_type(member, &holder);
+                        let created = placeholder(span);
+                        let read = self.member_access(
+                            member,
+                            Some(Box::new(created)),
+                            member_type.clone(),
+                            span,
+                        );
+                        (read, member_type)
+                    }
+                };
                 bound.extend(self.bind_initializers_on(&value_node, &member_type, Some(&read)));
                 continue;
             }

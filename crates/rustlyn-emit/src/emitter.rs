@@ -11810,6 +11810,48 @@ impl Emitter<'_> {
         receiver: Option<&Type>,
         setter: bool,
     ) -> Result<Token, EmitError> {
+        let token = self.declared_property_accessor(property, receiver, setter)?;
+        // A static member of a generic extension block, reached through the
+        // type that says what the block's type parameters are:
+        // `C<int>.P` for `extension<T>(C<T>)`.
+        let instantiation = receiver.and_then(|receiver| {
+            let detail = self.compilation.symbols().get(property).as_property()?;
+            let extended = detail.extended?;
+            (detail.parameters.is_empty() && !detail.extension_generics.is_empty()).then(|| {
+                (
+                    extended,
+                    detail.extension_generics.clone(),
+                    receiver.clone(),
+                )
+            })
+        });
+        let Some((extended, generics, receiver)) = instantiation else {
+            return Ok(token);
+        };
+        let mut sink = rustlyn_semantics::Diagnostics::new();
+        let pattern = self.binder.resolve_type_ref(extended, &mut sink);
+        let mut inferred = HashMap::new();
+        let actual = match &pattern {
+            Type::Named { symbol, .. } if receiver.symbol() != Some(*symbol) => self
+                .binder
+                .constructed_from(&receiver, *symbol)
+                .unwrap_or(receiver),
+            _ => receiver,
+        };
+        unify(&pattern, &actual, &mut inferred);
+        let arguments: Vec<Type> = generics
+            .iter()
+            .map(|parameter| inferred.get(parameter).cloned().unwrap_or(Type::Error))
+            .collect();
+        self.method_instantiation(token, &arguments)
+    }
+
+    fn declared_property_accessor(
+        &mut self,
+        property: SymbolId,
+        receiver: Option<&Type>,
+        setter: bool,
+    ) -> Result<Token, EmitError> {
         // An extension block's accessor belongs to the static class that
         // declared it, whatever the receiver.
         let receiver = if self

@@ -542,7 +542,9 @@ impl BodyBinder<'_> {
         }
         // An operator an extension block (C# 14) gave one of the operand
         // types, where the types declare none of their own.
-        if !any {
+        let predefined_first = self.predefined_conversions_of(&left.ty).is_empty()
+            && self.predefined_conversions_of(&right.ty).is_empty();
+        if !any && predefined_first {
             let mut candidates: Vec<(SymbolId, Type)> = Vec::new();
             for candidate in self.binder.extension_members_in_scope(&self.context, name) {
                 let Some(extended) = symbols
@@ -690,7 +692,26 @@ impl BodyBinder<'_> {
         {
             return None;
         }
-        let candidates = self.operator_candidates(symbol, name, span);
+        let mut candidates = self.operator_candidates(symbol, name, span);
+        // An operator an extension block (C# 14) gave the operand's type,
+        // where the type declares none of its own.
+        // The language's own operators, reached through a conversion of the
+        // operand, come before an extension block's.
+        if candidates.is_empty() && self.predefined_conversions_of(&ty).is_empty() {
+            let symbols = self.binder.compilation().symbols();
+            for candidate in self.binder.extension_members_in_scope(&self.context, name) {
+                let Some(extended) = symbols
+                    .get(candidate)
+                    .as_method()
+                    .and_then(|detail| detail.extended)
+                else {
+                    continue;
+                };
+                if self.resolve_extended(extended).symbol() == Some(symbol) {
+                    candidates.push(candidate);
+                }
+            }
+        }
         if candidates.is_empty() {
             return None;
         }

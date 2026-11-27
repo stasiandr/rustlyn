@@ -142,6 +142,9 @@ pub struct BodyBinder<'a> {
     /// innermost last, with the candidates they are placed against: each
     /// candidate reads them into its own parameters (§12.6.2.2).
     argument_names: std::cell::RefCell<Vec<NamedArguments>>,
+    /// The type parameters of extension blocks that the type a static
+    /// member is reached through settles, while a call to it is resolved.
+    static_receiver: std::cell::RefCell<HashMap<SymbolId, Type>>,
     /// The holes of interpolated strings whose values had no type of their
     /// own — a conditional, a `switch`, a `new()` — as they were written,
     /// by span. Each was made an `object` for a string, and a handler's
@@ -523,6 +526,7 @@ impl<'a> BodyBinder<'a> {
             invoked: false,
             lambda_answers: std::cell::RefCell::default(),
             argument_names: std::cell::RefCell::default(),
+            static_receiver: std::cell::RefCell::default(),
             typeless_holes: HashMap::new(),
             pending_receiver: None,
             lambda_probes: HashMap::new(),

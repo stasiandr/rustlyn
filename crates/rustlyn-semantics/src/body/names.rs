@@ -274,6 +274,26 @@ impl BodyBinder<'_> {
                 .insert(right.span(), BoundSymbol::Declared(access.1));
             return Some(access.0);
         }
+        // `Color.P` where `Color` is a value of the type `Color`: the name
+        // is the type as well, and reaches the static members of its blocks.
+        if !matches!(receiver.kind, BoundExpressionKind::TypeExpression(_))
+            && let Some(symbol) = receiver.ty.symbol()
+            && let Some(left) = right.parent().and_then(|parent| parent.children().next())
+            && left.kind() == SyntaxKind::IdentifierName
+            && self.names_a_type(&left)
+        {
+            let by_type = BoundExpression::new(
+                BoundExpressionKind::TypeExpression(symbol),
+                receiver.ty.clone(),
+                receiver.span,
+            );
+            if let Some((access, property)) = self.extension_member_access(&by_type, name, span) {
+                self.body
+                    .references
+                    .insert(right.span(), BoundSymbol::Declared(property));
+                return Some(access);
+            }
+        }
         // An extension block's property (C# 14) is read through a
         // `get_Name(receiver)` the block declared as an extension method.
         if let Some(read) = self.bind_extension_call(
@@ -1179,6 +1199,8 @@ impl BodyBinder<'_> {
         if !span.is_empty() {
             let code = if declared_further_on(node, &name) {
                 ErrorCode::ErrVariableUsedBeforeDeclaration
+            } else if names_receiver_in_static_member(node, &name) {
+                ErrorCode::ErrExtensionParameterInStaticContext
             } else {
                 ErrorCode::ErrNameNotInContext
             };
@@ -1830,6 +1852,18 @@ impl BodyBinder<'_> {
         name: &str,
         span: TextSpan,
     ) -> Option<(BoundExpression, SymbolId)> {
+        self.extension_member_access_checked(receiver, name, span)
+            .map(|(access, property, _)| (access, property))
+    }
+
+    /// The same, saying also whether another member of the same place is as
+    /// good a choice, which leaves the name ambiguous.
+    pub(super) fn extension_member_access_checked(
+        &mut self,
+        receiver: &BoundExpression,
+        name: &str,
+        span: TextSpan,
+    ) -> Option<(BoundExpression, SymbolId, bool)> {
         let candidates = self.binder.extension_members_in_scope(&self.context, name);
         if candidates.is_empty() {
             return None;
@@ -1837,6 +1871,7 @@ impl BodyBinder<'_> {
         let on_type = matches!(receiver.kind, BoundExpressionKind::TypeExpression(_));
         let symbols = self.binder.compilation().symbols();
         let mut statics = Vec::new();
+        let mut fitting: Vec<(SymbolId, HashMap<SymbolId, Type>, Type)> = Vec::new();
         for candidate in candidates {
             let symbol = symbols.get(candidate);
             match &symbol.detail {
@@ -1844,8 +1879,23 @@ impl BodyBinder<'_> {
                     let extended = detail.extended?;
                     let mut inferred = HashMap::new();
                     let fits = if on_type {
+                        // The type written says what the block's type
+                        // parameters are: `C<object>.P` of `extension<T>(T)`.
+                        if !detail.extension_generics.is_empty() {
+                            let pattern = self.resolve_extended(extended);
+                            self.infer_into(
+                                &pattern,
+                                &receiver.ty,
+                                &detail.extension_generics,
+                                &mut inferred,
+                            );
+                        }
                         detail.parameters.is_empty()
-                            && self.static_extension_fits(extended, &receiver.ty)
+                            && self.static_extension_fits_with(
+                                extended,
+                                &receiver.ty,
+                                &detail.extension_generics,
+                            )
                     } else {
                         detail.parameters.first().is_some_and(|parameter| {
                             self.receiver_fits(
@@ -1858,41 +1908,60 @@ impl BodyBinder<'_> {
                     };
                     if fits {
                         let mut sink = Diagnostics::new();
-                        let ty = self
-                            .binder
-                            .type_of(candidate, &mut sink)
-                            .substitute(&inferred);
-                        // An array or a `Span<T>` reaches a span receiver
-                        // through the span conversion, made where it is read.
-                        let mut receiver = receiver.clone();
-                        if !on_type && let Some(first) = detail.parameters.first() {
-                            let taken =
-                                self.binder.type_of(*first, &mut sink).substitute(&inferred);
-                            if self.binder.span_parts(&taken).is_some() && receiver.ty != taken {
-                                receiver = self.convert(receiver, &taken);
+                        let taken = match detail.parameters.first() {
+                            Some(first) if !on_type => {
+                                self.binder.type_of(*first, &mut sink).substitute(&inferred)
                             }
-                        }
-                        let access = BoundExpression::new(
-                            BoundExpressionKind::Property {
-                                receiver: (!on_type).then(|| Box::new(receiver)),
-                                property: candidate,
-                            },
-                            ty,
-                            span,
-                        );
-                        return Some((access, candidate));
+                            _ => self.resolve_extended(extended),
+                        };
+                        fitting.push((candidate, inferred, taken));
                     }
                 }
                 Detail::Method(detail) if on_type => {
                     let Some(extended) = detail.extended else {
                         continue;
                     };
-                    if self.static_extension_fits(extended, &receiver.ty) {
+                    let generics = self.block_generics(&detail.type_parameters);
+                    if self.static_extension_fits_with(extended, &receiver.ty, &generics) {
                         statics.push(candidate);
                     }
                 }
                 _ => {}
             }
+        }
+        if let Some((best, tied)) = self.best_extension_member(&fitting) {
+            let (candidate, inferred, taken) = fitting[best].clone();
+            let mut sink = Diagnostics::new();
+            let ty = self
+                .binder
+                .type_of(candidate, &mut sink)
+                .value()
+                .substitute(&inferred);
+            // An array or a `Span<T>` reaches a span receiver through the
+            // span conversion, made where it is read.
+            let mut receiver = receiver.clone();
+            if !on_type && self.binder.span_parts(&taken).is_some() && receiver.ty != taken {
+                receiver = self.convert(receiver, &taken);
+            }
+            // A static member of a generic block is reached through the type
+            // that settled its type parameters, which a call has to name.
+            let keeps_type = on_type
+                && self
+                    .binder
+                    .compilation()
+                    .symbols()
+                    .get(candidate)
+                    .as_property()
+                    .is_some_and(|detail| !detail.extension_generics.is_empty());
+            let access = BoundExpression::new(
+                BoundExpressionKind::Property {
+                    receiver: (!on_type || keeps_type).then(|| Box::new(receiver)),
+                    property: candidate,
+                },
+                ty,
+                span,
+            );
+            return Some((access, candidate, tied));
         }
         let first = *statics.first()?;
         Some((
@@ -1905,7 +1974,58 @@ impl BodyBinder<'_> {
                 span,
             ),
             first,
+            false,
         ))
+    }
+
+    /// Which of the extension block members that all fit a receiver is the
+    /// one named: those of the highest `[OverloadResolutionPriority]`, and
+    /// among them the one whose receiver is the most specific — a member
+    /// taking a `string` over one taking an `object`. Each is a member, its
+    /// type arguments and the type its receiver is taken as.
+    pub(super) fn best_extension_member(
+        &self,
+        fitting: &[(SymbolId, HashMap<SymbolId, Type>, Type)],
+    ) -> Option<(usize, bool)> {
+        let compilation = self.binder.compilation();
+        // The nearest place that has one decides (§12.8.10.3).
+        let level = |member: SymbolId| {
+            self.binder
+                .extension_level(&self.context, member)
+                .unwrap_or(usize::MAX)
+        };
+        let nearest = fitting.iter().map(|(member, _, _)| level(*member)).min()?;
+        let near: Vec<usize> = (0..fitting.len())
+            .filter(|at| level(fitting[*at].0) == nearest)
+            .collect();
+        let top = near
+            .iter()
+            .map(|at| compilation.overload_resolution_priority(fitting[*at].0))
+            .max()?;
+        let kept: Vec<usize> = near
+            .into_iter()
+            .filter(|at| compilation.overload_resolution_priority(fitting[*at].0) == top)
+            .collect();
+        let narrower = |a: &Type, b: &Type| {
+            a != b
+                && self.binder.converts_implicitly(a, b)
+                && self.receiver_converts(a, b)
+                && !(self.binder.converts_implicitly(b, a) && self.receiver_converts(b, a))
+        };
+        let best = kept
+            .iter()
+            .copied()
+            .find(|at| {
+                !kept
+                    .iter()
+                    .any(|other| narrower(&fitting[*other].2, &fitting[*at].2))
+            })
+            .or_else(|| kept.first().copied())?;
+        // Another member no worse than the one chosen leaves it a tie.
+        let tied = kept
+            .iter()
+            .any(|other| *other != best && !narrower(&fitting[best].2, &fitting[*other].2));
+        Some((best, tied))
     }
 
     /// Whether a receiver of this type is what an extension block's
@@ -1961,12 +2081,30 @@ impl BodyBinder<'_> {
     /// extended, or reaches it the way an extension receiver may — by
     /// reference or by boxing (`string.M()` for an `extension(object)`), or
     /// the block extends a type parameter, which any type may stand for.
-    pub(super) fn static_extension_fits(
+    ///
+    /// Where the block has type parameters the receiver infers them:
+    /// `Derived.M()` reaches a static member of `extension<T>(C<T>)` where
+    /// `Derived` is a `C<object>`.
+    pub(super) fn static_extension_fits_with(
         &self,
         extended: crate::symbol::TypeSyntaxRef,
         receiver: &Type,
+        generics: &[SymbolId],
     ) -> bool {
-        let extended = self.resolve_extended(extended);
+        let mut extended = self.resolve_extended(extended);
+        if !generics.is_empty() && !matches!(extended, Type::TypeParameter(_)) {
+            let mut inferred = HashMap::new();
+            self.infer_into(&extended, receiver, generics, &mut inferred);
+            // Where the receiver does not say what they all are, the block
+            // is judged as written, and the call says it cannot tell.
+            if generics
+                .iter()
+                .all(|generic| inferred.contains_key(generic))
+                && self.satisfies_constraints(generics, &inferred)
+            {
+                extended = extended.substitute(&inferred);
+            }
+        }
         if extended.symbol() == receiver.symbol() && receiver.symbol().is_some() {
             return true;
         }
@@ -1980,48 +2118,97 @@ impl BodyBinder<'_> {
         }
     }
 
+    /// Of a method's type parameters, those its extension block (C# 14)
+    /// declared.
+    pub(super) fn block_generics(&self, type_parameters: &[SymbolId]) -> Vec<SymbolId> {
+        let symbols = self.binder.compilation().symbols();
+        type_parameters
+            .iter()
+            .copied()
+            .filter(|parameter| {
+                symbols
+                    .get(*parameter)
+                    .container
+                    .is_some_and(|holder| symbols.get(holder).name == "<extension>")
+            })
+            .collect()
+    }
+
     pub(super) fn resolve_extended(&self, extended: crate::symbol::TypeSyntaxRef) -> Type {
         let mut sink = Diagnostics::new();
         self.binder.resolve_type_ref(extended, &mut sink)
     }
 
     /// `x[i]` reaching an indexer an extension block (C# 14) declared for
-    /// what `x` is: the indexer, whose first parameter is the receiver.
+    /// what `x` is: the indexer, whose first parameter is the receiver, and
+    /// what its type parameters were inferred to be. Overloads are resolved
+    /// as an extension method's are, the receiver being the first argument.
     pub(super) fn extension_indexer(
-        &self,
-        receiver: &Type,
+        &mut self,
+        receiver: &BoundExpression,
         indices: &[BoundExpression],
-    ) -> Option<(SymbolId, HashMap<SymbolId, Type>)> {
+        names: &[Option<String>],
+        unique: bool,
+    ) -> Option<(SymbolId, HashMap<SymbolId, Type>, Vec<BoundExpression>)> {
+        // An array and a `string` are indexed by the language itself.
+        if matches!(receiver.ty, Type::Array { .. })
+            || self.binder.special_of(&receiver.ty) == Some(SpecialType::String)
+        {
+            return None;
+        }
         let symbols = self.binder.compilation().symbols();
-        self.binder
+        let mut candidates: Vec<SymbolId> = self
+            .binder
             .extension_members_in_scope(&self.context, "this[]")
             .into_iter()
-            .find_map(|candidate| {
-                let detail = symbols.get(candidate).as_property()?;
-                let mut inferred = HashMap::new();
-                let fits = detail.parameters.len() == indices.len() + 1
-                    && detail.parameters.first().is_some_and(|parameter| {
-                        self.receiver_fits(
-                            *parameter,
-                            receiver,
-                            &detail.extension_generics,
-                            &mut inferred,
-                        )
-                    })
-                    && detail.parameters[1..]
-                        .iter()
-                        .zip(indices)
-                        .all(|(parameter, index)| {
-                            let mut sink = Diagnostics::new();
-                            let wanted = self
-                                .binder
-                                .type_of(*parameter, &mut sink)
-                                .substitute(&inferred);
-                            self.binder.converts_implicitly(&index.ty, &wanted)
-                                || self.constant_fits(index, &wanted)
-                        });
-                fits.then_some((candidate, inferred))
+            .filter(|candidate| {
+                symbols.get(*candidate).as_property().is_some_and(|detail| {
+                    detail.extended.is_some() && !detail.parameters.is_empty()
+                })
             })
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        let mut arguments = vec![receiver.clone()];
+        arguments.extend(indices.iter().cloned());
+        // `o[b: 1, a: 2]` names parameters after the receiver's.
+        if names.iter().any(Option::is_some) && names.len() + 1 == arguments.len() {
+            let mut named = vec![None];
+            named.extend(names.iter().cloned());
+            candidates = self.named_candidates(&candidates, &named);
+            if candidates.is_empty() {
+                return None;
+            }
+            arguments = self.reorder_named(&candidates, &named, arguments, &Type::Void);
+        }
+        let types: Vec<Type> = arguments
+            .iter()
+            .map(|argument| argument.ty.clone())
+            .collect();
+        let evidence = self.evidence_for(&arguments, true);
+        let resolved = self.resolve_call(&candidates, &types, &evidence, &receiver.ty, &[])?;
+        // Where the indexer is looked for by the language itself, another
+        // that would do as well is a tie, which finds none.
+        if unique
+            && self
+                .certain_rival(
+                    resolved.method,
+                    &candidates,
+                    &arguments,
+                    &Type::Void,
+                    &[],
+                    true,
+                )
+                .is_some()
+        {
+            return None;
+        }
+        Some((
+            resolved.method,
+            resolved.substitution,
+            arguments.into_iter().skip(1).collect(),
+        ))
     }
 
     /// The property an extension block (C# 14) declared for `receiver`'s
@@ -2029,26 +2216,31 @@ impl BodyBinder<'_> {
     /// if either is in scope.
     pub(super) fn extension_property(&self, receiver: &Type, name: &str) -> Option<SymbolId> {
         let symbols = self.binder.compilation().symbols();
-        let declared = self
-            .binder
-            .extension_members_in_scope(&self.context, name)
-            .into_iter()
-            .find(|member| {
-                symbols.get(*member).as_property().is_some_and(|detail| {
-                    !detail.is_indexer
-                        && detail.parameters.first().is_some_and(|parameter| {
-                            let mut inferred = HashMap::new();
-                            self.receiver_fits(
-                                *parameter,
-                                receiver,
-                                &detail.extension_generics,
-                                &mut inferred,
-                            )
-                        })
-                })
-            });
-        if declared.is_some() {
-            return declared;
+        let mut fitting: Vec<(SymbolId, HashMap<SymbolId, Type>, Type)> = Vec::new();
+        for member in self.binder.extension_members_in_scope(&self.context, name) {
+            let Some(detail) = symbols.get(member).as_property() else {
+                continue;
+            };
+            let Some(parameter) = detail.parameters.first().filter(|_| !detail.is_indexer) else {
+                continue;
+            };
+            let mut inferred = HashMap::new();
+            if self.receiver_fits(
+                *parameter,
+                receiver,
+                &detail.extension_generics,
+                &mut inferred,
+            ) {
+                let mut sink = Diagnostics::new();
+                let taken = self
+                    .binder
+                    .type_of(*parameter, &mut sink)
+                    .substitute(&inferred);
+                fitting.push((member, inferred, taken));
+            }
+        }
+        if let Some((best, _)) = self.best_extension_member(&fitting) {
+            return Some(fitting[best].0);
         }
         self.binder
             .extensions_in_scope(&self.context, &format!("get_{name}"))
@@ -2093,6 +2285,46 @@ fn receiver_is_a_type(expression: &BoundExpression) -> bool {
         _ => None,
     };
     receiver.is_some_and(|receiver| matches!(receiver.kind, BoundExpressionKind::TypeExpression(_)))
+}
+
+/// Whether `name` is the receiver parameter of the extension block (C# 14)
+/// around `node`, written in a static member of it: a member of that kind
+/// has no receiver to read.
+fn names_receiver_in_static_member(node: &SyntaxNode, name: &str) -> bool {
+    let mut member: Option<SyntaxNode> = None;
+    for ancestor in node.ancestors() {
+        match ancestor.kind() {
+            // A default value and an attribute argument are other places,
+            // which Roslyn says another thing of.
+            SyntaxKind::Attribute | SyntaxKind::EqualsValueClause
+                if ancestor
+                    .parent()
+                    .is_some_and(|parent| parent.kind() != SyntaxKind::VariableDeclarator) =>
+            {
+                return false;
+            }
+            SyntaxKind::ExtensionBlockDeclaration => {
+                let Some(member) = member else {
+                    return false;
+                };
+                let is_static = member
+                    .child_tokens()
+                    .any(|token| token.kind() == SyntaxKind::StaticKeyword);
+                let receiver = ancestor
+                    .child_of_kind(SyntaxKind::ParameterList)
+                    .and_then(|list| list.child_of_kind(SyntaxKind::Parameter))
+                    .and_then(|parameter| {
+                        parameter
+                            .child_tokens()
+                            .filter(|token| token.kind() == SyntaxKind::IdentifierToken)
+                            .last()
+                    });
+                return is_static && receiver.is_some_and(|receiver| receiver.value_text() == name);
+            }
+            _ => member = Some(ancestor),
+        }
+    }
+    false
 }
 
 /// Whether a local called `name` is declared later in a block around

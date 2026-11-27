@@ -935,8 +935,10 @@ impl BodyBinder<'_> {
             let detail = symbol.as_property()?;
             Some(Member {
                 parameters: detail.parameters.clone(),
-                type_parameters: Vec::new(),
-                is_extension: false,
+                type_parameters: detail.extension_generics.clone(),
+                // An indexer of an extension block (C# 14) takes its
+                // receiver first, as an extension method does.
+                is_extension: detail.extended.is_some(),
             })
         };
         // What a candidate is to this call: out of this check's depth
@@ -1224,15 +1226,20 @@ impl BodyBinder<'_> {
         // declared alike and called alike, and a third method that would
         // beat or equal them is no rival either.
         let written = |method: SymbolId| -> Option<(Vec<Type>, Vec<SymbolId>)> {
-            let detail = symbols.get(method).as_method()?;
+            let (parameters, type_parameters) = match symbols.get(method).as_method() {
+                Some(detail) => (detail.parameters.clone(), detail.type_parameters.clone()),
+                None => {
+                    let detail = symbols.get(method).as_property()?;
+                    (detail.parameters.clone(), detail.extension_generics.clone())
+                }
+            };
             let mut sink = Diagnostics::new();
             Some((
-                detail
-                    .parameters
+                parameters
                     .iter()
                     .map(|parameter| self.binder.type_of(*parameter, &mut sink))
                     .collect(),
-                detail.type_parameters.clone(),
+                type_parameters,
             ))
         };
         let declared_alike = |other: SymbolId| -> bool {
@@ -1370,14 +1377,33 @@ impl BodyBinder<'_> {
                 .map(|index| member_parameters[*index])
                 .collect();
         }
+        // An extension block's indexer has the block's type parameters, which
+        // its receiver infers.
         let method_type_parameters: Vec<SymbolId> = symbols
             .get(candidate)
             .as_method()
             .map(|detail| detail.type_parameters.clone())
+            .or_else(|| {
+                symbols
+                    .get(candidate)
+                    .as_property()
+                    .map(|detail| detail.extension_generics.clone())
+            })
             .unwrap_or_default();
         // Each candidate may be declared on a different type, and the
         // receiver says what that type's parameters are.
         let substitution = self.substitution_for(candidate, receiver);
+        // The type parameters of an extension block (C# 14) that a type
+        // written as the receiver of a static member already settled:
+        // `Task<bool>.M()` for `extension<T>(Task<T>)` has no argument to
+        // say what `T` is.
+        let settled: HashMap<SymbolId, Type> = self
+            .static_receiver
+            .borrow()
+            .iter()
+            .filter(|(parameter, _)| method_type_parameters.contains(parameter))
+            .map(|(parameter, ty)| (*parameter, ty.clone()))
+            .collect();
         let declared: Vec<Type> = member_parameters
             .iter()
             .map(|id| {
@@ -1385,13 +1411,18 @@ impl BodyBinder<'_> {
                 self.binder
                     .type_of(*id, &mut sink)
                     .substitute(&substitution)
+                    .substitute(&settled)
             })
             .collect();
-        let type_parameters = method_type_parameters;
+        let all_type_parameters = method_type_parameters.clone();
+        let type_parameters: Vec<SymbolId> = method_type_parameters
+            .into_iter()
+            .filter(|parameter| !settled.contains_key(parameter))
+            .collect();
         let mut from_function = false;
         // Explicit type arguments settle it; otherwise each parameter is
         // matched against its argument until every one is accounted for.
-        let method_substitution = if type_parameters.is_empty() {
+        let mut method_substitution = if type_parameters.is_empty() {
             // `Allocate<MemberDeclarationSyntax>()` is not a call to the
             // `Allocate()` beside it: writing type arguments rules out every
             // candidate that has none to take.
@@ -1464,6 +1495,8 @@ impl BodyBinder<'_> {
                 .zip(explicit.iter().cloned())
                 .collect()
         };
+        method_substitution.extend(settled);
+        let type_parameters = all_type_parameters;
         // A varargs method takes one more argument than it has parameters:
         // the `__arglist(...)`, which nothing else takes (§II.23.2.2).
         let vararg = symbols
@@ -1642,7 +1675,7 @@ impl BodyBinder<'_> {
             Type::ByRef(inner) => inner,
             other => other,
         };
-        if given == taken {
+        if self.identical(given, taken) {
             return true;
         }
         // `array.M()` reaches `M(this ReadOnlySpan<T>)` through an implicit
@@ -1847,7 +1880,7 @@ impl BodyBinder<'_> {
                         // `0.Goo()` does not reach `Goo(this long)`.
                         let symbols = self.binder.compilation().symbols();
                         if receiver
-                            && argument != parameter
+                            && !self.identical(argument, parameter)
                             && !argument.is_error()
                             && !parameter.is_reference_type(symbols)
                             && !matches!(parameter, Type::TypeParameter(_))
@@ -2039,10 +2072,18 @@ impl BodyBinder<'_> {
     pub(super) fn omits_refs(&self, method: SymbolId) -> bool {
         let symbols = self.binder.compilation().symbols();
         let symbol = symbols.get(method);
-        !symbol.modifiers.contains(crate::symbol::Modifiers::STATIC)
-            && symbol
-                .container
-                .is_some_and(|container| self.binder.is_com_import(container))
+        // A method an extension block (C# 14) gave a `[ComImport]` type is
+        // one of its own.
+        let block = symbol
+            .as_method()
+            .and_then(|detail| detail.extended.filter(|_| detail.is_extension))
+            .and_then(|extended| self.resolve_extended(extended).symbol())
+            .is_some_and(|extended| self.binder.is_com_import(extended));
+        block
+            || (!symbol.modifiers.contains(crate::symbol::Modifiers::STATIC)
+                && symbol
+                    .container
+                    .is_some_and(|container| self.binder.is_com_import(container)))
     }
 
     /// Whether the code here may name a type: every type in it is one it

@@ -18605,6 +18605,424 @@ static class Program
 }
 
 #[test]
+fn extension_block_indexers_resolve_and_run_as_the_real_compiler_has_them() {
+    check(
+        "extension_block_indexers",
+        r#"
+using System;
+using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
+
+class Plain { public int this[long i] => -1; }
+class Box { }
+class Cell<T> { public T V; }
+class Counted { public int Length => 5; public int this[int i] { get { Console.WriteLine("instance get " + i); return i; } } }
+class Bare { }
+class Holder { }
+class Item { public int F; }
+struct Wrapped { public int V; }
+
+static class Ext
+{
+    extension(Plain p)
+    {
+        public int this[int i] => i + 100;
+        public string this[string s, [CallerMemberName] string m = ""] => s + m;
+    }
+    extension(Box b)
+    {
+        public int this[int i, int j = 5] { get => i + j; set { Console.WriteLine("set " + i + " " + j + " " + value); } }
+        public int this[params int[] xs] => xs.Length;
+    }
+    extension<T>(Cell<T> c)
+    {
+        public T this[int i] { get => c.V; set { c.V = value; } }
+    }
+    extension(int n)
+    {
+        public int this[int j] => n * 10 + j;
+    }
+    extension(Counted c)
+    {
+        public int Slice(int start, int length) { Console.WriteLine("slice " + start + " " + length); return start + length; }
+    }
+    extension(Bare b)
+    {
+        public int Length => 3;
+        public int this[int i] { get { Console.WriteLine("ext get " + i); return i * 2; } set { Console.WriteLine("ext set " + i + " " + value); } }
+        public int Slice(int start, int length) => start * 100 + length;
+    }
+    extension(Holder h)
+    {
+        public Item P { get => new Item(); }
+        public int this[int i, string text] => i;
+    }
+    extension(Wrapped w)
+    {
+        public int this[int i] => w.V + i;
+    }
+    extension(string s)
+    {
+        public int Q => 42;
+    }
+    extension(object o)
+    {
+        public int Q => 1;
+        public static int Z => 7;
+    }
+    extension(Item i)
+    {
+        public static Item operator !(Item a) => new Item { F = -a.F };
+        public static Item operator -(Item a) => new Item { F = a.F + 1000 };
+    }
+}
+
+class P
+{
+    static void Main()
+    {
+        var p = new Plain();
+        Console.WriteLine(p[1]);
+        Console.WriteLine(p["x"]);
+        var b = new Box();
+        Console.WriteLine(b[1] + " " + b[1, 2] + " " + b[1, 2, 3]);
+        b[4] = 7;
+        b[4, 9] += 3;
+        var c = new Cell<string>();
+        c[0] = "hi";
+        c[0] += "!";
+        Console.WriteLine(c[0]);
+        int n = 4;
+        Console.WriteLine(n[2] + " " + 7[1]);
+        Box nb = null;
+        Console.WriteLine(nb?[3]);
+        Console.WriteLine(b?[3]);
+        var k = new Counted();
+        Console.WriteLine(k[^1]);
+        Console.WriteLine(k[1..3]);
+        var d = new Bare();
+        Console.WriteLine(d[^1]);
+        d[^2] = 10;
+        d[^1] += 5;
+        Console.WriteLine(d[1..^1]);
+        var h = new Holder();
+        Console.WriteLine(h[3, $"x{n}"]);
+        var cell = new Cell<int> { [0] = 9 };
+        Console.WriteLine(cell.V);
+        Console.WriteLine(new Wrapped { V = 5 }[2]);
+        Console.WriteLine("s".Q + " " + new Box().Q);
+        Console.WriteLine(new Holder { P = { F = 3 } } != null);
+        Console.WriteLine((!new Item { F = 4 }).F + " " + (-new Item { F = 4 }).F);
+    }
+}
+"#,
+        "-1\nxMain\n6 3 3\nset 4 5 7\nset 4 9 16\nhi!\n42 71\n\n8\ninstance get 4\n4\nslice 1 2\n3\next get 2\n4\next set 1 10\next get 2\next set 2 9\n101\n3\n9\n7\n42 1\nTrue\n-4 1004\n",
+    );
+}
+
+#[test]
+fn extension_blocks_come_after_what_the_language_and_the_type_have_themselves() {
+    check(
+        "ext_order_predefined_unary",
+        r#"
+public static class Extensions1
+{
+    extension(S2)
+    {
+        public static S2 operator +(S2 x) => throw null;
+    }
+}
+
+public struct S2
+{
+    public static implicit operator int(S2 x)
+    {
+        System.Console.Write("operator2");
+        return 0;
+    }
+}
+
+class Program
+{
+    static void Main()
+    {
+        var s2 = new S2();
+        int x = +s2;
+    }
+}
+"#,
+        "operator2",
+    );
+    check(
+        "ext_order_predefined_increment",
+        r#"
+public static class Extensions1
+{
+    extension(S2)
+    {
+        public static S2 operator ++(S2 x) => throw null;
+    }
+}
+
+public struct S2
+{
+    public static implicit operator int(S2 x)
+    {
+        System.Console.Write("operator2");
+        return 0;
+    }
+    public static implicit operator S2(int x)
+    {
+        System.Console.Write("operator3");
+        return default;
+    }
+}
+
+class Program
+{
+    static void Main()
+    {
+        var s2 = new S2();
+        ++s2;
+    }
+}
+"#,
+        "operator2operator3",
+    );
+    check(
+        "ext_order_predefined_logical",
+        r#"
+public static class Extensions1
+{
+    extension(S2)
+    {
+        public static S2 operator &(S2 x, S2 y) => throw null;
+        public static bool operator true (S2 x) => throw null;
+        public static bool operator false(S2 x) => throw null;
+    }
+}
+
+public struct S2
+{
+    public static implicit operator bool(S2 x)
+    {
+        System.Console.Write("operator3");
+        return true;
+    }
+}
+
+class Program
+{
+    static void Main()
+    {
+        var s2 = new S2();
+        bool x = s2 && s2;
+    }
+}
+"#,
+        "operator3operator3",
+    );
+    check(
+        "ext_order_own_index_pattern",
+        r#"
+var c = new C();
+System.Console.Write(c[^1]);
+
+static class E
+{
+    extension(C c)
+    {
+        public int this[System.Index i] { get => throw null; }
+    }
+}
+
+class C
+{
+    public int Length => 3;
+    public int this[int i]
+    {
+        get { System.Console.Write($"instance({i}) "); return 99; }
+    }
+}
+"#,
+        "instance(2) 99",
+    );
+    check(
+        "ext_order_own_range_pattern",
+        r#"
+var c = new C();
+System.Console.Write(c[1..^1]);
+
+static class E
+{
+    extension(C c)
+    {
+        public int this[System.Range r] { get => throw null; }
+    }
+}
+
+class C
+{
+    public int Length => 5;
+    public C Slice(int start, int length)
+    {
+        System.Console.Write($"instance({start}, {length}) ");
+        return new C();
+    }
+}
+"#,
+        "instance(1, 3) C",
+    );
+    check(
+        "ext_order_color_color_instance",
+        r#"
+using N;
+
+Color.M2(new Color());
+
+class Color
+{
+    public static void M2(Color Color)
+    {
+        Color.M();
+    }
+}
+
+static class E1
+{
+    extension(Color c)
+    {
+        public void M() { System.Console.Write("ran"); }
+    }
+}
+
+namespace N
+{
+    static class E2
+    {
+        extension(Color)
+        {
+            public static void M() => throw null;
+        }
+    }
+}
+"#,
+        "ran",
+    );
+    check(
+        "ext_order_explicit_type_arguments",
+        r#"
+string.M<object, long>(42);
+
+static class E
+{
+    extension<T>(T t)
+    {
+        public static void M<U>(U u) { System.Console.Write("ran"); }
+    }
+}
+"#,
+        "ran",
+    );
+    check(
+        "ext_order_generic_handler_receiver",
+        r#"
+using System;
+class Porgram
+{
+    static void Main()
+    {
+        E<MyClass>.field = new MyClass();
+        Test1<MyClass>();
+        Test2<MyClass>();
+        Test3<MyClass>();
+        Test4<MyClass>();
+    }
+
+    static void Test1<T>()
+    {
+        E<T>.field.M(Increment(), $"");
+    }
+
+    static void Test2<T>()
+    {
+        E.M(E<T>.field, Increment(), $"");
+    }
+
+    static void Test3<T>() where T : class
+    {
+        E<T>.field.M(Increment(), $"");
+    }
+
+    static void Test4<T>() where T : class
+    {
+        E.M(E<T>.field, Increment(), $"");
+    }
+                
+    static int Increment() => (E<MyClass>.field = new MyClass() { i = E<MyClass>.field.i + 1 }).i;
+}
+[System.Runtime.CompilerServices.InterpolatedStringHandler]
+public struct InterpolationHandler<TR>
+{
+
+    public InterpolationHandler(int literalLength, int formattedCount, TR s)
+    {
+        System.Console.Write(((MyClass)(object)s).i);
+        E<MyClass>.field = new MyClass() { i = E<MyClass>.field.i + 1 };
+    }
+    public void AppendLiteral(string value) { }
+    public void AppendFormatted<T>(T hole, int alignment = 0, string format = null) => throw null;
+}
+
+public class MyClass
+{
+    public int i;
+}
+
+public static class E
+{
+    extension<T>(T s)
+    {
+        public void M(int i, [System.Runtime.CompilerServices.InterpolatedStringHandlerArgument("s")] InterpolationHandler<T> h)
+        {
+            System.Console.Write(((MyClass)(object)s).i);
+            E<MyClass>.field = new MyClass() { i = E<MyClass>.field.i + 1 };
+        }
+    }
+}
+
+public static class E<T>
+{
+    public static T field;
+}            
+
+namespace System.Runtime.CompilerServices
+{
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct, AllowMultiple = false, Inherited = false)]
+    public sealed class InterpolatedStringHandlerAttribute : Attribute
+    {
+        public InterpolatedStringHandlerAttribute()
+        {
+        }
+    }
+}
+
+namespace System.Runtime.CompilerServices
+{
+    [AttributeUsage(AttributeTargets.Parameter, AllowMultiple = false, Inherited = false)]
+    public sealed class InterpolatedStringHandlerArgumentAttribute : Attribute
+    {
+        public InterpolatedStringHandlerArgumentAttribute(string argument) => Arguments = new string[] { argument };
+        public InterpolatedStringHandlerArgumentAttribute(params string[] arguments) => Arguments = arguments;
+        public string[] Arguments { get; }
+    }
+}
+"#,
+        "00336699",
+    );
+}
+
+#[test]
 fn an_extension_property_wins_over_an_extension_method_of_its_name_that_is_no_nearer() {
     check(
         "extension_property_and_method_names",

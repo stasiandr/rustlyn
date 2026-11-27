@@ -455,16 +455,33 @@ impl BodyBinder<'_> {
         }
         // `C.Make()` reaching a static method an extension block (C# 14)
         // gave `C`, where `C` has none of that name itself.
-        if candidates.is_empty() && names_a_type == Some(true) {
+        // A name that is both a value and a type (`Color.M()`) reaches them
+        // too.
+        let through_type = names_a_type == Some(true)
+            || (names_a_type.is_none()
+                && callee.kind() == SyntaxKind::SimpleMemberAccessExpression
+                && !self.extensions_here(&name).iter().any(|method| {
+                    symbols
+                        .get(*method)
+                        .as_method()
+                        .is_some_and(|detail| detail.type_parameters.is_empty())
+                        && self.extension_takes(*method, &receiver_type)
+                }));
+        if candidates.is_empty() && through_type {
             for candidate in self.binder.extension_members_in_scope(&self.context, &name) {
-                let Some(extended) = symbols
-                    .get(candidate)
-                    .as_method()
-                    .and_then(|detail| detail.extended)
-                else {
+                let Some(detail) = symbols.get(candidate).as_method() else {
                     continue;
                 };
-                if self.static_extension_fits(extended, &self.binder.self_type(container)) {
+                let Some(extended) = detail.extended else {
+                    continue;
+                };
+                let generics = self.block_generics(&detail.type_parameters);
+                let written = if receiver_type.symbol() == Some(container) {
+                    receiver_type.clone()
+                } else {
+                    self.binder.self_type(container)
+                };
+                if self.static_extension_fits_with(extended, &written, &generics) {
                     candidates.push(candidate);
                 }
             }
@@ -573,6 +590,11 @@ impl BodyBinder<'_> {
         let explicit = self.explicit_type_arguments(&name_node);
 
         let mut arguments = arguments;
+        // `Task<bool>.M()` for a static member of `extension<T>(Task<T>)`:
+        // the type written settles what the block's `T` is.
+        if through_type && explicit.is_empty() {
+            self.settle_static_receiver(&candidates, &receiver_type);
+        }
         let resolved = if candidates.is_empty() {
             None
         } else if by_candidate {
@@ -606,6 +628,7 @@ impl BodyBinder<'_> {
             )
         };
 
+        self.static_receiver.borrow_mut().clear();
         // A property an extension block (C# 14) gave the receiver, holding a
         // delegate, is what `x.P()` calls where no extension method of the
         // name is nearer than the block.
@@ -1320,6 +1343,47 @@ impl BodyBinder<'_> {
         ))
     }
 
+    /// What the type a static member of an extension block (C# 14) is
+    /// reached through says the block's type parameters are.
+    fn settle_static_receiver(&mut self, candidates: &[SymbolId], receiver: &Type) {
+        let symbols = self.binder.compilation().symbols();
+        let mut settled: HashMap<SymbolId, Type> = HashMap::new();
+        for candidate in candidates {
+            let Some(detail) = symbols.get(*candidate).as_method() else {
+                continue;
+            };
+            // An instance member takes its receiver as an argument, which says
+            // what the block's type parameters are by itself.
+            let Some(extended) = detail.extended.filter(|_| !detail.is_extension) else {
+                continue;
+            };
+            let generics = self.block_generics(&detail.type_parameters);
+            if generics.is_empty() {
+                continue;
+            }
+            let pattern = self.resolve_extended(extended);
+            let mut inferred = HashMap::new();
+            self.infer_into(&pattern, receiver, &generics, &mut inferred);
+            // What was inferred has to make the type the block extends the
+            // one written: two arguments that disagree about the `T` of an
+            // invariant `I<T, T>` settle nothing, and the call is left to
+            // say it cannot tell.
+            if generics
+                .iter()
+                .all(|generic| inferred.contains_key(generic))
+                && {
+                    let extended = pattern.substitute(&inferred);
+                    *receiver == extended
+                        || (self.binder.converts_implicitly(receiver, &extended)
+                            && self.receiver_converts(receiver, &extended))
+                }
+            {
+                settled.extend(inferred);
+            }
+        }
+        *self.static_receiver.borrow_mut() = settled;
+    }
+
     /// `receiver.Name()` as a call to an extension method in scope, for a
     /// call the compiler makes rather than the source: no name node to note
     /// a reference under, and no arguments beyond the receiver.
@@ -1334,7 +1398,7 @@ impl BodyBinder<'_> {
 
     /// The same with arguments after the receiver: the `Add` a collection
     /// initializer calls may be an extension (§12.8.17.4).
-    fn extension_call_with(
+    pub(super) fn extension_call_with(
         &mut self,
         name: &str,
         receiver: BoundExpression,
