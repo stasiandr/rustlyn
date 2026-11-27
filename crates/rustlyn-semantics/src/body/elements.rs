@@ -1155,16 +1155,14 @@ impl BodyBinder<'_> {
         // for an array, whose own element access and slicing come first.
         // And what the type itself counts and indexes or slices with comes
         // before it.
-        let int = self.special(SpecialType::Int32);
+        // The pattern is exact: an indexer of one `int` and no more, a
+        // `Slice` of two. `this[int i, object o = null]` is not it, and the
+        // block's indexer is what `c[^1]` means then.
         let own_pattern = self.length_through(receiver, span, false).is_some()
             && if is_index {
-                self.takes_directly(&receiver.ty, &int)
+                self.takes_only_ints(&receiver.ty, &["this[]"], 1)
             } else {
-                receiver.ty.symbol().is_some_and(|symbol| {
-                    ["Substring", "Slice"]
-                        .iter()
-                        .any(|name| !self.binder.lookup_member(symbol, name).is_empty())
-                })
+                self.takes_only_ints(&receiver.ty, &["Substring", "Slice"], 2)
             };
         if !own_pattern
             && !matches!(receiver.ty, Type::Array { .. })
@@ -1379,6 +1377,40 @@ impl BodyBinder<'_> {
             ty,
             span,
         ))
+    }
+
+    /// Whether the type has a member of one of these names that takes
+    /// exactly `count` parameters, each an `int`: the indexer or the `Slice`
+    /// the language reads `x[^1]` and `x[a..b]` through.
+    fn takes_only_ints(&self, receiver: &Type, names: &[&str], count: usize) -> bool {
+        let Some(symbol) = receiver.symbol() else {
+            return false;
+        };
+        let symbols = self.binder.compilation().symbols();
+        let int = self.special(SpecialType::Int32);
+        names.iter().any(|name| {
+            self.binder
+                .lookup_member(symbol, name)
+                .into_iter()
+                .any(|member| {
+                    let parameters = match symbols.get(member).kind {
+                        SymbolKind::Method => symbols
+                            .get(member)
+                            .as_method()
+                            .map(|detail| detail.parameters.clone()),
+                        _ => symbols
+                            .get(member)
+                            .as_property()
+                            .map(|detail| detail.parameters.clone()),
+                    };
+                    parameters.is_some_and(|parameters| {
+                        parameters.len() == count
+                            && parameters.iter().all(|parameter| {
+                                self.binder.type_of(*parameter, &mut Diagnostics::new()) == int
+                            })
+                    })
+                })
+        })
     }
 
     /// Whether a type has an indexer that takes this type as it stands.
