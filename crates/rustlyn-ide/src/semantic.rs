@@ -121,6 +121,9 @@ pub struct Semantic {
     /// The types the signature of each member of the project mentions: what
     /// [`implicit`] looks up the members that bring a value of a type by.
     member_types: std::sync::OnceLock<Vec<implicit::MemberTypes>>,
+    /// What every question of [`failability`] finds out about the project
+    /// as a whole: where each name is used, who calls what.
+    failing: failability::Shared,
 }
 
 /// How many bound bodies are kept before the cache starts over. A body is
@@ -424,6 +427,7 @@ impl Semantic {
             implicit: Mutex::new(HashMap::new()),
             reaching: Mutex::new(HashMap::new()),
             member_types: std::sync::OnceLock::new(),
+            failing: failability::Shared::default(),
         }
     }
 
@@ -541,6 +545,7 @@ impl Semantic {
             implicit: Mutex::new(HashMap::new()),
             reaching: Mutex::new(HashMap::new()),
             member_types: std::sync::OnceLock::new(),
+            failing: failability::Shared::default(),
         })
     }
 

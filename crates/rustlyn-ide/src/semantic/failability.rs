@@ -53,6 +53,19 @@
 //! type is not known) may run another body than the one it names, and what
 //! it fails with is unknown.
 //!
+//! A library call that throws on what it is given (`int.Parse`, `First()`, a
+//! dictionary's indexer, a collection's constructor) is judged by what the
+//! library does, and by a text only where every culture the runtime ships
+//! reads it alike: see [`parse`]. What a call is handed that depends on the
+//! culture the program runs under is *possible* or *unknown*, never one of
+//! the certain verdicts.
+//!
+//! What the project's calls pass for a parameter is the whole of what it gets
+//! only where nothing else reaches the member: a base or an interface, the
+//! runtime or a framework (an entry, an attribute, a Unity message), a
+//! delegate, a call by name at run time (`dynamic`, reflection), a body that
+//! does not compile. [`Origin`] says which.
+//!
 //! The values of an input are those it can have at any time, over the whole
 //! project: a field holds whatever any write gives it. That errs towards
 //! *possible*; the order of events is followed only to tell which reads of
@@ -66,8 +79,8 @@ use std::sync::Arc;
 use rustlyn_semantics::{
     BinaryOperator, BoundBody, BoundExpression, BoundExpressionKind as E, BoundPattern,
     BoundPatternKind as P, BoundStatement, BoundStatementKind as S, BoundSwitchLabel,
-    ConstantValue, LocalId, MethodKind, Modifiers, RefKind, SemanticModel, SpecialType, SymbolId,
-    SymbolKind, Type, TypeKind, UnaryOperator,
+    ConstantValue, ConversionKind, DynamicOperation, LocalId, MethodKind, Modifiers, RefKind,
+    SemanticModel, SpecialType, SymbolId, SymbolKind, Type, TypeKind, UnaryOperator,
 };
 use rustlyn_syntax::{SyntaxKind, SyntaxNode};
 use rustlyn_text::TextSpan;
@@ -229,9 +242,23 @@ pub enum Origin {
     Callers { count: usize },
     /// Nothing in the project calls the member: what it gets is not known.
     NoCallers,
-    /// The member is reached in ways the calls do not show: it is virtual,
-    /// an interface's, or used as a delegate.
+    /// The member is reached through a base or an interface: it is
+    /// virtual, an override, or implements an interface's member.
     Escapes,
+    /// The runtime or a framework calls the member: `Main`, a static
+    /// constructor, a method an attribute marks (a test, a serialization
+    /// callback), a Unity message.
+    EntryPoint,
+    /// The member is used as a delegate: who calls it is not seen.
+    Delegate,
+    /// A method of this name is used as a delegate, and which one the
+    /// delegate takes is not told.
+    NamedAsDelegate,
+    /// Something calls it by name at run time: a `dynamic` call, a lookup by
+    /// reflection.
+    ByName,
+    /// A body that may call it could not be read: it does not compile.
+    Unread,
     /// What the field's initializer and assignments write.
     Writes { readonly: bool },
     /// Nothing ever writes the field: it keeps its default.
@@ -347,6 +374,21 @@ impl Abs {
         for value in values {
             match f(value) {
                 Some(mapped) => out = out.union(Self::one(mapped)),
+                None => return Self::Top,
+            }
+        }
+        out
+    }
+
+    /// Each value mapped to what it can come to, the results joined.
+    fn flat_map(&self, f: &dyn Fn(&Val) -> Option<Self>) -> Self {
+        let Self::Set(values) = self else {
+            return Self::Top;
+        };
+        let mut out = Self::Set(Vec::new());
+        for value in values {
+            match f(value) {
+                Some(mapped) => out = out.union(mapped),
                 None => return Self::Top,
             }
         }
@@ -525,8 +567,13 @@ enum Test {
     Equals(BoundExpression, BoundExpression),
     /// That the index is outside the array.
     OutOfRange(BoundExpression, BoundExpression),
-    /// That the string parses as the number type.
-    Parses(BoundExpression, SpecialType),
+    /// That parsing the string comes to an end that fails the way said.
+    Parses(BoundExpression, Parsing),
+    /// That the number is below zero.
+    Negative(BoundExpression),
+    /// Something known to hold where the code is, said in words: "the stack
+    /// was made empty".
+    Fact(String),
     /// That the value matches one of these labels of a `switch`: each a
     /// pattern, and the `when` that has to hold with it.
     Matches(BoundExpression, Arc<Vec<Label>>, Range<usize>),
@@ -540,6 +587,15 @@ enum Test {
     /// That the filter of a `catch` holds. A filter whose value is not
     /// known may hold or not.
     Filter(BoundExpression),
+}
+
+/// A parse of a string, and the failure of it that a condition is about.
+#[derive(Clone, Copy, Debug)]
+struct Parsing {
+    target: parse::Target,
+    culture: parse::Culture,
+    /// `parse::FORMAT` or `parse::OVERFLOW`.
+    fails: u8,
 }
 
 /// A `case` of a switch statement or an arm of a switch expression.
@@ -557,6 +613,7 @@ impl Test {
             | Self::Null(e)
             | Self::Zero(e)
             | Self::Parses(e, _)
+            | Self::Negative(e)
             | Self::Filter(e) => vec![e],
             Self::Equals(a, b) | Self::OutOfRange(a, b) => vec![a, b],
             Self::Matches(governing, labels, range) => {
@@ -567,7 +624,7 @@ impl Test {
                 }
                 found
             }
-            Self::Opaque(_) | Self::Reach(_) => Vec::new(),
+            Self::Opaque(_) | Self::Reach(_) | Self::Fact(_) => Vec::new(),
         }
     }
 }
@@ -594,6 +651,10 @@ struct Found {
     span: TextSpan,
     conditions: Vec<Cond>,
     chain: Vec<CallStep>,
+    /// A finding only where the values say it can happen: a value nobody
+    /// knows may be out of range or null, and that is not worth a line
+    /// beside every call.
+    by_value: bool,
 }
 
 struct Engine<'s> {
@@ -635,6 +696,160 @@ struct Scan {
     closure: HashSet<Atom>,
 }
 
+/// What every question finds out about the project as a whole, kept for the
+/// next one: asking about each member of a project would otherwise read
+/// every file again for each.
+#[derive(Default)]
+pub(super) struct Shared {
+    mentions: std::sync::OnceLock<Mentions>,
+    /// The calls of each member, as found.
+    calls: std::sync::Mutex<HashMap<SymbolId, Arc<Vec<RawSite>>>>,
+    /// The writes to each field, as found.
+    writes: std::sync::Mutex<HashMap<SymbolId, Arc<FieldWrites>>>,
+    /// How each member is reached other than by name, where it is.
+    reached: std::sync::Mutex<HashMap<SymbolId, Option<Origin>>>,
+}
+
+/// How many members' calls and fields' writes are kept before the cache
+/// starts over: each holds the bodies that make them.
+const KEPT_FINDINGS: usize = 4096;
+
+fn kept<K: std::hash::Hash + Eq, V: Clone>(
+    cache: &std::sync::Mutex<HashMap<K, V>>,
+    key: &K,
+) -> Option<V> {
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+        .cloned()
+}
+
+fn keep<K: std::hash::Hash + Eq, V>(cache: &std::sync::Mutex<HashMap<K, V>>, key: K, value: V) {
+    let mut kept = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if kept.len() >= KEPT_FINDINGS {
+        kept.clear();
+    }
+    kept.insert(key, value);
+}
+
+impl Shared {
+    fn mentions(&self, semantic: &Semantic) -> &Mentions {
+        self.mentions.get_or_init(|| Mentions::of(semantic))
+    }
+}
+
+/// Where each name is written: the body or declaration that holds each
+/// identifier, found in one pass over every file.
+#[derive(Default)]
+struct Mentions {
+    /// Each name's places, by file and then by position.
+    names: HashMap<String, Vec<Mention>>,
+    /// The `this` and `base` of constructor initializers, likewise.
+    keywords: Vec<Mention>,
+    /// The string literals that spell a name, likewise: what a lookup by
+    /// name, in reflection, is given.
+    strings: HashMap<String, Vec<Mention>>,
+}
+
+/// The first place a name is written in one body.
+struct Mention {
+    tree: usize,
+    at: u32,
+    owner: SyntaxNode,
+}
+
+impl Mentions {
+    fn of(semantic: &Semantic) -> Self {
+        let mut found = Self::default();
+        let mut trees: Vec<usize> = semantic.paths.keys().copied().collect();
+        trees.sort_unstable();
+        for tree in trees {
+            let Some(parsed) = semantic.compilation.trees().get(tree) else {
+                continue;
+            };
+            let mut seen: HashSet<(Option<String>, TextSpan)> = HashSet::new();
+            for token in parsed.root().descendant_tokens() {
+                if token.kind() == SyntaxKind::StringLiteralToken {
+                    let rustlyn_syntax::TokenValue::String(text) = token.value() else {
+                        continue;
+                    };
+                    let text = text.to_string();
+                    if !text.is_empty()
+                        && text.chars().all(|c| c.is_alphanumeric() || c == '_')
+                        && let Some(owner) = SemanticModel::body_owner(token.parent())
+                        && seen.insert((Some(format!("\"{text}")), owner.span()))
+                    {
+                        found.strings.entry(text).or_default().push(Mention {
+                            tree,
+                            at: token.span().start(),
+                            owner,
+                        });
+                    }
+                    continue;
+                }
+                let name = match token.kind() {
+                    SyntaxKind::IdentifierToken => Some(token.value_text().to_string()),
+                    SyntaxKind::ThisKeyword | SyntaxKind::BaseKeyword => None,
+                    _ => continue,
+                };
+                let Some(owner) = SemanticModel::body_owner(token.parent()) else {
+                    continue;
+                };
+                if !seen.insert((name.clone(), owner.span())) {
+                    continue;
+                }
+                let mention = Mention {
+                    tree,
+                    at: token.span().start(),
+                    owner,
+                };
+                match name {
+                    Some(name) => found.names.entry(name).or_default().push(mention),
+                    None => found.keywords.push(mention),
+                }
+            }
+        }
+        found
+    }
+
+    /// The owners in `tree` that hold `word` as a string literal.
+    fn in_strings(&self, tree: usize, word: &str) -> Vec<SyntaxNode> {
+        let Some(list) = self.strings.get(word) else {
+            return Vec::new();
+        };
+        let from = list.partition_point(|m| m.tree < tree);
+        let to = list.partition_point(|m| m.tree <= tree);
+        list[from..to].iter().map(|m| m.owner.clone()).collect()
+    }
+
+    /// The owners in `tree` that write `word` — and, for a constructor's
+    /// callers, `this` or `base` — each once, in the order they first do.
+    fn owners(&self, tree: usize, word: &str, constructor: bool) -> Vec<SyntaxNode> {
+        fn of_tree(list: &[Mention], tree: usize) -> &[Mention] {
+            let from = list.partition_point(|m| m.tree < tree);
+            let to = list.partition_point(|m| m.tree <= tree);
+            &list[from..to]
+        }
+        let named = self
+            .names
+            .get(word)
+            .map_or(&[][..], |list| of_tree(list, tree));
+        if !constructor {
+            return named.iter().map(|m| m.owner.clone()).collect();
+        }
+        let mut both: Vec<&Mention> = named.iter().chain(of_tree(&self.keywords, tree)).collect();
+        both.sort_by_key(|m| m.at);
+        let mut seen = HashSet::new();
+        both.into_iter()
+            .filter(|m| seen.insert(m.owner.span()))
+            .map(|m| m.owner.clone())
+            .collect()
+    }
+}
+
 impl Semantic {
     /// Every way the member at `offset` of `path` can fail, and whether each
     /// can happen. The member is the one the cursor names — a method, a
@@ -657,6 +872,7 @@ impl Semantic {
         engine.collect(frame, &[], &[], &mut stack, &mut found);
         let mut failures: Vec<Failure> = Vec::new();
         for found in found {
+            let by_value = found.by_value;
             let failure = engine.judge(found);
             // A null or an index nobody can tell is not a finding: every
             // member reached through something would be one.
@@ -665,6 +881,9 @@ impl Semantic {
                 FailureKind::NullReference | FailureKind::IndexOutOfRange
             );
             if implicit && matches!(failure.verdict, Verdict::Unknown | Verdict::Never) {
+                continue;
+            }
+            if by_value && matches!(failure.verdict, Verdict::Unknown | Verdict::Never) {
                 continue;
             }
             // The same receiver dereferenced again fails at the first one.
@@ -1217,7 +1436,13 @@ impl<'s> Engine<'s> {
         } else if results.iter().all(|r| *r == Tri::True) {
             Verdict::Always
         } else if results.contains(&Tri::Unknown) {
-            Verdict::Unknown
+            // Inputs that nothing says anything of can still be asked for
+            // two things no value does at once.
+            if self.contradictory(&found.conditions) {
+                Verdict::Never
+            } else {
+                Verdict::Unknown
+            }
         } else {
             Verdict::Possible
         };
@@ -1237,6 +1462,186 @@ impl<'s> Engine<'s> {
             chain: found.chain,
             verdict,
             inputs,
+        }
+    }
+
+    /// Whether comparisons of one integer, as it is at one place, with
+    /// constants rule each other out whatever it is: `x > 0` and `x < 0`,
+    /// `i < 3` and `i == 5`. Nothing else is looked at.
+    fn contradictory(&mut self, conds: &[Cond]) -> bool {
+        #[derive(Default)]
+        struct Range {
+            low: Option<i128>,
+            high: Option<i128>,
+            not: Vec<i128>,
+        }
+        let mut ranges: HashMap<Key, Range> = HashMap::new();
+        let mut facts: Vec<(Key, BinaryOperator, i128)> = Vec::new();
+        for cond in conds {
+            if let Test::Truth(e) = &cond.test {
+                self.comparisons(cond, e, cond.holds, &mut facts);
+            }
+        }
+        for (key, operator, constant) in facts {
+            let range = ranges.entry(key).or_default();
+            let (c, narrower) = (constant, |old: Option<i128>, new: i128, low: bool| {
+                Some(match old {
+                    Some(old) if low => old.max(new),
+                    Some(old) => old.min(new),
+                    None => new,
+                })
+            });
+            match operator {
+                BinaryOperator::LessThan => range.high = narrower(range.high, c - 1, false),
+                BinaryOperator::LessThanOrEqual => range.high = narrower(range.high, c, false),
+                BinaryOperator::GreaterThan => range.low = narrower(range.low, c + 1, true),
+                BinaryOperator::GreaterThanOrEqual => range.low = narrower(range.low, c, true),
+                BinaryOperator::Equality => {
+                    range.low = narrower(range.low, c, true);
+                    range.high = narrower(range.high, c, false);
+                }
+                _ => range.not.push(c),
+            }
+            if let (Some(low), Some(high)) = (range.low, range.high)
+                && (low > high || (low == high && range.not.contains(&low)))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The comparisons of an integer with a constant that `e` says hold, or
+    /// that do not hold, in `facts`: through `!`, `&&` where it holds and
+    /// `||` where it does not.
+    fn comparisons(
+        &mut self,
+        cond: &Cond,
+        e: &BoundExpression,
+        holds: bool,
+        facts: &mut Vec<(Key, BinaryOperator, i128)>,
+    ) {
+        let e = strip(e);
+        match &e.kind {
+            E::Unary {
+                operator: UnaryOperator::LogicalNot,
+                operand,
+            } => self.comparisons(cond, operand, !holds, facts),
+            E::Binary {
+                operator: BinaryOperator::LogicalAnd,
+                left,
+                right,
+            } if holds => {
+                self.comparisons(cond, left, true, facts);
+                self.comparisons(cond, right, true, facts);
+            }
+            E::Binary {
+                operator: BinaryOperator::LogicalOr,
+                left,
+                right,
+            } if !holds => {
+                self.comparisons(cond, left, false, facts);
+                self.comparisons(cond, right, false, facts);
+            }
+            E::Binary {
+                operator,
+                left,
+                right,
+            } => {
+                use BinaryOperator as B;
+                if !matches!(
+                    operator,
+                    B::Equality
+                        | B::Inequality
+                        | B::LessThan
+                        | B::LessThanOrEqual
+                        | B::GreaterThan
+                        | B::GreaterThanOrEqual
+                ) {
+                    return;
+                }
+                // The constant is on one side, a variable on the other.
+                let (variable, constant, operator) = match (
+                    self.integer_place(cond.frame, left),
+                    self.constant_integer(right),
+                    self.integer_place(cond.frame, right),
+                    self.constant_integer(left),
+                ) {
+                    (Some(place), Some(c), _, _) => (place, c, *operator),
+                    (_, _, Some(place), Some(c)) => {
+                        let mirrored = match operator {
+                            B::LessThan => B::GreaterThan,
+                            B::GreaterThan => B::LessThan,
+                            B::LessThanOrEqual => B::GreaterThanOrEqual,
+                            B::GreaterThanOrEqual => B::LessThanOrEqual,
+                            other => *other,
+                        };
+                        (place, c, mirrored)
+                    }
+                    _ => return,
+                };
+                // Where it does not hold, its opposite does: for integers
+                // that is exact.
+                let operator = if holds {
+                    operator
+                } else {
+                    match operator {
+                        B::Equality => B::Inequality,
+                        B::Inequality => B::Equality,
+                        B::LessThan => B::GreaterThanOrEqual,
+                        B::LessThanOrEqual => B::GreaterThan,
+                        B::GreaterThan => B::LessThanOrEqual,
+                        _ => B::LessThan,
+                    }
+                };
+                let at = cond.versions.get(&variable).copied().unwrap_or(0);
+                facts.push(((cond.frame, variable, at), operator, constant));
+            }
+            _ => {}
+        }
+    }
+
+    /// The variable an operand of a comparison is, where it is an integer
+    /// that nothing narrowed on the way.
+    fn integer_place(&mut self, frame: usize, e: &BoundExpression) -> Option<Atom> {
+        let mut inner = e;
+        while let E::Conversion {
+            operand,
+            conversion: ConversionKind::Numeric | ConversionKind::Identity,
+            ..
+        } = &inner.kind
+        {
+            let (from, to) = (
+                self.special(frame, &operand.ty)?,
+                self.special(frame, &inner.ty)?,
+            );
+            if !is_integral(from) || !is_integral(to) {
+                return None;
+            }
+            inner = operand;
+        }
+        let special = self.special(frame, &inner.ty)?;
+        if !is_integral(special) {
+            return None;
+        }
+        match &inner.kind {
+            E::Parameter(_) | E::Local(_) | E::Field { .. } => place_atom(inner),
+            _ => None,
+        }
+    }
+
+    /// The whole number an operand of a comparison is, where it is a
+    /// constant written out.
+    fn constant_integer(&mut self, e: &BoundExpression) -> Option<i128> {
+        let e = strip(e);
+        match &e.kind {
+            E::Literal(value) => Val::from_constant(value).integer(),
+            E::Unary {
+                operator: UnaryOperator::Minus,
+                operand,
+            } => self.constant_integer(operand).map(|n| -n),
+            E::Field { field, .. } => self.constant(*field)?.integer(),
+            _ => None,
         }
     }
 
@@ -1295,18 +1700,37 @@ impl<'s> Engine<'s> {
                     _ => None,
                 })
             }
-            Test::Parses(text, special) => {
+            Test::Parses(text, parsing) => {
                 let text = self.eval(frame, text, assignment, at);
-                let special = *special;
-                text.map(&|v| match v {
-                    Val::Str(s) => Some(Val::Bool(parses(s, special))),
-                    Val::Null => Some(Val::Bool(false)),
+                let parsing = *parsing;
+                text.flat_map(&|v| match v {
+                    Val::Str(s) => {
+                        let outcomes = parse::outcomes(s, parsing.target, parsing.culture)?;
+                        Some(if outcomes == parsing.fails {
+                            Abs::one(Val::Bool(true))
+                        } else if outcomes & parsing.fails == 0 {
+                            Abs::one(Val::Bool(false))
+                        } else {
+                            // Some cultures fail it and some do not.
+                            Abs::Set(vec![Val::Bool(true), Val::Bool(false)])
+                        })
+                    }
+                    // What a null does is another failure's to say.
+                    Val::Null => Some(Abs::one(Val::Bool(false))),
                     _ => None,
                 })
             }
             Test::Matches(governing, labels, range) => {
                 self.matches(frame, governing, &labels[range.clone()], assignment, at)
             }
+            Test::Negative(e) => {
+                let v = self.eval(frame, e, assignment, at);
+                v.map(&|v| match v.integer() {
+                    Some(n) => Some(Val::Bool(n < 0)),
+                    None => v.number().map(|n| Val::Bool(n < 0.0)),
+                })
+            }
+            Test::Fact(_) => Abs::one(Val::Bool(true)),
             Test::Opaque(_) => Abs::Top,
             Test::Reach(_) => Abs::Set(vec![Val::Bool(true), Val::Bool(false)]),
             Test::Filter(e) => match self.eval(frame, e, assignment, at) {
@@ -1457,7 +1881,12 @@ impl<'s> Engine<'s> {
         let text_of = |e: &BoundExpression| self.text(tree, e.span);
         let text = match (&cond.test, cond.holds) {
             (Test::Truth(e) | Test::Filter(e), true) => text_of(e),
-            (Test::Truth(e) | Test::Filter(e), false) => negated(e, &text_of),
+            (Test::Truth(e) | Test::Filter(e), false) => negated(
+                e,
+                &text_of,
+                &|ty| ordered_exactly(self.semantic, ty),
+                &|method| decimal_operator(self.semantic, method),
+            ),
             (Test::Null(e), holds) => {
                 format!("{} {} null", text_of(e), if holds { "==" } else { "!=" })
             }
@@ -1476,12 +1905,14 @@ impl<'s> Engine<'s> {
                 let (a, i) = (text_of(a), text_of(i));
                 format!("{i} < 0 || {i} >= {a}.Length")
             }
-            (Test::Parses(e, _), holds) => {
-                format!(
-                    "{}{} is a number",
-                    text_of(e),
-                    if holds { "" } else { " not" }
-                )
+            (Test::Parses(e, parsing), holds) => {
+                let keyword = parsing.target.keyword();
+                match (parsing.fails == parse::OVERFLOW, holds) {
+                    (false, true) => format!("{} is not a valid {keyword}", text_of(e)),
+                    (false, false) => format!("{} is a valid {keyword}", text_of(e)),
+                    (true, true) => format!("{} is outside the range of {keyword}", text_of(e)),
+                    (true, false) => format!("{} is within the range of {keyword}", text_of(e)),
+                }
             }
             (Test::Matches(governing, labels, range), holds) => {
                 let governing = text_of(governing);
@@ -1522,7 +1953,10 @@ impl<'s> Engine<'s> {
                     format!("{governing} is not ({})", patterns.join(" or "))
                 }
             }
-            (Test::Opaque(words) | Test::Reach(words), _) => words.clone(),
+            (Test::Negative(e), holds) => {
+                format!("{} {} 0", text_of(e), if holds { "<" } else { ">=" })
+            }
+            (Test::Opaque(words) | Test::Reach(words) | Test::Fact(words), _) => words.clone(),
         };
         Condition {
             text,
@@ -1558,6 +1992,11 @@ impl<'s> Engine<'s> {
                 self.read((frame, atom, version(at, &atom)), assignment)
             }
             E::Default(ty) => self.default_of(frame, ty).map_or(Abs::Top, Abs::one),
+            // A null stays one through `as`; any other value may or may not
+            // be of the type.
+            E::TryCast { operand, .. } => self
+                .eval(frame, operand, assignment, at)
+                .map(&|v| (*v == Val::Null).then_some(Val::Null)),
             E::Conversion { operand, .. } => {
                 let value = self.eval(frame, operand, assignment, at);
                 let special = self.special(frame, &e.ty);
@@ -1626,6 +2065,23 @@ impl<'s> Engine<'s> {
             E::Property { property, receiver } if self.is_auto_property(*property) => {
                 let atom = field_atom(*property, receiver.as_deref());
                 self.read((frame, atom, version(at, &atom)), assignment)
+            }
+            // What `Empty<T>()` gives has no element.
+            E::Call { method, .. } => {
+                let symbols = self.semantic.compilation.symbols();
+                let method = symbols.get(*method);
+                let empty = method.name == "Empty"
+                    && method.container.is_some_and(|c| {
+                        matches!(
+                            symbols.qualified_name(c).as_str(),
+                            "System.Linq.Enumerable" | "System.Array"
+                        )
+                    });
+                if empty {
+                    Abs::one(Val::Array(0))
+                } else {
+                    Abs::Top
+                }
             }
             _ => Abs::Top,
         }
@@ -1768,16 +2224,12 @@ impl<'s> Engine<'s> {
             origin,
             places,
         };
-        let escapes = self.escapes(member) || self.implements_interface(member);
-        let found = if escapes
+        let reached = self.reached_unseen(member);
+        let found = if reached.is_some()
             || self.caller_depth >= CALLER_DEPTH
             || !self.evaluating_params.insert(member)
         {
-            let origin = if escapes {
-                Origin::Escapes
-            } else {
-                Origin::Unknown
-            };
+            let origin = reached.unwrap_or(Origin::Unknown);
             (Abs::Top, input(&Abs::Top, origin, Vec::new()))
         } else {
             self.caller_depth += 1;
@@ -1791,7 +2243,7 @@ impl<'s> Engine<'s> {
             };
             let mut values = Abs::Set(Vec::new());
             let mut places = Vec::new();
-            let mut escaped = false;
+            let mut escaped: Option<Escape> = None;
             for site in sites.iter() {
                 match site {
                     Site::Call {
@@ -1811,7 +2263,7 @@ impl<'s> Engine<'s> {
                         };
                         values = values.union(value);
                     }
-                    Site::Escape => escaped = true,
+                    Site::Escape(why) => escaped = escaped.or(Some(*why)),
                 }
             }
             self.caller_depth -= 1;
@@ -1820,8 +2272,8 @@ impl<'s> Engine<'s> {
                 .iter()
                 .filter(|s| matches!(s, Site::Call { .. }))
                 .count();
-            if escaped {
-                (Abs::Top, input(&Abs::Top, Origin::Escapes, places))
+            if let Some(why) = escaped {
+                (Abs::Top, input(&Abs::Top, why.origin(), places))
             } else if calls == 0 {
                 (Abs::Top, input(&Abs::Top, Origin::NoCallers, places))
             } else {
@@ -1892,9 +2344,25 @@ impl<'s> Engine<'s> {
         false
     }
 
-    /// Whether a member can be reached other than by the calls that name
-    /// it: through a base or an interface, from outside the project.
-    fn escapes(&self, member: SymbolId) -> bool {
+    /// How a member is reached other than by the calls that name it, if it
+    /// is: through a base or an interface, or by the runtime or a framework.
+    fn reached_unseen(&mut self, member: SymbolId) -> Option<Origin> {
+        if let Some(found) = kept(&self.semantic.failing.reached, &member) {
+            return found;
+        }
+        let found = if self.dispatched(member) || self.implements_interface(member) {
+            Some(Origin::Escapes)
+        } else if self.entry_point(member) {
+            Some(Origin::EntryPoint)
+        } else {
+            None
+        };
+        keep(&self.semantic.failing.reached, member, found);
+        found
+    }
+
+    /// Whether calls reach the member through a base type or an interface.
+    fn dispatched(&self, member: SymbolId) -> bool {
         let symbols = self.semantic.compilation.symbols();
         let symbol = symbols.get(member);
         let dispatched = symbol.modifiers.contains(Modifiers::VIRTUAL)
@@ -1904,16 +2372,123 @@ impl<'s> Engine<'s> {
             .container
             .and_then(|c| symbols.get(c).as_named_type())
             .is_some_and(|t| t.type_kind == Some(TypeKind::Interface));
-        let entry = symbol
-            .as_method()
-            .is_some_and(|m| matches!(m.method_kind, MethodKind::StaticConstructor))
-            || symbol.name == "Main";
-        dispatched || in_interface || entry
+        dispatched || in_interface
+    }
+
+    /// Whether the runtime or a framework calls the member: the program's
+    /// entry, a static constructor, a method an attribute marks for a test
+    /// runner, a serializer or a host, a Unity message.
+    fn entry_point(&mut self, member: SymbolId) -> bool {
+        let symbols = self.semantic.compilation.symbols();
+        let symbol = symbols.get(member);
+        let Some(method) = symbol.as_method() else {
+            return false;
+        };
+        if matches!(method.method_kind, MethodKind::StaticConstructor) || symbol.name == "Main" {
+            return true;
+        }
+        if method.method_kind != MethodKind::Ordinary {
+            return false;
+        }
+        let name = symbol.name.clone();
+        let container = symbol.container;
+        // An attribute other than the few that only say how the compiler
+        // or a tool treats the method makes it a method something finds.
+        let marked = self.body_owner_of(member).is_some_and(|(_, owner)| {
+            owner
+                .children()
+                .filter(|c| c.kind() == SyntaxKind::AttributeList)
+                .any(|list| {
+                    attribute_names(&list.text())
+                        .iter()
+                        .any(|a| !is_inert_attribute(a))
+                })
+        });
+        if marked {
+            return true;
+        }
+        self.semantic.project.kind == ProjectKind::Unity
+            && is_unity_message(&name)
+            && container.is_some_and(|c| self.derives_from_engine(c))
+    }
+
+    /// Whether a type derives from one the Unity engine declares.
+    fn derives_from_engine(&mut self, ty: SymbolId) -> bool {
+        let symbols = self.semantic.compilation.symbols();
+        let Some(tree) = symbols
+            .get(ty)
+            .locations
+            .first()
+            .map(|location| location.tree)
+        else {
+            return false;
+        };
+        let Some(model) = self.model(tree) else {
+            return false;
+        };
+        let binder = model.binder();
+        let mut pending = vec![ty];
+        let mut seen = HashSet::new();
+        while let Some(ty) = pending.pop() {
+            if !seen.insert(ty) {
+                continue;
+            }
+            for base in binder.base_types_of(ty) {
+                let Type::Named { symbol: base, .. } = base else {
+                    continue;
+                };
+                if symbols.qualified_name(base).starts_with("UnityEngine.") {
+                    return true;
+                }
+                pending.push(base);
+            }
+        }
+        false
     }
 
     /// Every place in the project that calls `member`, with its arguments
     /// and a frame to evaluate them in.
     fn call_sites(&mut self, member: SymbolId) -> Vec<Site> {
+        let raw = self.raw_call_sites(member);
+        let mut sites = Vec::new();
+        for site in raw.iter() {
+            match site {
+                RawSite::Escape(why) => sites.push(Site::Escape(*why)),
+                RawSite::Call {
+                    tree,
+                    owner,
+                    body,
+                    caller,
+                    arguments,
+                    span,
+                } => {
+                    let key = (*tree, *owner);
+                    let frame = match self.caller_frames.get(&key) {
+                        Some(&frame) => frame,
+                        None => {
+                            let frame =
+                                self.push_frame(*tree, body.clone(), *caller, None, HashMap::new());
+                            self.caller_frames.insert(key, frame);
+                            frame
+                        }
+                    };
+                    sites.push(Site::Call {
+                        frame,
+                        arguments: arguments.clone(),
+                        span: *span,
+                    });
+                }
+            }
+        }
+        sites
+    }
+
+    /// The calls of `member`, found once for every question.
+    fn raw_call_sites(&mut self, member: SymbolId) -> Arc<Vec<RawSite>> {
+        let shared = &self.semantic.failing.calls;
+        if let Some(found) = kept(shared, &member) {
+            return found;
+        }
         let symbols = self.semantic.compilation.symbols();
         let symbol = symbols.get(member);
         let is_constructor = symbol
@@ -1927,40 +2502,30 @@ impl<'s> Engine<'s> {
         } else {
             symbol.name.clone()
         };
+        let container = is_constructor.then_some(symbol.container).flatten();
         let mut sites = Vec::new();
         let mut trees: Vec<usize> = self.semantic.paths.keys().copied().collect();
         trees.sort_unstable();
         for tree in trees {
-            let Some(text) = self
-                .semantic
-                .compilation
-                .trees()
-                .source(tree)
-                .map(|s| s.text())
-            else {
-                continue;
-            };
-            let mentions = contains_word(text, &word)
-                || (is_constructor && (contains_word(text, "this") || contains_word(text, "base")));
-            if !mentions {
-                continue;
-            }
-            let (bodies, missed) = self.bodies_mentioning(tree, &word, is_constructor);
+            let (bodies, missed) = self.bodies_naming(tree, &word, is_constructor);
             if missed {
-                sites.push(Site::Escape);
+                sites.push(RawSite::Escape(Escape::Unread));
             }
             for (owner, body) in bodies {
                 let caller = self
                     .view(tree)
                     .and_then(|view| view.model.declared_symbol(&owner));
                 let mut calls: Vec<(Vec<BoundExpression>, TextSpan)> = Vec::new();
-                let mut escaped = false;
+                let mut escaped: Option<Escape> = None;
                 walk_everything(&body, &mut |visited| match visited {
                     Visited::Expression(e) => match &e.kind {
                         E::Call {
                             method, arguments, ..
                         } if *method == member => {
                             calls.push((arguments.clone(), e.span));
+                        }
+                        _ if reached_by_name(self.semantic, e, &word, container) => {
+                            escaped = escaped.or(Some(Escape::ByName));
                         }
                         E::ObjectCreation {
                             constructor: Some(c),
@@ -1970,10 +2535,10 @@ impl<'s> Engine<'s> {
                         E::DelegateCreation { method, .. } | E::MethodAddress { method, .. }
                             if *method == member =>
                         {
-                            escaped = true;
+                            escaped = escaped.or(Some(Escape::Delegate));
                         }
                         E::MethodGroup { candidates, .. } if candidates.contains(&member) => {
-                            escaped = true;
+                            escaped = escaped.or(Some(Escape::NamedAsDelegate));
                         }
                         _ => {}
                     },
@@ -1989,57 +2554,57 @@ impl<'s> Engine<'s> {
                         }
                     }
                 });
-                if escaped {
-                    sites.push(Site::Escape);
+                if let Some(why) = escaped {
+                    sites.push(RawSite::Escape(why));
                 }
-                if calls.is_empty() {
-                    continue;
-                }
-                let key = (tree, owner.span());
-                let frame = match self.caller_frames.get(&key) {
-                    Some(&frame) => frame,
-                    None => {
-                        let frame =
-                            self.push_frame(tree, body.clone(), caller, None, HashMap::new());
-                        self.caller_frames.insert(key, frame);
-                        frame
-                    }
-                };
                 for (arguments, span) in calls {
-                    sites.push(Site::Call {
-                        frame,
+                    sites.push(RawSite::Call {
+                        tree,
+                        owner: owner.span(),
+                        body: body.clone(),
+                        caller,
                         arguments,
                         span,
                     });
                 }
             }
         }
+        let sites = Arc::new(sites);
+        keep(shared, member, sites.clone());
         sites
     }
 
-    /// The bodies of `tree` that hold the word: each with the syntax that
-    /// owns it; and whether one of them could not be bound.
-    fn bodies_mentioning(
+    /// The bodies of `tree` that hold the word, or the word as a string a
+    /// lookup by name may be given (after those that hold the word): each with
+    /// the syntax that owns it; and whether one of them could not be bound.
+    fn bodies_naming(
         &mut self,
         tree: usize,
         word: &str,
         constructor: bool,
     ) -> (Vec<(SyntaxNode, Arc<BoundBody>)>, bool) {
+        self.bodies_with(tree, word, constructor, true)
+    }
+
+    fn bodies_with(
+        &mut self,
+        tree: usize,
+        word: &str,
+        constructor: bool,
+        strings: bool,
+    ) -> (Vec<(SyntaxNode, Arc<BoundBody>)>, bool) {
+        let mentions = self.semantic.failing.mentions(self.semantic);
+        let mut owners = mentions.owners(tree, word, constructor);
+        if strings {
+            let named = mentions.in_strings(tree, word);
+            let known: HashSet<TextSpan> = owners.iter().map(SyntaxNode::span).collect();
+            owners.extend(named.into_iter().filter(|o| !known.contains(&o.span())));
+        }
+        if owners.is_empty() {
+            return (Vec::new(), false);
+        }
         let Some(view) = self.view(tree) else {
             return (Vec::new(), true);
-        };
-        let owners: Vec<SyntaxNode> = {
-            let mut seen = HashSet::new();
-            view.root
-                .descendant_tokens()
-                .filter(|token| match token.kind() {
-                    SyntaxKind::IdentifierToken => token.value_text() == word,
-                    SyntaxKind::ThisKeyword | SyntaxKind::BaseKeyword => constructor,
-                    _ => false,
-                })
-                .filter_map(|token| SemanticModel::body_owner(token.parent()))
-                .filter(|owner| seen.insert(owner.span()))
-                .collect()
         };
         // A body that does not bind may be the one that calls or writes:
         // the caller is told, so that it does not take the rest for all.
@@ -2164,92 +2729,34 @@ impl<'s> Engine<'s> {
                 }
             }
             let mut writes = 0usize;
-            let mut trees: Vec<usize> = self.semantic.paths.keys().copied().collect();
-            trees.sort_unstable();
-            for tree in trees {
-                let Some(text) = self
-                    .semantic
-                    .compilation
-                    .trees()
-                    .source(tree)
-                    .map(|s| s.text())
-                else {
-                    continue;
-                };
-                if !contains_word(text, &name) {
-                    continue;
-                }
-                let (bodies, missed) = self.bodies_mentioning(tree, &name, false);
-                if missed {
+            let found = self.raw_field_writes(field, container);
+            if found.missed > 0 {
+                writes += found.missed;
+                values = Abs::Top;
+            }
+            for write in &found.bodies {
+                in_constructor |= write.in_constructor;
+                let frame = self.push_frame(
+                    write.tree,
+                    write.body.clone(),
+                    write.owner,
+                    None,
+                    HashMap::new(),
+                );
+                for (value, span) in &write.assigned {
                     writes += 1;
-                    values = Abs::Top;
+                    if places.len() < MAX_PLACES {
+                        places.push((self.path(write.tree), *span));
+                    }
+                    let value = self.eval(frame, value, &HashMap::new(), None);
+                    values = values.union(value);
                 }
-                for (owner, body) in bodies {
-                    let owner_symbol = self
-                        .view(tree)
-                        .and_then(|view| view.model.declared_symbol(&owner));
-                    let is_constructor_of_container = owner_symbol.is_some_and(|o| {
-                        let o = self.semantic.compilation.symbols().get(o);
-                        o.container == container
-                            && o.as_method().is_some_and(|m| {
-                                matches!(
-                                    m.method_kind,
-                                    MethodKind::Constructor | MethodKind::StaticConstructor
-                                )
-                            })
-                    });
-                    let mut assigned: Vec<(BoundExpression, TextSpan)> = Vec::new();
-                    let mut opaque: Vec<TextSpan> = Vec::new();
-                    walk_everything(&body, &mut |visited| {
-                        if let Visited::Expression(e) = visited {
-                            match &e.kind {
-                                E::Assignment { target, value } if is_field(target, field) => {
-                                    assigned.push(((**value).clone(), e.span));
-                                }
-                                E::CompoundAssignment { target, .. }
-                                | E::Increment { target, .. }
-                                    if is_field(target, field) =>
-                                {
-                                    opaque.push(e.span);
-                                }
-                                E::RefArgument { kind, operand }
-                                    if is_field(operand, field) && *kind != RefKind::In =>
-                                {
-                                    opaque.push(e.span);
-                                }
-                                _ => {}
-                            }
-                        }
-                    });
-                    if assigned.is_empty() && opaque.is_empty() {
-                        continue;
+                for span in &write.opaque {
+                    writes += 1;
+                    if places.len() < MAX_PLACES {
+                        places.push((self.path(write.tree), *span));
                     }
-                    // A write in a lambda the constructor makes runs later,
-                    // if at all: until then the field has its default.
-                    let in_lambda = |span: &TextSpan| {
-                        body.lambdas
-                            .iter()
-                            .any(|l| l.span.start() <= span.start() && span.end() <= l.span.end())
-                    };
-                    in_constructor |= is_constructor_of_container
-                        && assigned.iter().any(|(_, span)| !in_lambda(span));
-                    let frame =
-                        self.push_frame(tree, body.clone(), owner_symbol, None, HashMap::new());
-                    for (value, span) in assigned {
-                        writes += 1;
-                        if places.len() < MAX_PLACES {
-                            places.push((self.path(tree), span));
-                        }
-                        let value = self.eval(frame, &value, &HashMap::new(), None);
-                        values = values.union(value);
-                    }
-                    for span in opaque {
-                        writes += 1;
-                        if places.len() < MAX_PLACES {
-                            places.push((self.path(tree), span));
-                        }
-                        values = Abs::Top;
-                    }
+                    values = Abs::Top;
                 }
             }
             // Without an initializer, the default is what is read until a
@@ -2289,6 +2796,97 @@ impl<'s> Engine<'s> {
         };
         self.evaluating_fields.remove(&field);
         self.fields.insert(field, found.clone());
+        found
+    }
+
+    /// The writes to `field`, found once for every question.
+    fn raw_field_writes(
+        &mut self,
+        field: SymbolId,
+        container: Option<SymbolId>,
+    ) -> Arc<FieldWrites> {
+        let shared = &self.semantic.failing.writes;
+        if let Some(found) = kept(shared, &field) {
+            return found;
+        }
+        let name = self.semantic.compilation.symbols().get(field).name.clone();
+        let mut found = FieldWrites {
+            missed: 0,
+            bodies: Vec::new(),
+        };
+        let mut trees: Vec<usize> = self.semantic.paths.keys().copied().collect();
+        trees.sort_unstable();
+        for tree in trees {
+            let (bodies, missed) = self.bodies_naming(tree, &name, false);
+            if missed {
+                found.missed += 1;
+            }
+            for (owner, body) in bodies {
+                let owner_symbol = self
+                    .view(tree)
+                    .and_then(|view| view.model.declared_symbol(&owner));
+                let is_constructor_of_container = owner_symbol.is_some_and(|o| {
+                    let o = self.semantic.compilation.symbols().get(o);
+                    o.container == container
+                        && o.as_method().is_some_and(|m| {
+                            matches!(
+                                m.method_kind,
+                                MethodKind::Constructor | MethodKind::StaticConstructor
+                            )
+                        })
+                });
+                let mut assigned: Vec<(BoundExpression, TextSpan)> = Vec::new();
+                let mut opaque: Vec<TextSpan> = Vec::new();
+                let mut by_name = false;
+                walk_everything(&body, &mut |visited| {
+                    if let Visited::Expression(e) = visited {
+                        by_name |= reached_by_name(self.semantic, e, &name, None);
+                        match &e.kind {
+                            E::Assignment { target, value } if is_field(target, field) => {
+                                assigned.push(((**value).clone(), e.span));
+                            }
+                            E::CompoundAssignment { target, .. } | E::Increment { target, .. }
+                                if is_field(target, field) =>
+                            {
+                                opaque.push(e.span);
+                            }
+                            E::RefArgument { kind, operand }
+                                if is_field(operand, field) && *kind != RefKind::In =>
+                            {
+                                opaque.push(e.span);
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+                // Written by name at run time: whatever it is given is not seen.
+                if by_name {
+                    found.missed += 1;
+                }
+                if assigned.is_empty() && opaque.is_empty() {
+                    continue;
+                }
+                // A write in a lambda the constructor makes runs later, if
+                // at all: until then the field has its default.
+                let in_lambda = |span: &TextSpan| {
+                    body.lambdas
+                        .iter()
+                        .any(|l| l.span.start() <= span.start() && span.end() <= l.span.end())
+                };
+                let in_constructor = is_constructor_of_container
+                    && assigned.iter().any(|(_, span)| !in_lambda(span));
+                found.bodies.push(FieldWrite {
+                    tree,
+                    body: body.clone(),
+                    owner: owner_symbol,
+                    assigned,
+                    opaque,
+                    in_constructor,
+                });
+            }
+        }
+        let found = Arc::new(found);
+        keep(shared, field, found.clone());
         found
     }
 
@@ -2427,6 +3025,65 @@ impl<'s> Engine<'s> {
     }
 }
 
+/// Why a member's callers are not all seen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Escape {
+    Delegate,
+    NamedAsDelegate,
+    ByName,
+    Unread,
+}
+
+impl Escape {
+    const fn origin(self) -> Origin {
+        match self {
+            Self::Delegate => Origin::Delegate,
+            Self::NamedAsDelegate => Origin::NamedAsDelegate,
+            Self::ByName => Origin::ByName,
+            Self::Unread => Origin::Unread,
+        }
+    }
+}
+
+/// A call of a member as found in the project, before it is tied to the
+/// question that asks.
+enum RawSite {
+    Call {
+        tree: usize,
+        /// The span of the syntax that owns the body.
+        owner: TextSpan,
+        body: Arc<BoundBody>,
+        caller: Option<SymbolId>,
+        arguments: Vec<BoundExpression>,
+        span: TextSpan,
+    },
+    /// Calls that are not seen.
+    Escape(Escape),
+}
+
+/// What a body writes to a field, as found.
+struct FieldWrite {
+    tree: usize,
+    body: Arc<BoundBody>,
+    /// The member the body is of.
+    owner: Option<SymbolId>,
+    /// The values assigned, and where.
+    assigned: Vec<(BoundExpression, TextSpan)>,
+    /// Writes whose value is not followed: `+=`, `++`, `ref`.
+    opaque: Vec<TextSpan>,
+    /// Whether a constructor of the field's own type assigns it, outside
+    /// a lambda: until it does, the field has its default.
+    in_constructor: bool,
+}
+
+/// Every write to a field in the project.
+struct FieldWrites {
+    /// Files holding a body that did not bind, or has errors: what it
+    /// writes is not known.
+    missed: usize,
+    bodies: Vec<FieldWrite>,
+}
+
 /// A call of a member, found by [`Engine::call_sites`].
 enum Site {
     /// A call, in the frame of the body that makes it.
@@ -2435,8 +3092,8 @@ enum Site {
         arguments: Vec<BoundExpression>,
         span: TextSpan,
     },
-    /// The member is used as a delegate: who calls it is not known.
-    Escape,
+    /// Calls that are not seen.
+    Escape(Escape),
 }
 
 // MARK: - the walk
@@ -2803,6 +3460,7 @@ impl Walker<'_, '_> {
                 collection, body, ..
             } => {
                 self.expression(collection, conds);
+                self.dereference(collection, conds);
                 self.loop_effects(statement);
                 let base = conds.len();
                 // A collection with nothing in it never runs the body.
@@ -3115,6 +3773,7 @@ impl Walker<'_, '_> {
                         span: e.span,
                         conditions: with,
                         chain: self.chain.clone(),
+                        by_value: false,
                     });
                 }
             }
@@ -3334,14 +3993,21 @@ impl Walker<'_, '_> {
             }
             E::IndexerAccess {
                 receiver,
+                indexer,
                 arguments,
-                ..
             } => {
                 self.expression(receiver, conds);
                 for argument in arguments {
                     self.expression(argument, conds);
                 }
                 self.dereference(receiver, conds);
+                // Written to, a dictionary does not miss: only a null key
+                // is refused.
+                if self.is_dictionary_indexer(*indexer)
+                    && let Some(key) = arguments.first()
+                {
+                    self.null_key(key, target.span, conds);
+                }
             }
             E::Field { .. } | E::Property { .. } | E::Local(_) | E::Parameter(_) => {}
             _ => self.expression(target, conds),
@@ -3350,19 +4016,28 @@ impl Walker<'_, '_> {
 
     /// A member reached through `receiver`: a failure if it can be null.
     fn dereference(&mut self, receiver: &BoundExpression, conds: &[Cond]) {
+        let written = receiver;
         let receiver = strip(receiver);
-        let named = matches!(
+        // A `null` or a `default` written out is a receiver too: what a cast
+        // gave it is its type.
+        let literal = matches!(
             receiver.kind,
-            E::Parameter(_) | E::Local(_) | E::Field { .. } | E::Property { .. }
+            E::Literal(ConstantValue::Null) | E::Default(_)
         );
+        let named = literal
+            || matches!(
+                receiver.kind,
+                E::Parameter(_) | E::Local(_) | E::Field { .. } | E::Property { .. }
+            );
         if !named {
             return;
         }
+        let ty = if literal { &written.ty } else { &receiver.ty };
         let string = self
             .engine
-            .special(self.frame, &receiver.ty)
+            .special(self.frame, ty)
             .is_some_and(|s| matches!(s, SpecialType::String | SpecialType::Object));
-        if !string && !is_reference(self.engine.semantic, &receiver.ty) {
+        if !string && !is_reference(self.engine.semantic, ty) {
             return;
         }
         let mut with = conds.to_vec();
@@ -3382,6 +4057,22 @@ impl Walker<'_, '_> {
         span: TextSpan,
         conditions: Vec<Cond>,
     ) {
+        self.implicit_found(kind, exception, span, conditions, false);
+    }
+
+    /// A failure that is a finding only where the values say it can happen.
+    fn implicit_by_value(&mut self, exception: &str, span: TextSpan, conditions: Vec<Cond>) {
+        self.implicit_found(FailureKind::Library, exception, span, conditions, true);
+    }
+
+    fn implicit_found(
+        &mut self,
+        kind: FailureKind,
+        exception: &str,
+        span: TextSpan,
+        conditions: Vec<Cond>,
+        by_value: bool,
+    ) {
         self.record(Found {
             kind,
             exception: exception.to_owned(),
@@ -3391,7 +4082,29 @@ impl Walker<'_, '_> {
             span,
             conditions,
             chain: self.chain.clone(),
+            by_value,
         });
+    }
+
+    /// A dictionary refuses a key that is null.
+    fn null_key(&mut self, key: &BoundExpression, span: TextSpan, conds: &[Cond]) {
+        let key = strip(key);
+        let mut with = conds.to_vec();
+        with.push(self.cond(Test::Null(key.clone()), true, key.span));
+        self.implicit_by_value("ArgumentNullException", span, with);
+    }
+
+    /// Whether the indexer is a dictionary's.
+    fn is_dictionary_indexer(&self, indexer: SymbolId) -> bool {
+        let symbols = self.engine.semantic.compilation.symbols();
+        let container = symbols
+            .get(indexer)
+            .container
+            .map(|c| symbols.qualified_name(c))
+            .unwrap_or_default();
+        container.starts_with("System.Collections.Generic.Dictionary")
+            || container.starts_with("System.Collections.Generic.IDictionary")
+            || container.starts_with("System.Collections.Generic.IReadOnlyDictionary")
     }
 
     /// `d[key]`: a dictionary's throws when the key is not there, unless a
@@ -3429,6 +4142,9 @@ impl Walker<'_, '_> {
             return;
         }
         let tree = self.engine.frames[self.frame].tree;
+        if let Some(key) = arguments.first() {
+            self.null_key(key, span, conds);
+        }
         let receiver_text = self.engine.text(tree, strip(receiver).span);
         let key_text = arguments
             .first()
@@ -3516,6 +4232,11 @@ impl Walker<'_, '_> {
         // What is counted: `xs` of `xs.Count`, `xs.Length`, `xs.Count()`.
         let counted = |e: &BoundExpression| -> Option<String> {
             let e = strip(e);
+            // A count turned round (`!(n > 0)` is `n <= 0`) only where the
+            // count is a whole number and cannot be unordered.
+            if !ordered_exactly(self.engine.semantic, &e.ty) {
+                return None;
+            }
             let tree = self.engine.frames[self.frame].tree;
             let text = |e: &BoundExpression| self.engine.text(tree, strip(e).span);
             match &e.kind {
@@ -3611,6 +4332,7 @@ impl Walker<'_, '_> {
     fn library(
         &mut self,
         method: SymbolId,
+        receiver: Option<&BoundExpression>,
         arguments: &[BoundExpression],
         span: TextSpan,
         conds: &[Cond],
@@ -3623,13 +4345,58 @@ impl Walker<'_, '_> {
             .map(|c| symbols.qualified_name(c))
             .unwrap_or_default();
         let tree = self.engine.frames[self.frame].tree;
-        if let Some(special) = parsed_type(&container, &name)
+        if let Some((target, convert)) = parsed_target(&container, &name)
             && let Some(text) = arguments.first()
-            && self.engine.special(self.frame, &strip(text).ty) == Some(SpecialType::String)
+            && self.is_text(text, !convert)
+        {
+            self.parse(target, convert, arguments, span, conds);
+            return true;
+        }
+        let collection = container
+            .strip_prefix("System.Collections.Generic.")
+            .map(|rest| rest.split(['`', '<']).next().unwrap_or(rest).to_owned());
+        let is_constructor = symbol
+            .as_method()
+            .is_some_and(|m| m.method_kind == MethodKind::Constructor);
+        // A collection made with a capacity below zero.
+        if is_constructor
+            && matches!(
+                collection.as_deref(),
+                Some("List" | "Dictionary" | "HashSet" | "Queue" | "Stack")
+            )
+            && let [capacity] = arguments
+            && self.engine.special(self.frame, &strip(capacity).ty) == Some(SpecialType::Int32)
         {
             let mut with = conds.to_vec();
-            with.push(self.cond(Test::Parses(strip(text).clone(), special), false, text.span));
-            self.implicit(FailureKind::Library, "FormatException", span, with);
+            with.push(self.cond(Test::Negative(strip(capacity).clone()), true, capacity.span));
+            self.implicit_by_value("ArgumentOutOfRangeException", span, with);
+            return true;
+        }
+        // Taking from a stack or a queue with nothing in it.
+        if let (Some(receiver), Some(kind)) = (receiver, collection.as_deref())
+            && matches!(
+                (kind, name.as_str()),
+                ("Stack", "Pop" | "Peek") | ("Queue", "Dequeue" | "Peek")
+            )
+        {
+            let receiver_text = self.engine.text(tree, strip(receiver).span);
+            if self.counted(conds, &receiver_text) {
+                return true;
+            }
+            let words = format!("{receiver_text} is empty");
+            let test = if self.known_empty(receiver) {
+                Test::Fact(words)
+            } else {
+                Test::Opaque(words)
+            };
+            let mut with = conds.to_vec();
+            with.push(self.cond(test, true, span));
+            self.implicit(
+                FailureKind::Library,
+                "InvalidOperationException",
+                span,
+                with,
+            );
             return true;
         }
         if container == "System.Linq.Enumerable" {
@@ -3654,12 +4421,248 @@ impl Walker<'_, '_> {
             {
                 return true;
             }
+            let said = format!("{sequence_text} {words}");
+            // What has no element throws for each of these, but `Max`,
+            // `Min` and `Average` of nullable or reference elements give
+            // `null`, and `Aggregate` with a seed gives the seed.
+            let throws_when_empty = match name.as_str() {
+                "First" | "Last" | "Single" | "ElementAt" => true,
+                "Max" | "Min" | "Average" => {
+                    arguments.len() == 1 && self.of_plain_numbers(&strip(sequence).ty)
+                }
+                _ => false,
+            };
+            let test = if throws_when_empty && self.known_empty(sequence) {
+                Test::Fact(said)
+            } else {
+                Test::Opaque(said)
+            };
             let mut with = conds.to_vec();
-            with.push(self.cond(Test::Opaque(format!("{sequence_text} {words}")), true, span));
+            with.push(self.cond(test, true, span));
             self.implicit(FailureKind::Library, exception, span, with);
             return true;
         }
         false
+    }
+
+    /// Whether a sequence type holds numbers that are neither nullable nor
+    /// references: `int[]`, `List<double>`.
+    fn of_plain_numbers(&mut self, ty: &Type) -> bool {
+        let element = match ty {
+            Type::Array { element, .. } => Some((**element).clone()),
+            Type::Named { type_arguments, .. } => match type_arguments.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        element
+            .and_then(|element| self.engine.special(self.frame, &element))
+            .is_some_and(|special| {
+                is_integral(special)
+                    || matches!(
+                        special,
+                        SpecialType::Single | SpecialType::Double | SpecialType::Decimal
+                    )
+            })
+    }
+
+    /// Whether a collection has nothing in it where it is used: it is an
+    /// array or `Empty<T>()` of no length, it is made right there, or it is
+    /// a local made empty and not touched since. Nothing else is told: a
+    /// collection that something else can reach may have changed.
+    fn known_empty(&mut self, e: &BoundExpression) -> bool {
+        let e = strip(e);
+        let fresh = |e: &BoundExpression| match &e.kind {
+            E::ObjectCreation {
+                arguments,
+                initializers,
+                ..
+            } => {
+                arguments.is_empty()
+                    && initializers.is_empty()
+                    && e.ty.symbol().is_some_and(|ty| {
+                        let symbols = self.engine.semantic.compilation.symbols();
+                        let name = symbols.qualified_name(ty);
+                        name.strip_prefix("System.Collections.Generic.")
+                            .map(|rest| rest.split(['`', '<']).next().unwrap_or(rest))
+                            .is_some_and(|kind| {
+                                matches!(
+                                    kind,
+                                    "List" | "Stack" | "Queue" | "HashSet" | "LinkedList"
+                                )
+                            })
+                    })
+            }
+            _ => false,
+        };
+        let by_value = self.engine.eval(self.frame, e, &HashMap::new(), None);
+        if matches!(&by_value, Abs::Set(values) if values == &[Val::Array(0)]) {
+            return true;
+        }
+        if fresh(e) {
+            return true;
+        }
+        let E::Local(local) = &e.kind else {
+            return false;
+        };
+        // A local that was given a collection once, with no mention of it
+        // between there and here, and no loop or lambda that can come back
+        // to the use after something else changed it.
+        let atom = Atom::Local(*local);
+        let scan = self.scan.clone();
+        let Some([made]) = scan.assigned.get(&atom).map(Vec::as_slice) else {
+            return false;
+        };
+        if scan.opaque.contains(&atom) || scan.closure.contains(&atom) || !fresh(strip(made)) {
+            return false;
+        }
+        let tree = self.engine.frames[self.frame].tree;
+        let Some(text) = self
+            .engine
+            .semantic
+            .compilation
+            .trees()
+            .source(tree)
+            .map(|s| s.text())
+        else {
+            return false;
+        };
+        let (from, to) = (made.span.end() as usize, e.span.start() as usize);
+        let Some(between) = text.get(from..to) else {
+            return false;
+        };
+        let name = self.engine.text(tree, e.span);
+        if contains_word(between, &name) {
+            return false;
+        }
+        let body = self.engine.frames[self.frame].body.clone();
+        let around = |outer: TextSpan| {
+            outer.start() <= e.span.start()
+                && e.span.end() <= outer.end()
+                && !(outer.start() <= made.span.start() && made.span.end() <= outer.end())
+        };
+        let mut returns = false;
+        walk_everything(&body, &mut |visited| {
+            if let Visited::Statement(s) = visited
+                && matches!(
+                    s.kind,
+                    S::While { .. }
+                        | S::DoWhile { .. }
+                        | S::For { .. }
+                        | S::ForEach { .. }
+                        | S::Label(_)
+                )
+                && around(s.span)
+            {
+                returns = true;
+            }
+        });
+        let closure = body.lambdas.iter().any(|l| around(l.span))
+            || body.local_functions.iter().any(|f| around(f.span));
+        !returns && !closure
+    }
+
+    /// Whether `e` is a string; `null` itself is one where the call can only
+    /// mean its string overload.
+    fn is_text(&mut self, e: &BoundExpression, null_is_text: bool) -> bool {
+        let e = strip(e);
+        self.engine.special(self.frame, &e.ty) == Some(SpecialType::String)
+            || (null_is_text && matches!(e.kind, E::Literal(ConstantValue::Null)))
+    }
+
+    /// The culture an argument of a `Parse` names, or `None` where it is
+    /// the number styles or the base of the overload.
+    fn culture_of(&mut self, e: &BoundExpression) -> Option<parse::Culture> {
+        let e = strip(e);
+        if self.engine.special(self.frame, &e.ty) == Some(SpecialType::Int32) {
+            return None;
+        }
+        let symbols = self.engine.semantic.compilation.symbols();
+        if let Type::Named { symbol, .. } = &e.ty
+            && symbols.qualified_name(*symbol) == "System.Globalization.NumberStyles"
+        {
+            return None;
+        }
+        let named = |member: SymbolId| {
+            let symbol = symbols.get(member);
+            matches!(symbol.name.as_str(), "InvariantCulture" | "InvariantInfo")
+                && symbol.container.is_some_and(|c| {
+                    symbols
+                        .qualified_name(c)
+                        .starts_with("System.Globalization.")
+                })
+        };
+        let invariant = match &e.kind {
+            E::Property {
+                property,
+                receiver: None,
+            } => named(*property),
+            E::Field {
+                field,
+                receiver: None,
+            } => named(*field),
+            _ => false,
+        };
+        Some(if invariant {
+            parse::Culture::Invariant
+        } else {
+            parse::Culture::Any
+        })
+    }
+
+    /// `int.Parse(text)` and the like: a text that is no number, one out of
+    /// the type's range, and a null.
+    fn parse(
+        &mut self,
+        target: parse::Target,
+        convert: bool,
+        arguments: &[BoundExpression],
+        span: TextSpan,
+        conds: &[Cond],
+    ) {
+        let text = strip(&arguments[0]).clone();
+        let culture = match arguments {
+            [_] => Some(parse::Culture::Any),
+            [_, second] => self.culture_of(second),
+            _ => None,
+        };
+        let Some(culture) = culture else {
+            // Number styles or a base: what they allow is not followed.
+            let words = format!(
+                "{} is not a valid {}",
+                self.text(text.span),
+                target.keyword()
+            );
+            let mut with = conds.to_vec();
+            with.push(self.cond(Test::Opaque(words), true, text.span));
+            self.implicit(FailureKind::Library, "FormatException", span, with);
+            return;
+        };
+        let mut failures = vec![("FormatException", parse::FORMAT)];
+        if target.has_range() {
+            failures.push(("OverflowException", parse::OVERFLOW));
+        }
+        for (exception, fails) in failures {
+            let parsing = Parsing {
+                target,
+                culture,
+                fails,
+            };
+            let mut with = conds.to_vec();
+            with.push(self.cond(Test::Parses(text.clone(), parsing), true, text.span));
+            if fails == parse::FORMAT {
+                self.implicit(FailureKind::Library, exception, span, with);
+            } else {
+                self.implicit_by_value(exception, span, with);
+            }
+        }
+        // `Convert.ToInt32(null)` is zero; `int.Parse(null)` throws.
+        if !convert {
+            let mut with = conds.to_vec();
+            with.push(self.cond(Test::Null(text.clone()), true, text.span));
+            self.implicit_by_value("ArgumentNullException", span, with);
+        }
     }
 
     fn throw(&mut self, operand: &BoundExpression, span: TextSpan, conds: &[Cond]) {
@@ -3692,15 +4695,27 @@ impl Walker<'_, '_> {
             }
             _ => None,
         };
+        // `throw null`, and a throw of what is known to be null, throws the
+        // exception the runtime makes of it.
+        let value = self
+            .engine
+            .eval(self.frame, strip(operand), &HashMap::new(), None);
+        let null = matches!(&value, Abs::Set(values) if values == &[Val::Null]);
+        let (exception, exception_type, message) = if null {
+            ("NullReferenceException".to_owned(), None, None)
+        } else {
+            (exception, Some(operand.ty.clone()), message)
+        };
         self.record(Found {
             kind: FailureKind::Throw,
             exception,
-            exception_type: Some(operand.ty.clone()),
+            exception_type,
             message,
             frame: self.frame,
             span,
             conditions: conds.to_vec(),
             chain: self.chain.clone(),
+            by_value: false,
         });
     }
 
@@ -3837,7 +4852,7 @@ impl Walker<'_, '_> {
         } = site;
         // What the library says about its own members comes first: the
         // body a reference assembly has is not the one that runs.
-        if self.library(method, arguments, span, conds) {
+        if self.library(method, receiver, arguments, span, conds) {
             return;
         }
         if self.stack.len() >= CALL_DEPTH || self.stack.contains(&method) {
@@ -4079,24 +5094,216 @@ fn getter(owner: &SyntaxNode) -> Option<SyntaxNode> {
         })
 }
 
-/// Whether `text` is what `Parse` of the number type accepts.
-fn parses(text: &str, special: SpecialType) -> bool {
-    let text = text.trim();
-    match special {
-        SpecialType::Single | SpecialType::Double | SpecialType::Decimal => {
-            text.parse::<f64>().is_ok()
+/// Whether an expression reaches a member by its name at run time: a
+/// `dynamic` call or access, a reflection lookup or a Unity message given
+/// the name as a string. `constructed` is the type of a constructor asked
+/// about, which a `dynamic` `new` may call.
+fn reached_by_name(
+    semantic: &Semantic,
+    e: &BoundExpression,
+    name: &str,
+    constructed: Option<SymbolId>,
+) -> bool {
+    let symbols = semantic.compilation.symbols();
+    match &e.kind {
+        E::Dynamic(dynamic) => match &dynamic.operation {
+            DynamicOperation::InvokeMember { name: called, .. }
+            | DynamicOperation::GetMember(called) => called == name,
+            DynamicOperation::InvokeConstructor => {
+                constructed.is_some_and(|ty| e.ty.symbol() == Some(ty))
+            }
+            _ => false,
+        },
+        E::Call {
+            method, arguments, ..
+        } => {
+            let method = symbols.get(*method);
+            let Some(container) = method.container.map(|c| symbols.qualified_name(c)) else {
+                return false;
+            };
+            let looks_up = matches!(
+                container.as_str(),
+                "System.Type" | "System.Delegate" | "System.Linq.Expressions.Expression"
+            ) || container.starts_with("System.Reflection.")
+                || (container.starts_with("UnityEngine.")
+                    && matches!(
+                        method.name.as_str(),
+                        "SendMessage"
+                            | "SendMessageUpwards"
+                            | "BroadcastMessage"
+                            | "Invoke"
+                            | "InvokeRepeating"
+                            | "CancelInvoke"
+                            | "IsInvoking"
+                            | "StartCoroutine"
+                            | "StopCoroutine"
+                    ));
+            looks_up
+                && arguments.iter().any(|argument| {
+                    matches!(&strip(argument).kind,
+                        E::Literal(ConstantValue::String(text)) if text == name)
+                })
         }
-        SpecialType::Boolean => {
-            text.eq_ignore_ascii_case("true") || text.eq_ignore_ascii_case("false")
-        }
-        _ => text.parse::<i128>().is_ok(),
+        _ => false,
     }
 }
 
-/// The number type a `Parse` or a `Convert.ToX` gives.
-fn parsed_type(container: &str, name: &str) -> Option<SpecialType> {
+/// The names of the attributes in an attribute list's text: `[Fact,
+/// Trait("a", "b")]` has `Fact` and `Trait`.
+fn attribute_names(list: &str) -> Vec<String> {
+    let inner = list
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    // A target: `[return: NotNull]`, `[assembly: ...]`.
+    let inner = match inner.split_once(':') {
+        Some((target, rest)) if !target.contains(['(', ',']) => rest,
+        _ => inner,
+    };
+    let (mut names, mut depth, mut current) = (Vec::new(), 0usize, String::new());
+    for c in inner.chars() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                names.push(std::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
+        }
+        if depth == 0 && !matches!(c, ')' | ']' | '}') {
+            current.push(c);
+        }
+    }
+    names.push(current);
+    names
+        .into_iter()
+        .map(|name| {
+            let name = name.trim();
+            let name = name.rsplit('.').next().unwrap_or(name);
+            name.strip_suffix("Attribute").unwrap_or(name).to_owned()
+        })
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Attributes that say how the compiler or a tool treats a method, and
+/// make nothing call it.
+fn is_inert_attribute(name: &str) -> bool {
+    matches!(
+        name,
+        "Obsolete"
+            | "MethodImpl"
+            | "DebuggerStepThrough"
+            | "DebuggerHidden"
+            | "DebuggerNonUserCode"
+            | "DebuggerDisplay"
+            | "CompilerGenerated"
+            | "GeneratedCode"
+            | "EditorBrowsable"
+            | "SuppressMessage"
+            | "ExcludeFromCodeCoverage"
+            | "Conditional"
+            | "Pure"
+            | "Description"
+            | "DoesNotReturn"
+            | "NotNull"
+            | "MaybeNull"
+            | "AllowNull"
+            | "DisallowNull"
+            | "NotNullWhen"
+            | "MaybeNullWhen"
+            | "NotNullIfNotNull"
+            | "MemberNotNull"
+            | "MemberNotNullWhen"
+            | "StackTraceHidden"
+            | "SkipLocalsInit"
+            | "AsyncStateMachine"
+            | "IteratorStateMachine"
+            | "AsyncIteratorStateMachine"
+            | "AsyncMethodBuilder"
+            | "InlineArray"
+            | "UnscopedRef"
+            | "RequiresUnreferencedCode"
+            | "UnconditionalSuppressMessage"
+            | "DynamicDependency"
+            | "SecurityCritical"
+            | "SecuritySafeCritical"
+            | "TargetedPatchingOptOut"
+            | "ReliabilityContract"
+            | "HandleProcessCorruptedStateExceptions"
+            | "Browsable"
+            | "ContractAnnotation"
+            | "CanBeNull"
+            | "ItemNotNull"
+            | "ItemCanBeNull"
+            | "MustUseReturnValue"
+            | "PublicAPI"
+            | "InstantHandle"
+            | "NoEnumeration"
+            | "LinqTunnel"
+            | "AssertionMethod"
+            | "TerminatesProgram"
+            | "StringFormatMethod"
+    )
+}
+
+/// Whether Unity calls a method of this name on a component or a
+/// scriptable object.
+fn is_unity_message(name: &str) -> bool {
+    matches!(
+        name,
+        "Awake"
+            | "Start"
+            | "Update"
+            | "LateUpdate"
+            | "FixedUpdate"
+            | "Reset"
+            | "OnEnable"
+            | "OnDisable"
+            | "OnDestroy"
+            | "OnValidate"
+            | "OnGUI"
+            | "OnBeforeSerialize"
+            | "OnAfterDeserialize"
+    ) || [
+        "OnCollision",
+        "OnTrigger",
+        "OnMouse",
+        "OnParticle",
+        "OnAnimator",
+        "OnJoint",
+        "OnApplication",
+        "OnBecame",
+        "OnTransform",
+        "OnRectTransform",
+        "OnCanvas",
+        "OnRender",
+        "OnPre",
+        "OnPost",
+        "OnWillRender",
+        "OnDraw",
+        "OnAudio",
+        "OnController",
+        "OnBeforeTransform",
+        "OnDidApply",
+        "OnPlayer",
+        "OnServer",
+        "OnConnected",
+        "OnDisconnected",
+        "OnFailedTo",
+        "OnNetwork",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+}
+
+/// The type a `Parse` or a `Convert.ToX` gives, and whether it is the
+/// `Convert`, which takes a null for zero.
+fn parsed_target(container: &str, name: &str) -> Option<(parse::Target, bool)> {
     let by_type = |full: &str| {
-        Some(match full {
+        Some(parse::Target::Number(match full {
             "System.Int32" => SpecialType::Int32,
             "System.Int64" => SpecialType::Int64,
             "System.Int16" => SpecialType::Int16,
@@ -4108,15 +5315,19 @@ fn parsed_type(container: &str, name: &str) -> Option<SpecialType> {
             "System.Single" => SpecialType::Single,
             "System.Double" => SpecialType::Double,
             "System.Decimal" => SpecialType::Decimal,
-            "System.Boolean" => SpecialType::Boolean,
+            "System.Boolean" => return Some(parse::Target::Boolean),
             _ => return None,
-        })
+        }))
     };
     if name == "Parse" {
-        return by_type(container);
+        if container == "System.Char" {
+            return Some((parse::Target::Char, false));
+        }
+        return by_type(container).map(|target| (target, false));
     }
     if container == "System.Convert" {
-        return by_type(&format!("System.{}", name.strip_prefix("To")?));
+        return by_type(&format!("System.{}", name.strip_prefix("To")?))
+            .map(|target| (target, true));
     }
     None
 }
@@ -4253,33 +5464,190 @@ fn unknown_input(name: String) -> Input {
     }
 }
 
-/// The opposite of a condition, as C# would write it.
-fn negated(e: &BoundExpression, text_of: &dyn Fn(&BoundExpression) -> String) -> String {
-    match &e.kind {
+/// Whether `a < b` and `a >= b` are each other's opposite for values of
+/// this type: they are for the integers, `char`, `decimal` and an enum, and
+/// not where a value can be unordered (a `float`, a `double`, a nullable's
+/// `null`) or an operator is the program's own.
+fn ordered_exactly(semantic: &Semantic, ty: &Type) -> bool {
+    let compilation = &semantic.compilation;
+    let Some(symbol) = ty.symbol() else {
+        return false;
+    };
+    if compilation
+        .symbols()
+        .get(symbol)
+        .as_named_type()
+        .and_then(|t| t.type_kind)
+        == Some(TypeKind::Enum)
+    {
+        return true;
+    }
+    SpecialType::ALL.iter().copied().any(|special| {
+        compilation.special_type(special) == Some(symbol)
+            && (is_integral(special) || special == SpecialType::Decimal)
+    })
+}
+
+/// The comparison operator a method is, where it is one of `decimal`'s.
+fn decimal_operator(semantic: &Semantic, method: SymbolId) -> Option<BinaryOperator> {
+    let symbols = semantic.compilation.symbols();
+    let symbol = symbols.get(method);
+    let container = symbol.container?;
+    if symbols.qualified_name(container) != "System.Decimal" {
+        return None;
+    }
+    Some(match symbol.name.as_str() {
+        "op_Equality" => BinaryOperator::Equality,
+        "op_Inequality" => BinaryOperator::Inequality,
+        "op_LessThan" => BinaryOperator::LessThan,
+        "op_GreaterThan" => BinaryOperator::GreaterThan,
+        "op_LessThanOrEqual" => BinaryOperator::LessThanOrEqual,
+        "op_GreaterThanOrEqual" => BinaryOperator::GreaterThanOrEqual,
+        _ => return None,
+    })
+}
+
+/// Whether the text of an expression stands as one operand of `!` or of a
+/// comparison: a name, a member access, a call, an index, with nothing
+/// at the top level that binds more loosely.
+fn is_primary_text(text: &str) -> bool {
+    let mut depth = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '"' | '\'' => {
+                // A literal: up to its end.
+                while let Some(d) = chars.next() {
+                    if d == '\\' {
+                        chars.next();
+                    } else if d == c {
+                        break;
+                    }
+                }
+            }
+            _ if depth > 0 => {}
+            '?' if matches!(chars.peek(), Some('.' | '[')) => {}
+            '!' if chars
+                .peek()
+                .is_none_or(|n| matches!(n, '.' | '[' | ')' | ',')) => {}
+            c if c.is_alphanumeric() || matches!(c, '_' | '.' | '@' | '$') => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The opposite of a condition, as C# would write it: a comparison reversed
+/// only where that is exactly its opposite, and the operands and the whole
+/// parenthesised wherever the text alone would bind differently.
+fn negated(
+    e: &BoundExpression,
+    text_of: &dyn Fn(&BoundExpression) -> String,
+    ordered: &dyn Fn(&Type) -> bool,
+    decimal_operator: &dyn Fn(SymbolId) -> Option<BinaryOperator>,
+) -> String {
+    let whole = || format!("!({})", text_of(e));
+    // An operand as written, in parentheses unless nothing around it can
+    // take it apart: the operator it is the operand of is of the same rank
+    // as the one that replaces it.
+    let operand = |x: &BoundExpression| {
+        let text = text_of(x);
+        let tight = match &strip(x).kind {
+            E::Binary { operator, .. } => matches!(
+                operator,
+                BinaryOperator::Add
+                    | BinaryOperator::Subtract
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo
+                    | BinaryOperator::LeftShift
+                    | BinaryOperator::RightShift
+                    | BinaryOperator::UnsignedRightShift
+            ),
+            E::Unary { .. }
+            | E::Literal(_)
+            | E::Parameter(_)
+            | E::Local(_)
+            | E::Field { .. }
+            | E::Property { .. }
+            | E::Call { .. }
+            | E::IndexerAccess { .. }
+            | E::ArrayLength { .. }
+            | E::This
+            | E::Default(_)
+            | E::TypeOf(_) => true,
+            _ => false,
+        };
+        if tight && (matches!(strip(x).kind, E::Binary { .. }) || is_primary_text(&text)) {
+            text
+        } else {
+            format!("({text})")
+        }
+    };
+    // A comparison: the operator the language has, or `decimal`'s own, which
+    // orders every pair of values.
+    let comparison = match &e.kind {
         E::Binary {
             operator,
             left,
             right,
-        } => {
+        } => Some((*operator, &**left, &**right)),
+        E::Call {
+            receiver,
+            method,
+            arguments,
+            ..
+        } if arguments.len() == 2
+            && receiver
+                .as_ref()
+                .is_none_or(|r| matches!(r.kind, E::TypeExpression(_))) =>
+        {
+            decimal_operator(*method).map(|operator| (operator, &arguments[0], &arguments[1]))
+        }
+        _ => None,
+    };
+    if let Some((operator, left, right)) = comparison {
+        {
+            let operator = &operator;
             let flipped = match operator {
                 BinaryOperator::Equality => "!=",
                 BinaryOperator::Inequality => "==",
-                BinaryOperator::LessThan => ">=",
-                BinaryOperator::GreaterThan => "<=",
-                BinaryOperator::LessThanOrEqual => ">",
-                BinaryOperator::GreaterThanOrEqual => "<",
-                _ => return format!("!({})", text_of(e)),
+                BinaryOperator::LessThan
+                | BinaryOperator::GreaterThan
+                | BinaryOperator::LessThanOrEqual
+                | BinaryOperator::GreaterThanOrEqual
+                    if ordered(&left.ty) && ordered(&right.ty) =>
+                {
+                    match operator {
+                        BinaryOperator::LessThan => ">=",
+                        BinaryOperator::GreaterThan => "<=",
+                        BinaryOperator::LessThanOrEqual => ">",
+                        _ => "<",
+                    }
+                }
+                _ => return whole(),
             };
-            format!("{} {flipped} {}", text_of(left), text_of(right))
+            return format!("{} {flipped} {}", operand(left), operand(right));
         }
+    }
+    match &e.kind {
         E::Unary {
             operator: UnaryOperator::LogicalNot,
             operand,
         } => text_of(operand),
-        E::Parameter(_) | E::Local(_) | E::Field { .. } | E::Property { .. } | E::Call { .. } => {
+        E::Parameter(_)
+        | E::Local(_)
+        | E::Field { .. }
+        | E::Property { .. }
+        | E::Call { .. }
+        | E::IndexerAccess { .. }
+            if is_primary_text(&text_of(e)) =>
+        {
             format!("!{}", text_of(e))
         }
-        _ => format!("!({})", text_of(e)),
+        _ => whole(),
     }
 }
 
@@ -4372,20 +5740,39 @@ fn equal(a: &Val, b: &Val) -> Option<bool> {
         (Val::Object | Val::Array(_), _) | (_, Val::Object | Val::Array(_)) => return None,
         (Val::Bool(x), Val::Bool(y)) => x == y,
         (Val::Str(x), Val::Str(y)) => x == y,
-        _ => a.number()? == b.number()?,
+        // Two integers are compared as integers: a `double` cannot tell
+        // `9007199254740992` from the next one.
+        _ => match (a.integer(), b.integer()) {
+            (Some(x), Some(y)) => x == y,
+            _ => a.number()? == b.number()?,
+        },
     })
+}
+
+/// How two numbers order; `None` where one is not a number, or where they
+/// are unordered, as `NaN` is.
+fn order(a: &Val, b: &Val) -> Option<std::cmp::Ordering> {
+    match (a.integer(), b.integer()) {
+        (Some(x), Some(y)) => Some(x.cmp(&y)),
+        _ => a.number()?.partial_cmp(&b.number()?),
+    }
 }
 
 fn binary(operator: BinaryOperator, a: &Val, b: &Val, integral: bool) -> Option<Val> {
     use BinaryOperator as B;
-    let compare = |f: fn(f64, f64) -> bool| Some(Val::Bool(f(a.number()?, b.number()?)));
+    // A comparison with a number that is not a number is false.
+    let compare = |f: fn(std::cmp::Ordering) -> bool| {
+        a.number()?;
+        b.number()?;
+        Some(Val::Bool(order(a, b).is_some_and(f)))
+    };
     match operator {
         B::Equality => equal(a, b).map(Val::Bool),
         B::Inequality => equal(a, b).map(|e| Val::Bool(!e)),
-        B::LessThan => compare(|x, y| x < y),
-        B::GreaterThan => compare(|x, y| x > y),
-        B::LessThanOrEqual => compare(|x, y| x <= y),
-        B::GreaterThanOrEqual => compare(|x, y| x >= y),
+        B::LessThan => compare(std::cmp::Ordering::is_lt),
+        B::GreaterThan => compare(std::cmp::Ordering::is_gt),
+        B::LessThanOrEqual => compare(std::cmp::Ordering::is_le),
+        B::GreaterThanOrEqual => compare(std::cmp::Ordering::is_ge),
         B::LogicalAnd | B::BitwiseAnd if matches!((a, b), (Val::Bool(_), Val::Bool(_))) => {
             Some(Val::Bool(a == &Val::Bool(true) && b == &Val::Bool(true)))
         }
@@ -4449,5 +5836,6 @@ fn arithmetic(
     }
 }
 
+mod parse;
 #[cfg(test)]
 mod tests;

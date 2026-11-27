@@ -22,15 +22,15 @@ pub struct Lines {
 }
 
 impl Lines {
-    /// The line and column (one-based, the column in characters) of byte
-    /// `offset`.
+    /// The line and column (one-based, the column in UTF-16 code units, as
+    /// an editor and `csc` count it) of byte `offset`.
     pub fn at(&mut self, path: &Path, offset: u32) -> (usize, usize) {
         let (text, starts) = self.file(path);
         let offset = (offset as usize).min(text.len());
         let line = starts.partition_point(|&s| s <= offset).saturating_sub(1);
         let column = text
             .get(starts[line]..offset)
-            .map_or(0, |t| t.chars().count());
+            .map_or(0, |t| t.encode_utf16().count());
         (line + 1, column + 1)
     }
 
@@ -83,8 +83,25 @@ pub trait Wording {
             Origin::Callers { count } => format!("all calls in the project ({count})"),
             Origin::NoCallers => "no calls in the project — what comes is unknown".to_owned(),
             Origin::Escapes => {
-                "the method is virtual, from an interface or passed as a delegate — not every call is seen"
+                "the method is virtual, an override or implements an interface — calls reach it without naming it"
                     .to_owned()
+            }
+            Origin::EntryPoint => {
+                "the runtime or a framework calls the method — what it gets is not known"
+                    .to_owned()
+            }
+            Origin::Delegate => {
+                "the method is passed as a delegate — not every call is seen".to_owned()
+            }
+            Origin::NamedAsDelegate => {
+                "a method of this name is passed as a delegate — not every call is seen".to_owned()
+            }
+            Origin::ByName => {
+                "called by name at run time (dynamic or reflection) — not every call is seen"
+                    .to_owned()
+            }
+            Origin::Unread => {
+                "code that may call it does not compile — not every call is seen".to_owned()
             }
             Origin::Writes { readonly: true } => "readonly: initializer and constructor".to_owned(),
             Origin::Writes { readonly: false } => "all writes in the project".to_owned(),
@@ -196,10 +213,20 @@ pub fn failure_text(
     if failure.conditions.is_empty() {
         out.push_str(&format!("   {}: {}\n", wording.when(), wording.always()));
     } else {
+        let several = failure.conditions.len() > 1;
         let all: Vec<String> = failure
             .conditions
             .iter()
-            .map(|c| wording.condition(&c.text))
+            .map(|c| {
+                let text = wording.condition(&c.text);
+                // Joined by `&&`, a `||` or a `?:` in one would take the
+                // others in.
+                if several && binds_looser_than_and(&c.text) {
+                    format!("({text})")
+                } else {
+                    text
+                }
+            })
             .collect();
         out.push_str(&format!("   {}: {}\n", wording.when(), all.join(" && ")));
     }
@@ -340,6 +367,41 @@ pub fn offsets(
     }
 }
 
+/// Whether C# code has a `||`, `??`, `?:`, assignment or lambda arrow at its
+/// top level, outside brackets and literals: whatever binds more loosely than
+/// `&&`.
+fn binds_looser_than_and(code: &str) -> bool {
+    let chars: Vec<char> = code.chars().collect();
+    let mut depth = 0usize;
+    let mut at = 0;
+    while at < chars.len() {
+        let (c, next) = (chars[at], chars.get(at + 1).copied());
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '"' | '\'' => {
+                at += 1;
+                while at < chars.len() && chars[at] != c {
+                    at += if chars[at] == '\\' { 2 } else { 1 };
+                }
+            }
+            '|' if depth == 0 && next == Some('|') => return true,
+            '?' if depth == 0 && !matches!(next, Some('.' | '[')) => return true,
+            '=' if depth == 0 && next == Some('>') => return true,
+            '=' if depth == 0 && next != Some('=') => {
+                // `==`, `!=`, `<=`, `>=` are comparisons; a lone `=` is not.
+                let before = at.checked_sub(1).map(|i| chars[i]);
+                if !matches!(before, Some('=' | '!' | '<' | '>')) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    false
+}
+
 /// The project's `.cs` files, except tool folders.
 pub fn sources(folder: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(folder) else {
@@ -408,5 +470,76 @@ mod tests {
         let declarations = [(DeclarationKind::Field, 0), (DeclarationKind::Method, 4)];
         assert_eq!(offsets(text, Some(2), None, &declarations), vec![4]);
         assert_eq!(offsets(text, None, None, &declarations), vec![4]);
+    }
+
+    #[test]
+    fn columns_count_utf16_code_units() {
+        let dir = TempDir::new("failability-columns");
+        let text =
+            "class C {\n    void M() { var s = \"\u{1F600}\"; throw new System.Exception(); }\n}\n";
+        dir.write("C.cs", text);
+        let root = dir.canonical();
+        let path = Path::new(&root).join("C.cs");
+        let session = crate::blast::project::compiled(&root, None).expect("compiled");
+        let _ = session.open(&path);
+        let at = text.find("void M").expect("present") + 5;
+        let at = text[..at].encode_utf16().count();
+        let found = session
+            .failability(&path, u32::try_from(at).expect("small"))
+            .expect("an answer");
+        let report = report(&found, &root, &mut Lines::default(), &English);
+        let line = text.lines().nth(1).expect("line");
+        let before = &line[..line.find("throw").expect("throw")];
+        let column = before.encode_utf16().count() + 1;
+        assert_eq!(column, before.chars().count() + 2, "an emoji is two units");
+        assert!(
+            report.contains(&format!("where: C.cs:2:{column}  ")),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn conditions_are_joined_without_one_taking_in_another() {
+        let dir = TempDir::new("failability-join");
+        let text = "class C {\n    void M(bool a, bool b, int c) {\n        if (a || b) { if (c > 0) throw new System.Exception(); }\n    }\n}\n";
+        dir.write("C.cs", text);
+        let root = dir.canonical();
+        let path = Path::new(&root).join("C.cs");
+        let session = crate::blast::project::compiled(&root, None).expect("compiled");
+        let _ = session.open(&path);
+        let at = text.find("void M").expect("present") + 5;
+        let found = session
+            .failability(&path, u32::try_from(at).expect("small"))
+            .expect("an answer");
+        let report = report(&found, &root, &mut Lines::default(), &English);
+        assert!(report.contains("when: (a || b) && c > 0"), "{report}");
+    }
+
+    #[test]
+    fn what_binds_looser_than_and() {
+        for code in [
+            "a || b",
+            "a ? b : c",
+            "x = y",
+            "f => f",
+            "a ?? b",
+            "(a) || (b)",
+        ] {
+            assert!(binds_looser_than_and(code), "{code}");
+        }
+        for code in [
+            "a == b",
+            "a <= b",
+            "a != b",
+            "f(a || b)",
+            "s == \"||\"",
+            "a?.b",
+            "xs[a ? 1 : 2]",
+            "!(a || b)",
+            "a && b",
+            "c == '?'",
+        ] {
+            assert!(!binds_looser_than_and(code), "{code}");
+        }
     }
 }

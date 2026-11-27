@@ -3,7 +3,7 @@
 //! on real code, and how long it takes.
 //!
 //! ```text
-//! find src -name '*.cs' | cargo run --release -p rustlyn-ide --example failability -- <root> [-v]
+//! find src -name '*.cs' | cargo run --release -p rustlyn-ide --example failability -- <root> [-v|--all]
 //! ```
 
 use std::collections::BTreeMap;
@@ -18,9 +18,10 @@ use rustlyn_ide::semantic::{Semantic, Verdict};
 fn main() {
     std::panic::set_hook(Box::new(|_| {}));
     let mut args = std::env::args().skip(1);
-    let root = PathBuf::from(args.next().expect("usage: failability <root> [-v]"));
+    let root = PathBuf::from(args.next().expect("usage: failability <root> [-v|--all]"));
     let rest: Vec<String> = args.collect();
-    let verbose = rest.iter().any(|a| a == "-v");
+    let all = rest.iter().any(|a| a == "--all");
+    let verbose = all || rest.iter().any(|a| a == "-v");
     let only = rest
         .iter()
         .find(|a| a.starts_with("--only="))
@@ -115,7 +116,7 @@ fn main() {
                 *kinds
                     .entry(format!("{:?} {}", failure.kind, failure.exception))
                     .or_default() += 1;
-                if verbose && failure.verdict != Verdict::Unknown {
+                if verbose && (all || failure.verdict != Verdict::Unknown) {
                     let conditions: Vec<&str> =
                         failure.conditions.iter().map(|c| c.text.as_str()).collect();
                     let line = std::fs::read_to_string(&failure.path)
@@ -128,13 +129,18 @@ fn main() {
                                 + 1
                         })
                         .unwrap_or(0);
+                    let through: Vec<&str> =
+                        failure.chain.iter().map(|c| c.text.as_str()).collect();
                     println!(
-                        "{}: {:?} {} at {}:{line} when [{}]",
+                        "{}: {:?} {} at {}:{line}@{} when [{}] through [{}] {:?}",
                         found.member,
                         failure.verdict,
                         failure.exception,
                         failure.path.display(),
-                        conditions.join(" && ")
+                        failure.span.start(),
+                        conditions.join(" && "),
+                        through.join("; "),
+                        failure.message
                     );
                     for input in &failure.inputs {
                         println!(

@@ -395,13 +395,83 @@ What each verdict says:
   values cannot tell.
 
 A parameter has what every call in the project passes until the body writes to
-it (nothing is known of the parameters of a member that is virtual, implements
-an interface member or is used as a delegate: calls reach it without naming
-it); after that it has that or what the body gives it, and nothing is known
-after `+=`, `++`, `ref` or `out`. The `default` of a `switch` holds where no
-other label does; an arm of a `switch` expression, where its pattern matches
-and no arm before it did. A call of an `async` method that is not awaited does
-not throw, and a call of an iterator runs none of its body.
+it; after that it has that or what the body gives it, and nothing is known
+after `+=`, `++`, `ref` or `out`. Nothing is known of the parameters of a
+member that calls reach without naming it, and the input's line in the report
+says which way:
+
+- it is virtual, an override or implements an interface member;
+- the runtime or a framework calls it: `Main`, a static constructor, a method
+  with an attribute other than the few that only tell the compiler or a tool
+  something (`[Fact]`, `[OnDeserialized]`, `[HttpGet]`, `[ContextMenu]`), and in
+  a Unity project a message such as `Update` or `OnTriggerEnter` of a type
+  derived from the engine's;
+- it is passed as a delegate, or a method of its name is in a method group the
+  binder could not resolve;
+- something calls it by name at run time: a `dynamic` call or access of that
+  name on any receiver (`d.F(0)`, `F(d)` with a `dynamic` argument), or a
+  lookup by name that is a constant string or `nameof` (`GetMethod("F")`,
+  `InvokeMember`, `Delegate.CreateDelegate`, `Expression.Call`, Unity's
+  `Invoke("F")` and `SendMessage("F")`). A field written by name
+  (`GetField("f").SetValue`, a `dynamic` assignment) has no known values;
+- a body that may call it does not compile.
+
+A call whose member is a public one of a library may come from code outside
+the project too; that is the limit stated below, and `impossible` is said of
+the project as it is.
+
+The `default` of a `switch` holds where no other label does; an arm of a
+`switch` expression, where its pattern matches and no arm before it did. A call
+of an `async` method that is not awaited does not throw, and a call of an
+iterator runs none of its body.
+
+A library call that throws on what it is given is judged by what the library
+does. `int.Parse(s)` reads `s` by the current culture, which the program sets
+and the analysis does not know: `-` is the sign in most cultures and
+`U+061C -` in the Arabic ones, `1,000` is a thousand in one culture and not a
+number in another. A verdict is certain only for a text every culture the
+runtime ships reads the same way:
+
+- digits, the white space `\t \n \v \f \r` and the space around them, and
+  the NULs a string may end in: `" 5 "` and `"5\0"` parse, `"5 5"` and `""` do
+  not;
+- the range of an integer type (`OverflowException` where the digits are too
+  many, and not `FormatException`), of `decimal` too;
+- an ASCII letter, `.` or `,` in an integer, a letter in a `decimal`, a
+  character no culture uses in a number (`_`, `(`, `$`): it does not parse;
+- `bool.Parse` and `char.Parse`, which no culture reads.
+
+A `+` or `-` in a text that would parse makes it *possible* (the cultures
+differ), unless the provider is `CultureInfo.InvariantCulture` or
+`NumberFormatInfo.InvariantInfo`, which sign with them. A `.`, `,`, `e`, `NaN` or `Infinity` in a `float`,
+`double` or `decimal`, a character beyond ASCII that a culture may use as a
+sign or a separator, and the overloads that take `NumberStyles` or a base are
+*unknown*. `TryParse` never throws; `Convert.ToInt32(null)` is `0` where
+`int.Parse(null)` throws `ArgumentNullException`. An `OverflowException` or an
+`ArgumentNullException` of a parse is listed only where it can happen. `Parse`
+of a `Guid`, `DateTime`, `TimeSpan`, `Version`, an enum or a `BigInteger` is
+not modelled and lists nothing.
+
+A condition is written as C# that means what it says. Where the failure is on
+the way past a guard, the opposite is written: a comparison is turned round
+(`a < b` to `a >= b`) only for integers, `char`, `decimal` and enums, where
+that is exactly the opposite; for a `float`, a `double`, a nullable or a type
+with an operator of its own it is `!(a < b)`. Operands that bind more loosely
+than the comparison are put in parentheses, and conditions joined with `&&`
+are, where one has a `||` or a `?:`.
+
+Certain, beside the failures already followed: a member reached through a
+`null` that is written (`((string)null).Length`, `default(string).Length`), a
+`foreach` over what is known to be null, `dict[null]` read or written, a
+collection made with a capacity below zero, `First()`, `Last()`, `Single()`
+and `ElementAt()` of an empty array, of `Enumerable.Empty<T>()` and of a
+collection made empty where it is used, `Pop`, `Peek` and `Dequeue` of an
+empty stack or queue, `throw null`. A collection held in a local counts as
+empty only where the local has been given it once and is not mentioned
+between, in a loop that comes back to it, or in a lambda. Two comparisons of
+one integer, as it is at one place, with constants that no value satisfies
+together (`x > 0 && x < 0`, `i < 3` and `i == 5`) rule the failure out
+whatever the integer is; comparisons of anything else are not combined.
 
 ## Extending the analyses
 
@@ -456,6 +526,12 @@ println!("{}", report.text());
   A virtual or interface member's failures are not told from its overrides',
   an exception that a `catch` rethrows is not followed out of it, and what an
   iterator or a delegate runs is not followed.
+  A name that is read at run time (`GetMethod(name)`), a method found by
+  `Activator.CreateInstance` or `Type.GetMethods()`, and a method the Unity
+  inspector wires to an event, are not seen: `impossible` rests on the calls
+  that name the member.
+  A column in `rustlyn-fail`'s output is counted in UTF-16 code units, as an
+  editor and `csc` count them.
 - Morpeh-style ECS stashes are recognised by `value::ecs` and `reach`. Other ECS frameworks
   need their own provider.
 - Unity source generators are not run, so members they add are invisible

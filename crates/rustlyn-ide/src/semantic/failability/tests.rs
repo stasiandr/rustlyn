@@ -867,3 +867,1065 @@ fn code_after_a_label_is_reached_by_a_jump_not_for_certain() {
         "a jump or the code above reaches this label"
     );
 }
+
+// MARK: - what `Parse` does, and when that is told
+
+use super::parse::{self, Culture, Target};
+use rustlyn_semantics::SpecialType;
+
+/// What `Parse` does with a text under every culture the runtime ships, as
+/// the runtime did it when this was written: `parsed`, `format` (a
+/// `FormatException`), `overflow` (an `OverflowException`), or `varies` where
+/// the cultures differ among themselves.
+const PARSES: &[(&str, &str, &str)] = &[
+    ("sbyte", "0", "parsed"),
+    ("sbyte", "--5", "format"),
+    ("sbyte", "5 -", "format"),
+    ("sbyte", "\n ", "format"),
+    ("sbyte", "5 5", "format"),
+    ("sbyte", "1e", "format"),
+    ("sbyte", " \u{5}", "format"),
+    ("sbyte", "\u{2212}5", "varies"),
+    ("sbyte", "\u{221e}", "format"),
+    ("sbyte", "1.5e3", "format"),
+    ("sbyte", "\t5", "parsed"),
+    ("sbyte", "\n-5", "varies"),
+    ("sbyte", "5\u{c}", "parsed"),
+    ("sbyte", "-5\r", "varies"),
+    ("sbyte", "-128", "varies"),
+    ("sbyte", "-127", "varies"),
+    ("sbyte", "128", "overflow"),
+    ("sbyte", "000000000000000000000000000000127", "parsed"),
+    ("sbyte", "1270", "overflow"),
+    (
+        "sbyte",
+        "-99999999999999999999999999999999999999999999999999",
+        "varies",
+    ),
+    ("sbyte", "+127", "varies"),
+    ("sbyte", "-00", "varies"),
+    ("byte", "0", "parsed"),
+    ("byte", "--5", "format"),
+    ("byte", "5 -", "format"),
+    ("byte", "\n ", "format"),
+    ("byte", "5 5", "format"),
+    ("byte", "1e", "format"),
+    ("byte", " \u{5}", "format"),
+    ("byte", "\u{2212}5", "varies"),
+    ("byte", "\u{221e}", "format"),
+    ("byte", "1.5e3", "format"),
+    ("byte", "\t5", "parsed"),
+    ("byte", "\n-5", "varies"),
+    ("byte", "5\u{c}", "parsed"),
+    ("byte", "-5\r", "varies"),
+    ("byte", "255", "parsed"),
+    ("byte", "254", "parsed"),
+    ("byte", "000000000000000000000000000000256", "overflow"),
+    (
+        "byte",
+        "99999999999999999999999999999999999999999999999999",
+        "overflow",
+    ),
+    ("byte", " 255 ", "parsed"),
+    ("byte", "+256", "varies"),
+    ("short", "0", "parsed"),
+    ("short", "--5", "format"),
+    ("short", "5 -", "format"),
+    ("short", "\n ", "format"),
+    ("short", "5 5", "format"),
+    ("short", "1e", "format"),
+    ("short", " \u{5}", "format"),
+    ("short", "\u{2212}5", "varies"),
+    ("short", "\u{221e}", "format"),
+    ("short", "1.5e3", "format"),
+    ("short", "\t5", "parsed"),
+    ("short", "\n-5", "varies"),
+    ("short", "5\u{c}", "parsed"),
+    ("short", "-5\r", "varies"),
+    ("short", "-32768", "varies"),
+    ("short", "-32767", "varies"),
+    ("short", "32768", "overflow"),
+    ("short", "00000000000000000000000000000032767", "parsed"),
+    ("short", "327670", "overflow"),
+    (
+        "short",
+        "-99999999999999999999999999999999999999999999999999",
+        "varies",
+    ),
+    ("short", "+32767", "varies"),
+    ("short", "-00", "varies"),
+    ("ushort", "0", "parsed"),
+    ("ushort", "--5", "format"),
+    ("ushort", "5 -", "format"),
+    ("ushort", "\n ", "format"),
+    ("ushort", "5 5", "format"),
+    ("ushort", "1e", "format"),
+    ("ushort", " \u{5}", "format"),
+    ("ushort", "\u{2212}5", "varies"),
+    ("ushort", "\u{221e}", "format"),
+    ("ushort", "1.5e3", "format"),
+    ("ushort", "\t5", "parsed"),
+    ("ushort", "\n-5", "varies"),
+    ("ushort", "5\u{c}", "parsed"),
+    ("ushort", "-5\r", "varies"),
+    ("ushort", "65535", "parsed"),
+    ("ushort", "65534", "parsed"),
+    ("ushort", "00000000000000000000000000000065536", "overflow"),
+    (
+        "ushort",
+        "99999999999999999999999999999999999999999999999999",
+        "overflow",
+    ),
+    ("ushort", " 65535 ", "parsed"),
+    ("ushort", "+65536", "varies"),
+    ("int", "0", "parsed"),
+    ("int", "12", "parsed"),
+    ("int", "-0", "varies"),
+    ("int", "-5", "varies"),
+    ("int", "--5", "format"),
+    ("int", "-+5", "format"),
+    ("int", "5+", "format"),
+    ("int", "- 5", "format"),
+    ("int", "5 -", "format"),
+    ("int", "(5)", "format"),
+    ("int", "", "format"),
+    ("int", "  ", "format"),
+    ("int", "\n ", "format"),
+    ("int", "+", "format"),
+    ("int", "a", "format"),
+    ("int", "5a", "format"),
+    ("int", "5 5", "format"),
+    ("int", "1,000", "format"),
+    ("int", "1.", "format"),
+    ("int", "1e3", "format"),
+    ("int", "1e", "format"),
+    ("int", "1_000", "format"),
+    ("int", "5\0\0", "parsed"),
+    ("int", "5\0 ", "format"),
+    ("int", " \u{5}", "format"),
+    ("int", "\0", "format"),
+    ("int", "\u{a0}5", "format"),
+    ("int", "\u{ff15}", "format"),
+    ("int", "\u{2212}5", "varies"),
+    ("int", "\u{61c}-5", "varies"),
+    ("int", "nan", "format"),
+    ("int", "inf", "format"),
+    ("int", "\u{221e}", "format"),
+    ("int", "5%", "format"),
+    ("int", "5,", "format"),
+    ("int", "1,2,3", "format"),
+    ("int", "1.5e3", "format"),
+    ("int", "1e-3", "format"),
+    ("int", "5 ", "parsed"),
+    ("int", " -5", "varies"),
+    ("int", "\t5", "parsed"),
+    ("int", "\t5\t", "parsed"),
+    ("int", "-5\t", "varies"),
+    ("int", "5\n", "parsed"),
+    ("int", "\n-5", "varies"),
+    ("int", "\u{b}5", "parsed"),
+    ("int", "\u{b}5\u{b}", "parsed"),
+    ("int", "-5\u{b}", "varies"),
+    ("int", "5\u{c}", "parsed"),
+    ("int", "\u{c}-5", "varies"),
+    ("int", "\r5", "parsed"),
+    ("int", "\r5\r", "parsed"),
+    ("int", "-5\r", "varies"),
+    ("int", "          5", "parsed"),
+    ("int", "-2147483648", "varies"),
+    ("int", "-2147483649", "varies"),
+    ("int", "-2147483647", "varies"),
+    ("int", "2147483647", "parsed"),
+    ("int", "2147483648", "overflow"),
+    ("int", "2147483646", "parsed"),
+    ("int", "0000000000000000000000000000002147483647", "parsed"),
+    (
+        "int",
+        "0000000000000000000000000000002147483648",
+        "overflow",
+    ),
+    ("int", "21474836470", "overflow"),
+    (
+        "int",
+        "99999999999999999999999999999999999999999999999999",
+        "overflow",
+    ),
+    (
+        "int",
+        "-99999999999999999999999999999999999999999999999999",
+        "varies",
+    ),
+    ("int", " 2147483647 ", "parsed"),
+    ("int", "+2147483647", "varies"),
+    ("int", "+2147483648", "varies"),
+    ("int", "-00", "varies"),
+    ("int", "-1", "varies"),
+    ("uint", "0", "parsed"),
+    ("uint", "--5", "format"),
+    ("uint", "5 -", "format"),
+    ("uint", "\n ", "format"),
+    ("uint", "5 5", "format"),
+    ("uint", "1e", "format"),
+    ("uint", " \u{5}", "format"),
+    ("uint", "\u{2212}5", "varies"),
+    ("uint", "\u{221e}", "format"),
+    ("uint", "1.5e3", "format"),
+    ("uint", "\t5", "parsed"),
+    ("uint", "\n-5", "varies"),
+    ("uint", "5\u{c}", "parsed"),
+    ("uint", "-5\r", "varies"),
+    ("uint", "4294967295", "parsed"),
+    ("uint", "4294967294", "parsed"),
+    (
+        "uint",
+        "0000000000000000000000000000004294967296",
+        "overflow",
+    ),
+    (
+        "uint",
+        "99999999999999999999999999999999999999999999999999",
+        "overflow",
+    ),
+    ("uint", " 4294967295 ", "parsed"),
+    ("uint", "+4294967296", "varies"),
+    ("long", "0", "parsed"),
+    ("long", "--5", "format"),
+    ("long", "5 -", "format"),
+    ("long", "\n ", "format"),
+    ("long", "5 5", "format"),
+    ("long", "1e", "format"),
+    ("long", " \u{5}", "format"),
+    ("long", "\u{2212}5", "varies"),
+    ("long", "\u{221e}", "format"),
+    ("long", "1.5e3", "format"),
+    ("long", "\t5", "parsed"),
+    ("long", "\n-5", "varies"),
+    ("long", "5\u{c}", "parsed"),
+    ("long", "-5\r", "varies"),
+    ("long", "-9223372036854775808", "varies"),
+    ("long", "-9223372036854775807", "varies"),
+    ("long", "9223372036854775808", "overflow"),
+    (
+        "long",
+        "0000000000000000000000000000009223372036854775807",
+        "parsed",
+    ),
+    ("long", "92233720368547758070", "overflow"),
+    (
+        "long",
+        "-99999999999999999999999999999999999999999999999999",
+        "varies",
+    ),
+    ("long", "+9223372036854775807", "varies"),
+    ("long", "-00", "varies"),
+    ("ulong", "0", "parsed"),
+    ("ulong", "--5", "format"),
+    ("ulong", "5 -", "format"),
+    ("ulong", "\n ", "format"),
+    ("ulong", "5 5", "format"),
+    ("ulong", "1e", "format"),
+    ("ulong", " \u{5}", "format"),
+    ("ulong", "\u{2212}5", "varies"),
+    ("ulong", "\u{221e}", "format"),
+    ("ulong", "1.5e3", "format"),
+    ("ulong", "\t5", "parsed"),
+    ("ulong", "\n-5", "varies"),
+    ("ulong", "5\u{c}", "parsed"),
+    ("ulong", "-5\r", "varies"),
+    ("ulong", "18446744073709551615", "parsed"),
+    ("ulong", "18446744073709551614", "parsed"),
+    (
+        "ulong",
+        "00000000000000000000000000000018446744073709551616",
+        "overflow",
+    ),
+    (
+        "ulong",
+        "99999999999999999999999999999999999999999999999999",
+        "overflow",
+    ),
+    ("ulong", " 18446744073709551615 ", "parsed"),
+    ("ulong", "+18446744073709551616", "varies"),
+    ("double", "0", "parsed"),
+    ("double", "--5", "format"),
+    ("double", "5 -", "format"),
+    ("double", "\n ", "format"),
+    ("double", "5 5", "varies"),
+    ("double", "1e", "format"),
+    ("double", " \u{5}", "format"),
+    ("double", "\u{2212}5", "varies"),
+    ("double", "\u{221e}", "varies"),
+    ("double", "1.5e3", "varies"),
+    ("double", "\t5", "parsed"),
+    ("double", "\n-5", "varies"),
+    ("double", "5\u{c}", "parsed"),
+    ("double", "-5\r", "varies"),
+    (
+        "double",
+        "9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+        "parsed",
+    ),
+    (
+        "double",
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "parsed",
+    ),
+    ("float", "0", "parsed"),
+    ("float", "--5", "format"),
+    ("float", "5 -", "format"),
+    ("float", "\n ", "format"),
+    ("float", "5 5", "varies"),
+    ("float", "1e", "format"),
+    ("float", " \u{5}", "format"),
+    ("float", "\u{2212}5", "varies"),
+    ("float", "\u{221e}", "varies"),
+    ("float", "1.5e3", "varies"),
+    ("float", "\t5", "parsed"),
+    ("float", "\n-5", "varies"),
+    ("float", "5\u{c}", "parsed"),
+    ("float", "-5\r", "varies"),
+    (
+        "float",
+        "9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+        "parsed",
+    ),
+    (
+        "float",
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "parsed",
+    ),
+    ("decimal", "0", "parsed"),
+    ("decimal", "--5", "format"),
+    ("decimal", "5 -", "varies"),
+    ("decimal", "\n ", "format"),
+    ("decimal", "5 5", "varies"),
+    ("decimal", "1e", "format"),
+    ("decimal", " \u{5}", "format"),
+    ("decimal", "\u{2212}5", "varies"),
+    ("decimal", "\u{221e}", "format"),
+    ("decimal", "1.5e3", "format"),
+    ("decimal", "\t5", "parsed"),
+    ("decimal", "\n-5", "varies"),
+    ("decimal", "5\u{c}", "parsed"),
+    ("decimal", "-5\r", "varies"),
+    ("decimal", "79228162514264337593543950335", "parsed"),
+    ("decimal", "-79228162514264337593543950335", "varies"),
+    (
+        "decimal",
+        "00000000000000000000000000000000000000007",
+        "parsed",
+    ),
+    ("decimal", "999999999999999999999999999999", "overflow"),
+    ("bool", "true", "parsed"),
+    ("bool", "false", "parsed"),
+    ("bool", "True", "parsed"),
+    ("bool", "FALSE", "parsed"),
+    ("bool", " true ", "parsed"),
+    ("bool", "\ttrue\n", "parsed"),
+    ("bool", "true\0", "parsed"),
+    ("bool", "false\0\0", "parsed"),
+    ("bool", "\0true", "parsed"),
+    ("bool", " \0 true", "parsed"),
+    ("bool", "tru", "format"),
+    ("bool", "truee", "format"),
+    ("bool", "t", "format"),
+    ("bool", "1", "format"),
+    ("bool", "0", "format"),
+    ("bool", "yes", "format"),
+    ("bool", "", "format"),
+    ("bool", " ", "format"),
+    ("bool", "\0", "format"),
+    ("bool", "true false", "format"),
+    ("bool", "True,", "format"),
+    ("bool", "\u{a0}true", "parsed"),
+    ("bool", "true\u{a0}", "parsed"),
+    ("bool", "TRUE\r\n", "parsed"),
+    ("bool", "f", "format"),
+    ("bool", "falsE", "parsed"),
+    ("bool", "faIse", "format"),
+    ("bool", "\u{17f}alse", "format"),
+    ("char", "a", "parsed"),
+    ("char", "ab", "format"),
+    ("char", "", "format"),
+    ("char", " ", "parsed"),
+    ("char", "\0", "parsed"),
+    ("char", "5", "parsed"),
+    ("char", "\u{1f60}0", "format"),
+    ("char", "\u{e9}", "parsed"),
+    ("char", "e\u{301}", "format"),
+    ("char", "\n", "parsed"),
+    ("char", "abc", "format"),
+];
+
+/// Texts of the table that are not judged: what a text with a `.` or a `,`
+/// means to a `double` is a culture's to say, and so is a sign set apart from
+/// its number.
+const NOT_JUDGED: &[(&str, &str)] = &[
+    ("int", "- 5"),
+    ("double", "1e"),
+    ("float", "1e"),
+    ("decimal", "\u{221e}"),
+    ("decimal", "1.5e3"),
+    ("bool", "\u{a0}true"),
+    ("bool", "true\u{a0}"),
+    ("bool", "\u{17f}alse"),
+];
+
+fn target_of(name: &str) -> Target {
+    Target::Number(match name {
+        "sbyte" => SpecialType::SByte,
+        "byte" => SpecialType::Byte,
+        "short" => SpecialType::Int16,
+        "ushort" => SpecialType::UInt16,
+        "int" => SpecialType::Int32,
+        "uint" => SpecialType::UInt32,
+        "long" => SpecialType::Int64,
+        "ulong" => SpecialType::UInt64,
+        "double" => SpecialType::Double,
+        "float" => SpecialType::Single,
+        "decimal" => SpecialType::Decimal,
+        "bool" => return Target::Boolean,
+        "char" => return Target::Char,
+        other => panic!("{other}"),
+    })
+}
+
+#[test]
+fn what_parse_does_is_what_the_runtime_does() {
+    let mut unjudged = Vec::new();
+    for (ty, text, expected) in PARSES {
+        let got = parse::outcomes(text, target_of(ty), Culture::Any);
+        let want = match *expected {
+            "parsed" => parse::PARSED,
+            "format" => parse::FORMAT,
+            "overflow" => parse::OVERFLOW,
+            // Some cultures say one thing and some another: the text is
+            // not judged, or judged as both, never as one.
+            _ => {
+                assert!(
+                    got.is_none_or(|got| got.count_ones() > 1),
+                    "{ty} {text:?}: {got:?}"
+                );
+                continue;
+            }
+        };
+        match got {
+            Some(got) => assert_eq!(got, want, "{ty} {text:?}"),
+            None => unjudged.push((*ty, *text)),
+        }
+    }
+    assert_eq!(unjudged, NOT_JUDGED);
+}
+
+#[test]
+fn the_invariant_culture_reads_the_signs() {
+    let int = Target::Number(SpecialType::Int32);
+    assert_eq!(
+        parse::outcomes("-5", int, Culture::Invariant),
+        Some(parse::PARSED)
+    );
+    assert_eq!(
+        parse::outcomes("+5", int, Culture::Invariant),
+        Some(parse::PARSED)
+    );
+    assert_eq!(
+        parse::outcomes("5-", int, Culture::Invariant),
+        Some(parse::FORMAT)
+    );
+    // Some other cultures write the sign another way.
+    assert_eq!(
+        parse::outcomes("-5", int, Culture::Any),
+        Some(parse::PARSED | parse::FORMAT)
+    );
+    let byte = Target::Number(SpecialType::Byte);
+    assert_eq!(
+        parse::outcomes("-0", byte, Culture::Invariant),
+        Some(parse::PARSED)
+    );
+    assert_eq!(
+        parse::outcomes("-1", byte, Culture::Invariant),
+        Some(parse::OVERFLOW)
+    );
+}
+
+/// The failability of each of `members` (each named `M`), every one in a
+/// class of its own, compiled once against the real framework; `None` where
+/// none is installed.
+fn batch(members: &[String]) -> Option<Vec<Failability>> {
+    let mut text = String::from(
+        "using System;\nusing System.Collections.Generic;\nusing System.Globalization;\nusing System.Linq;\nclass FactAttribute : Attribute { }\n",
+    );
+    for (i, member) in members.iter().enumerate() {
+        let member = member
+            .replace("@C", &format!("C{i}"))
+            .replace("@N", &format!("M{i}"))
+            .replace("@G", &format!("G{i}"));
+        text.push_str(&format!("class C{i} {{\n    {member}\n}}\n"));
+    }
+    let semantic = compile(&[("C.cs", &text)], true)?;
+    Some(
+        (0..members.len())
+            .map(|i| {
+                let class = text.find(&format!("class C{i} {{")).expect("class");
+                let at = class + text[class..].find(" M").expect("member") + 2;
+                semantic
+                    .failability(Path::new("/p/C.cs"), at as u32)
+                    .expect("a member")
+            })
+            .collect(),
+    )
+}
+
+/// The failability of `return {call};` in each of `calls`.
+fn call_failures(calls: &[&str]) -> Option<Vec<Failability>> {
+    let members: Vec<String> = calls
+        .iter()
+        .map(|call| format!("object M() {{ return {call}; }}"))
+        .collect();
+    batch(&members)
+}
+
+fn verdict_of(found: &Failability, exception: &str) -> Option<Verdict> {
+    found
+        .failures
+        .iter()
+        .find(|f| f.exception == exception)
+        .map(|f| f.verdict)
+}
+
+fn is_certain(verdict: Option<Verdict>) -> bool {
+    matches!(verdict, Some(Verdict::Always | Verdict::Never))
+}
+
+/// A text every culture reads the same way is judged; one that some cultures
+/// read as a number and some do not is not told, either way.
+#[test]
+fn a_text_the_cultures_read_alike_is_judged_and_one_they_do_not_is_not() {
+    let certain = [
+        ("int.Parse(\"abc\")", Verdict::Always),
+        ("int.Parse(\" 5 \")", Verdict::Never),
+        ("int.Parse(\"5\\0\")", Verdict::Never),
+        ("int.Parse(\"1,000\")", Verdict::Always),
+        ("long.Parse(\"\")", Verdict::Always),
+        ("decimal.Parse(\"1e3\")", Verdict::Always),
+        ("decimal.Parse(\"inf\")", Verdict::Always),
+        ("bool.Parse(\"false\\0\")", Verdict::Never),
+        ("bool.Parse(\" TRUE \")", Verdict::Never),
+        ("bool.Parse(\"yes\")", Verdict::Always),
+        ("char.Parse(\"ab\")", Verdict::Always),
+        ("Convert.ToInt32(\"x\")", Verdict::Always),
+        (
+            "int.Parse(\"-5\", CultureInfo.InvariantCulture)",
+            Verdict::Never,
+        ),
+        (
+            "int.Parse(\"5-\", CultureInfo.InvariantCulture)",
+            Verdict::Always,
+        ),
+    ];
+    // A culture's own decimal point, group separator, sign, exponent or
+    // symbol: not for the analysis to say.
+    let culture = [
+        "double.Parse(\"1,000\")",
+        "float.Parse(\"1,000\")",
+        "Convert.ToDouble(\"1,000\")",
+        "decimal.Parse(\"1,000\")",
+        "decimal.Parse(\"5-\")",
+        "double.Parse(\"1e3\")",
+        "double.Parse(\"inf\")",
+        "double.Parse(\"+inf\")",
+        "double.Parse(\"NaN\")",
+        "int.Parse(\"-5\")",
+        "int.Parse(\"+5\")",
+        "int.Parse(\"\\u22125\")",
+        "int.Parse(\"5\", NumberStyles.HexNumber)",
+        "Convert.ToInt32(\"ff\", 16)",
+    ];
+    let calls: Vec<&str> = certain
+        .iter()
+        .map(|(call, _)| *call)
+        .chain(culture)
+        .collect();
+    let Some(found) = call_failures(&calls) else {
+        return;
+    };
+    for ((call, verdict), found) in certain.iter().zip(&found) {
+        assert_eq!(
+            verdict_of(found, "FormatException"),
+            Some(*verdict),
+            "{call}"
+        );
+    }
+    for (call, found) in culture.iter().zip(&found[certain.len()..]) {
+        assert!(
+            !is_certain(verdict_of(found, "FormatException")),
+            "{call}: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn a_number_out_of_range_is_an_overflow_not_a_format_error() {
+    let Some(found) = call_failures(&[
+        "int.Parse(\"99999999999\")",
+        "byte.Parse(\"255\")",
+        "byte.Parse(\"256\")",
+        "byte.Parse(\"-0\")",
+        "uint.Parse(\"-1\", CultureInfo.InvariantCulture)",
+        "int.Parse(\"2147483647\")",
+        "int.Parse(\"2147483648\")",
+    ]) else {
+        return;
+    };
+    let overflow = |at: usize| verdict_of(&found[at], "OverflowException");
+    assert_eq!(overflow(0), Some(Verdict::Always));
+    assert_eq!(
+        verdict_of(&found[0], "FormatException"),
+        Some(Verdict::Never)
+    );
+    assert_eq!(
+        verdict_of(&found[1], "FormatException"),
+        Some(Verdict::Never)
+    );
+    // Nothing that cannot happen is listed beside what can.
+    assert_eq!(overflow(1), None);
+    assert_eq!(overflow(2), Some(Verdict::Always));
+    // `-0` is a number in the cultures that sign with `-`.
+    assert_eq!(
+        verdict_of(&found[3], "FormatException"),
+        Some(Verdict::Possible)
+    );
+    assert_eq!(overflow(4), Some(Verdict::Always));
+    assert_eq!(overflow(5), None);
+    assert_eq!(overflow(6), Some(Verdict::Always));
+}
+
+#[test]
+fn a_null_text_is_an_argument_error_for_parse_and_zero_for_convert() {
+    let Some(found) = call_failures(&[
+        "int.Parse((string)null)",
+        "int.Parse(null)",
+        "Convert.ToInt32((string)null)",
+        "Convert.ToInt32(null as string)",
+    ]) else {
+        return;
+    };
+    let null = |at: usize| verdict_of(&found[at], "ArgumentNullException");
+    assert_eq!(null(0), Some(Verdict::Always));
+    assert_eq!(
+        verdict_of(&found[0], "FormatException"),
+        Some(Verdict::Never)
+    );
+    assert_eq!(null(1), Some(Verdict::Always));
+    assert_eq!(null(2), None);
+    assert_eq!(
+        verdict_of(&found[2], "FormatException"),
+        Some(Verdict::Never)
+    );
+    assert_eq!(
+        verdict_of(&found[3], "FormatException"),
+        Some(Verdict::Never)
+    );
+    // A text nobody knows may be null; that is not a finding by itself.
+    let found = batch(&["int M(string s) { return int.Parse(s); }".to_owned()]).expect("framework");
+    assert_eq!(verdict_of(&found[0], "ArgumentNullException"), None);
+}
+
+// MARK: - what only a name reaches
+
+/// A member reached by a `dynamic` call or by a lookup by name has callers
+/// the project's calls do not show: what it gets is not known.
+#[test]
+fn a_call_by_name_at_run_time_voids_what_the_callers_pass() {
+    let flags =
+        "System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance";
+    let by_name = [
+        "void B() { dynamic d = this; d.@N(0); }".to_owned(),
+        "void B(dynamic d) { @N(d); }".to_owned(),
+        format!(
+            "void B() {{ typeof(@C).GetMethod(\"@N\", {flags}).Invoke(this, new object[] {{ 0 }}); }}"
+        ),
+        format!(
+            "void B() {{ typeof(@C).GetMethod(nameof(@N), {flags}).Invoke(this, new object[] {{ 0 }}); }}"
+        ),
+        format!(
+            "void B() {{ typeof(@C).InvokeMember(\"@N\", System.Reflection.BindingFlags.InvokeMethod | {flags}, null, this, new object[] {{ 0 }}); }}"
+        ),
+    ];
+    // A name that is another's, or a call of another member, changes nothing.
+    let unrelated = [
+        "void B() { dynamic d = this; d.@G(0); }",
+        "void B() { typeof(@C).GetMethod(\"@G\"); }",
+        "void B() { System.Console.WriteLine(\"@N\"); }",
+        "",
+    ];
+    let members: Vec<String> = by_name
+        .iter()
+        .map(String::as_str)
+        .chain(unrelated)
+        .map(|other| {
+            format!(
+                "int @N(int x) {{ if (x == 0) throw new Exception(); return x; }}\n    int @G(int y) => y;\n    {other}\n    void A() {{ @N(1); }}"
+            )
+        })
+        .collect();
+    let Some(found) = batch(&members) else {
+        return;
+    };
+    for (other, found) in by_name.iter().zip(&found) {
+        assert_eq!(only(found), Verdict::Unknown, "{other}");
+        assert_eq!(
+            found.failures[0].inputs[0].origin,
+            Origin::ByName,
+            "{other}"
+        );
+    }
+    for (other, found) in unrelated.iter().zip(&found[by_name.len()..]) {
+        assert_eq!(only(found), Verdict::Never, "{other}");
+    }
+}
+
+#[test]
+fn a_field_written_by_name_has_values_nobody_sees() {
+    let members = [
+        "int @G = 1;\n    void @N() { if (@G == 0) throw new Exception(); }\n    void Set() { typeof(@C).GetField(\"@G\", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance).SetValue(this, 0); }",
+        "int @G = 1;\n    void @N() { if (@G == 0) throw new Exception(); }",
+    ]
+    .map(str::to_owned);
+    let Some(found) = batch(&members) else {
+        return;
+    };
+    assert_eq!(only(&found[0]), Verdict::Unknown);
+    assert_eq!(only(&found[1]), Verdict::Never);
+}
+
+/// A method a framework finds by its attribute is called by it; one marked
+/// only for the compiler is not.
+#[test]
+fn a_method_an_attribute_marks_is_called_from_outside() {
+    let members = [
+        "[Fact] public void M(int x) { if (x == 0) throw new Exception(); }\n    void A() { M(1); }",
+        "[Obsolete] public void M(int x) { if (x == 0) throw new Exception(); }\n    void A() { M(1); }",
+        "[System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] public void M(int x) { if (x == 0) throw new Exception(); }\n    void A() { M(1); }",
+    ]
+    .map(str::to_owned);
+    let Some(found) = batch(&members) else {
+        return;
+    };
+    assert_eq!(only(&found[0]), Verdict::Unknown);
+    assert_eq!(found[0].failures[0].inputs[0].origin, Origin::EntryPoint);
+    assert_eq!(only(&found[1]), Verdict::Never);
+    assert_eq!(only(&found[2]), Verdict::Never);
+}
+
+#[test]
+fn the_reason_a_call_is_not_seen_is_the_one_that_holds() {
+    let members = [
+        // A body of the file that does not compile.
+        "int @N(int x) { if (x == 0) throw new Exception(); return x; }\n    void A() { @N(1); }\n    void E() { int q = \"x\"; @N(q); }",
+        // This very method passed as a delegate.
+        "int @N(int x) { if (x == 0) throw new Exception(); return x; }\n    void A() { @N(1); Func<int, int> f = @N; }",
+        // Another class's method of the name, as a delegate.
+        "int @N(int x) { if (x == 0) throw new Exception(); return x; }\n    void A() { @N(1); }\n    class D { int @N(int x) => x; void B() { Func<int, int> f = @N; } }",
+        // Virtual: reached through its base.
+        "public virtual int @N(int x) { if (x == 0) throw new Exception(); return x; }\n    void A() { @N(1); }",
+    ]
+    .map(str::to_owned);
+    let Some(found) = batch(&members) else {
+        return;
+    };
+    assert_eq!(found[0].failures[0].inputs[0].origin, Origin::Unread);
+    assert_eq!(found[1].failures[0].inputs[0].origin, Origin::Delegate);
+    assert_eq!(only(&found[2]), Verdict::Never);
+    assert_eq!(found[3].failures[0].inputs[0].origin, Origin::Escapes);
+}
+
+// MARK: - what a condition says
+
+/// What is written for the way past a guard is C# that means exactly what
+/// the guard does not: precedence kept, and a comparison turned round only
+/// where nothing is unordered.
+#[test]
+fn the_text_of_the_opposite_of_a_condition_is_the_opposite() {
+    let cases = [
+        (
+            "static void M(int flags, int mask, int target) { if ((flags & mask) == target) return; throw new Exception(); }",
+            "(flags & mask) != target",
+        ),
+        (
+            "static void M(int a, int b) { if (a < b) return; throw new Exception(); }",
+            "a >= b",
+        ),
+        (
+            "static void M(int a, int b) { if (a + 1 <= b * 2) return; throw new Exception(); }",
+            "a + 1 > b * 2",
+        ),
+        (
+            "static void M(Func<int> f) { if (f == null) return; throw new Exception(); }",
+            "!(f == null)",
+        ),
+        (
+            "static void M(TimeSpan t) { if (t <= TimeSpan.Zero) return; throw new Exception(); }",
+            "!(t <= TimeSpan.Zero)",
+        ),
+        (
+            "static void M(double a, double b) { if (a < b) return; throw new Exception(); }",
+            "!(a < b)",
+        ),
+        (
+            "static void M(float a, float b) { if (a >= b) return; throw new Exception(); }",
+            "!(a >= b)",
+        ),
+        (
+            "static void M(int? a, int? b) { if (a < b) return; throw new Exception(); }",
+            "!(a < b)",
+        ),
+        (
+            "static void M(decimal a, decimal b) { if (a > b) return; throw new Exception(); }",
+            "a <= b",
+        ),
+        (
+            "static void M(char a, char b) { if (a > b) return; throw new Exception(); }",
+            "a <= b",
+        ),
+        (
+            "static void M(DayOfWeek a) { if (a < DayOfWeek.Tuesday) return; throw new Exception(); }",
+            "a >= DayOfWeek.Tuesday",
+        ),
+        (
+            "static void M(bool a, bool b) { if (a && b) return; throw new Exception(); }",
+            "!(a && b)",
+        ),
+        (
+            "static void M(bool ready) { if (ready) return; throw new Exception(); }",
+            "!ready",
+        ),
+        (
+            "static void M(string s) { if (s.Length > 3) return; throw new Exception(); }",
+            "s.Length <= 3",
+        ),
+        (
+            "static void M(string s) { if (s.StartsWith(\"a\") || s.Length > 3) return; throw new Exception(); }",
+            "!(s.StartsWith(\"a\") || s.Length > 3)",
+        ),
+        (
+            "static void M(bool a, bool b) { if (!(a || b)) return; throw new Exception(); }",
+            "a || b",
+        ),
+    ];
+    let members: Vec<String> = cases
+        .iter()
+        .map(|(member, _)| (*member).to_owned())
+        .collect();
+    let Some(found) = batch(&members) else {
+        return;
+    };
+    for ((member, expected), found) in cases.iter().zip(&found) {
+        let conditions: Vec<&str> = found.failures[0]
+            .conditions
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(conditions, [*expected], "{member}");
+    }
+}
+
+/// Nothing the analysis concludes follows from turning a comparison round:
+/// a `NaN` is neither below nor above, and a null is not compared.
+#[test]
+fn a_nan_and_a_null_do_not_make_the_way_past_a_guard_certain() {
+    let members = [
+        "static void M(double a, double b) { if (a < b) return; throw new System.Exception(); }\n    static void G() { M(double.NaN, 1.0); }",
+        "static void M(int? a, int? b) { if (a < b) return; throw new System.Exception(); }\n    static void G() { M(null, 1); }",
+    ]
+    .map(str::to_owned);
+    let Some(found) = batch(&members) else {
+        return;
+    };
+    // `NaN < 1.0` is false: the throw is reached, and is not "impossible".
+    assert_ne!(only(&found[0]), Verdict::Never);
+    assert_ne!(only(&found[1]), Verdict::Never);
+}
+
+// MARK: - failures that are certain
+
+/// What a call or a statement of a member is certain to do, where it is
+/// written out: a `null` that is cast, a `default`, a collection made empty
+/// there.
+#[test]
+fn a_null_that_is_written_out_is_dereferenced() {
+    let always = [
+        (
+            "int M() { return ((string)null).Length; }",
+            "NullReferenceException",
+        ),
+        (
+            "int M() { return default(string).Length; }",
+            "NullReferenceException",
+        ),
+        (
+            "void M() { string s = null; foreach (var c in s) { } }",
+            "NullReferenceException",
+        ),
+        (
+            "void M() { var d = new Dictionary<string, int>(); d[null] = 1; }",
+            "ArgumentNullException",
+        ),
+        (
+            "int M() { var d = new Dictionary<string, int>(); return d[null]; }",
+            "ArgumentNullException",
+        ),
+        (
+            "void M() { new List<int>(-1); }",
+            "ArgumentOutOfRangeException",
+        ),
+        (
+            "void M() { new Stack<int>().Pop(); }",
+            "InvalidOperationException",
+        ),
+        (
+            "void M() { var s = new Stack<int>(); s.Pop(); }",
+            "InvalidOperationException",
+        ),
+        (
+            "void M() { var q = new Queue<int>(); int unrelated = 1; q.Dequeue(); }",
+            "InvalidOperationException",
+        ),
+        (
+            "int M() { return new List<int>().First(); }",
+            "InvalidOperationException",
+        ),
+        (
+            "int M() { var e = new int[0]; return e.Max(); }",
+            "InvalidOperationException",
+        ),
+        (
+            "int M() { var e = Enumerable.Empty<int>(); return e.First(); }",
+            "InvalidOperationException",
+        ),
+        (
+            "void M() { int[] a = null; foreach (var x in a) { } }",
+            "NullReferenceException",
+        ),
+    ];
+    let members: Vec<String> = always
+        .iter()
+        .map(|(member, _)| (*member).to_owned())
+        .collect();
+    let Some(found) = batch(&members) else {
+        return;
+    };
+    for ((member, exception), found) in always.iter().zip(&found) {
+        assert_eq!(
+            verdict_of(found, exception),
+            Some(Verdict::Always),
+            "{member}: {found:?}"
+        );
+    }
+}
+
+/// The same things, where what the receiver holds can have changed or is
+/// not known: nothing is certain.
+#[test]
+fn what_may_have_changed_is_not_certain() {
+    let not_certain = [
+        "void M(string s) { foreach (var c in s) { } }",
+        "void M() { var d = new Dictionary<string, int>(); string k = \"a\"; d[k] = 1; }",
+        "void M(int n) { new List<int>(n); }",
+        "void M() { new List<int>(0); }",
+        "void M() { var s = new Stack<int>(); s.Push(1); s.Pop(); }",
+        "void M() { var s = new Stack<int>(); for (int i = 0; i < 2; i++) { if (i > 0) s.Pop(); s.Push(i); } }",
+        "void M() { var s = new Stack<int>(); Action a = () => s.Push(1); a(); s.Pop(); }",
+        "int M() { var l = new List<int>(); l.Add(1); return l.First(); }",
+        "int M(List<int> l) { return l.First(); }",
+        "int M() { var l = new List<int> { 1 }; return l.First(); }",
+        "int M() { return new List<int>(new[] { 1 }).First(); }",
+        "int? M() { return new List<int?>().Max(); }",
+        "string M() { return new List<string>().Max(); }",
+        "int M() { return new List<int>().Aggregate(0, (a, b) => a + b); }",
+    ]
+    .map(str::to_owned);
+    let Some(found) = batch(&not_certain) else {
+        return;
+    };
+    for (member, found) in not_certain.iter().zip(&found) {
+        assert!(
+            found
+                .failures
+                .iter()
+                .all(|f| !matches!(f.verdict, Verdict::Always)),
+            "{member}: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn throwing_null_throws_a_null_reference() {
+    let members = [
+        "void M() { throw null; }",
+        "void M() { Exception e = null; throw e; }",
+        "void M() { throw new Exception(); }",
+    ]
+    .map(str::to_owned);
+    let Some(found) = batch(&members) else {
+        return;
+    };
+    assert_eq!(found[0].failures[0].exception, "NullReferenceException");
+    assert_eq!(found[0].failures[0].verdict, Verdict::Always);
+    assert_eq!(found[1].failures[0].exception, "NullReferenceException");
+    assert_eq!(found[2].failures[0].exception, "Exception");
+}
+
+/// Two comparisons of one integer, as it is at one place, that no value
+/// satisfies together, rule the failure out whatever the integer is.
+#[test]
+fn comparisons_that_no_integer_satisfies_together_are_impossible() {
+    let impossible = [
+        "void M(int x) { if (x > 0 && x < 0) throw new Exception(); }",
+        "void M(int x) { if (x > 0) { if (x < 0) throw new Exception(); } }",
+        "void M(int x) { if (x == 5) { if (x != 5) throw new Exception(); } }",
+        "void M(int x) { if (x < 3 && x == 5) throw new Exception(); }",
+        "void M(int x) { if (!(x <= 3) && x == 2) throw new Exception(); }",
+        "void M(int x) { if (0 < x && x < 1) throw new Exception(); }",
+        "void M(long x) { if (x >= 10 && x <= 9) throw new Exception(); }",
+        "void M() { for (int i = 0; i < 3; i++) { if (i == 5) throw new Exception(); } }",
+    ]
+    .map(str::to_owned);
+    // Comparisons that can hold together, or are of what may be a `NaN` or
+    // a null, or are of two values of one name, stay as they were.
+    let possible = [
+        "void M(int x) { if (x > 0 && x < 5) throw new Exception(); }",
+        "void M(int x) { if (x > 0 || x < 0) throw new Exception(); }",
+        "void M(double x) { if (!(x > 0) && !(x < 0)) throw new Exception(); }",
+        "void M(int? x) { if (!(x > 0) && !(x < 0)) throw new Exception(); }",
+        "void M(int x) { if (x > 0) { x = -1; if (x < 0) throw new Exception(); } }",
+        "void M(int x, int y) { if (x > 0 && y < 0) throw new Exception(); }",
+        "void M(byte x) { if (x > 0 && x < 255) throw new Exception(); }",
+    ]
+    .map(str::to_owned);
+    let both: Vec<String> = impossible.iter().chain(&possible).cloned().collect();
+    let Some(found) = batch(&both) else {
+        return;
+    };
+    for (member, found) in impossible.iter().zip(&found) {
+        assert_eq!(only(found), Verdict::Never, "{member}: {found:?}");
+    }
+    for (member, found) in possible.iter().zip(&found[impossible.len()..]) {
+        assert_ne!(only(found), Verdict::Never, "{member}: {found:?}");
+    }
+}
+
+#[test]
+fn integers_are_compared_as_integers() {
+    // `double` cannot tell these two apart.
+    let members = [
+        "void M() { long x = 9007199254740992; if (x == 9007199254740993) throw new Exception(); }",
+        "void M() { long x = 9007199254740992; if (x < 9007199254740993) throw new Exception(); }",
+    ]
+    .map(str::to_owned);
+    let Some(found) = batch(&members) else {
+        return;
+    };
+    assert_eq!(only(&found[0]), Verdict::Never);
+    assert_eq!(only(&found[1]), Verdict::Always);
+}
