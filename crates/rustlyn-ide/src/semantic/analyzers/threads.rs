@@ -352,6 +352,26 @@ pub(in super::super) fn threads(
     let mut fields: Vec<_> = by_field.into_iter().collect();
     fields.sort_by_key(|(field, _)| *field);
     for (field, uses) in fields {
+        // Two reads race with nothing: a field nobody writes has no partner
+        // for any of them.
+        if !uses
+            .iter()
+            .any(|&(index, _)| gathered.accesses[index].write)
+        {
+            continue;
+        }
+        // Nor do two accesses that cannot be at the same time, which only
+        // the threads they are on say: a field used on one thread alone has
+        // no partner, however many times it is used.
+        let mut threads: Vec<Ctx> = uses.iter().map(|&(_, ctx)| ctx).collect();
+        threads.sort_unstable();
+        threads.dedup();
+        if !threads
+            .iter()
+            .any(|&x| threads.iter().any(|&y| order.concurrent(x, y)))
+        {
+            continue;
+        }
         for &(a, ca) in &uses {
             let first = &gathered.accesses[a];
             let key = (field, first.unit, first.in_lambda);
@@ -673,6 +693,11 @@ fn names_of(body: &BoundBody) -> HashMap<SymbolId, Vec<TextSpan>> {
     for (at, symbol) in &body.symbols {
         names.entry(*symbol).or_default().push(*at);
     }
+    // In order of place, so that the first one from some place on is found
+    // without looking at all of them.
+    for spans in names.values_mut() {
+        spans.sort_by_key(|at| at.start());
+    }
     names
 }
 
@@ -880,10 +905,11 @@ impl Walk<'_, '_> {
             .names
             .get(&member)
             .and_then(|spans| {
-                spans
+                let from = spans.partition_point(|at| at.start() < after);
+                spans[from..]
                     .iter()
-                    .filter(|at| span.contains_span(**at) && at.start() >= after)
-                    .min_by_key(|at| at.start())
+                    .take_while(|at| at.start() < span.end())
+                    .find(|at| span.contains_span(**at))
             })
             .copied();
         if let Some(found) = found {

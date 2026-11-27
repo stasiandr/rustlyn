@@ -362,10 +362,17 @@ pub(super) fn unused_values(
         }
         // What the bound tree says nobody reads, checked against the names
         // written: a constant the binder folded into its uses, or a read it
-        // did not keep, is still a read.
+        // did not keep, is still a read. The identifiers of the body are
+        // gathered by name when the first report needs them: a body with a
+        // thousand locals nobody reads is otherwise read through a thousand
+        // times.
+        let mut written: Option<HashMap<String, Vec<rustlyn_syntax::SyntaxToken>>> = None;
         for report in reported {
-            if report.unread && read_in_syntax(view, &body.owner, report.declared, &report.name) {
-                continue;
+            if report.unread {
+                let names = written.get_or_insert_with(|| identifiers_by_name(&body.owner));
+                if read_in_syntax(view, names, report.declared, &report.name) {
+                    continue;
+                }
             }
             found.push(report.diagnostic);
         }
@@ -382,20 +389,34 @@ struct Report {
     diagnostic: AnalyzerDiagnostic,
 }
 
-/// Whether a name in `owner` other than the declaration reads the local
-/// declared at `declared`.
-fn read_in_syntax(view: &mut View<'_>, owner: &SyntaxNode, declared: TextSpan, name: &str) -> bool {
-    let tokens: Vec<rustlyn_syntax::SyntaxToken> = owner
-        .descendant_tokens()
-        .filter(|token| {
-            token.kind() == SyntaxKind::IdentifierToken
-                && token.value_text() == name
-                && token.span() != declared
+/// The identifier tokens of `owner`, by what they say, in order.
+fn identifiers_by_name(owner: &SyntaxNode) -> HashMap<String, Vec<rustlyn_syntax::SyntaxToken>> {
+    let mut names: HashMap<String, Vec<rustlyn_syntax::SyntaxToken>> = HashMap::new();
+    for token in owner.descendant_tokens() {
+        if token.kind() == SyntaxKind::IdentifierToken {
+            names
+                .entry(token.value_text().to_string())
+                .or_default()
+                .push(token);
+        }
+    }
+    names
+}
+
+/// Whether a name among `names`, the identifiers of a body, other than the
+/// declaration reads the local declared at `declared`.
+fn read_in_syntax(
+    view: &mut View<'_>,
+    names: &HashMap<String, Vec<rustlyn_syntax::SyntaxToken>>,
+    declared: TextSpan,
+    name: &str,
+) -> bool {
+    names.get(name).is_some_and(|tokens| {
+        tokens.iter().any(|token| {
+            token.span() != declared
+                && matches!(view.resolve(token), Some(Resolved::Local { span, .. }) if span == declared)
+                && super::access_of(token) != super::Access::Write
         })
-        .collect();
-    tokens.into_iter().any(|token| {
-        matches!(view.resolve(&token), Some(Resolved::Local { span, .. }) if span == declared)
-            && super::access_of(&token) != super::Access::Write
     })
 }
 

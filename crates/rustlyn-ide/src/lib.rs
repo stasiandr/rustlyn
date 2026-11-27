@@ -71,5 +71,6 @@ pub use highlight::{Class, Classified, Highlighter};
 pub use index::{Confidence, Entry, Found, IndexedFile, ProjectIndex};
 pub use navigate::{Miss, Target, definition_at};
 pub use outline::{Declaration, DeclarationKind, FileOutline, Parameter, PassedBy, Using};
+pub use rustlyn_semantics::parallel::deep;
 pub use session::{Definition, Location, Refusal, Run, Session};
 pub use utf16::Utf16Map;

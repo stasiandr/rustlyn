@@ -116,6 +116,23 @@ pub struct Semantic {
 /// kilobytes to tens of kilobytes.
 const KEPT_BODIES: usize = 4096;
 
+impl Drop for Semantic {
+    fn drop(&mut self) {
+        // A bound body is dropped level by level, as deep as the code it
+        // was bound from: the bodies this kept are let go on a stack made
+        // for that, wherever the last of the project's users is.
+        let kept = std::mem::take(
+            &mut *self
+                .bodies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if !kept.is_empty() {
+            rustlyn_semantics::parallel::deep(move || drop(kept));
+        }
+    }
+}
+
 impl std::fmt::Debug for Semantic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Semantic")
@@ -563,6 +580,8 @@ impl Semantic {
             root,
             model: SemanticModel::new(&self.compilation, tree),
             bodies: HashMap::new(),
+            above: HashMap::new(),
+            contexts: HashMap::new(),
             speculation: None,
         })
     }
@@ -591,6 +610,8 @@ impl Semantic {
             root: edited.root(),
             model: SemanticModel::speculative(&self.compilation, speculation.clone()),
             bodies: HashMap::new(),
+            above: HashMap::new(),
+            contexts: HashMap::new(),
             speculation: Some(speculation),
         })
     }
@@ -830,8 +851,207 @@ pub struct View<'a> {
     root: SyntaxNode,
     model: SemanticModel<'a>,
     bodies: HashMap<TextSpan, Arc<BoundBody>>,
+    /// What climbing from a node finds, kept for every node climbed from or
+    /// through: see [`Above`].
+    above: HashMap<NodeKey, Above>,
+    /// The scopes of the declarations asked about, worked out once each.
+    contexts: HashMap<NodeKey, Arc<rustlyn_semantics::Context>>,
     /// Set when this is the editor's text rather than the compiled one.
     speculation: Option<Speculation>,
+}
+
+/// Which node of the tree: where it starts and the green node it is. The
+/// green tree shares equal subtrees, so the place is part of it; no node
+/// holds itself, so the pair is one node's alone.
+type NodeKey = (u32, usize);
+
+fn key_of(node: &SyntaxNode) -> NodeKey {
+    (node.full_span().start(), Arc::as_ptr(node.green()) as usize)
+}
+
+/// What is above `node`: kept in `known` for every node climbed through, so
+/// that the next question stops at the nearest node already asked about.
+fn above_in(known: &mut HashMap<NodeKey, Above>, node: &SyntaxNode) -> Above {
+    let mut pending: Vec<SyntaxNode> = Vec::new();
+    let mut cursor = Some(node.clone());
+    let mut found: Option<Above> = None;
+    while let Some(current) = cursor {
+        if let Some(above) = known.get(&key_of(&current)) {
+            found = Some(above.clone());
+            break;
+        }
+        cursor = current.parent().cloned();
+        pending.push(current);
+    }
+    for current in pending.into_iter().rev() {
+        let above = Above::of(&current, found.as_ref());
+        known.insert(key_of(&current), above.clone());
+        found = Some(above);
+    }
+    found.expect("the node itself is climbed from")
+}
+
+/// The scopes of `node`: those of the declaration it is in, kept in
+/// `contexts`.
+fn context_in(
+    known: &mut HashMap<NodeKey, Above>,
+    contexts: &mut HashMap<NodeKey, Arc<rustlyn_semantics::Context>>,
+    binder: &rustlyn_semantics::Binder<'_>,
+    tree: usize,
+    root: &SyntaxNode,
+    node: &SyntaxNode,
+) -> Arc<rustlyn_semantics::Context> {
+    let scope = above_in(known, node).scope.unwrap_or_else(|| root.clone());
+    contexts
+        .entry(key_of(&scope))
+        .or_insert_with(|| Arc::new(binder.context_at(tree, &scope)))
+        .clone()
+}
+
+/// What a name, or any node, needs to know of the nodes above it, which
+/// asking afresh for each costs the depth of the tree: a chain of ten
+/// thousand calls has a name at the bottom of every one of ten thousand
+/// climbs. Kept for each node, it is worked out from its parent's, so that
+/// the whole tree costs what one climb does.
+#[derive(Clone)]
+struct Above {
+    /// The `Attribute` the node is in, if the code around it up to the
+    /// body it is in has one.
+    attribute: Option<SyntaxNode>,
+    /// The clause that holds the node as a parameter's default value, an
+    /// enum member's value or a fixed buffer's size, in the same reach.
+    default: Option<SyntaxNode>,
+    /// [`SemanticModel::body_owner`] of the node.
+    owner: Option<SyntaxNode>,
+    /// The declaration whose scopes the node is in: the node or the nearest
+    /// node above it that opens one.
+    scope: Option<SyntaxNode>,
+    /// The nearest namespace declaration above the node.
+    namespace: Option<SyntaxNode>,
+    /// The nearest `using` or namespace declaration above the node.
+    directive: Option<SyntaxNode>,
+    /// The nearest `Attribute` above the node, in whatever it is on.
+    enclosing_attribute: Option<SyntaxNode>,
+}
+
+impl Above {
+    /// What the node finds, given what its parent found (`None` for the
+    /// root).
+    fn of(node: &SyntaxNode, parent: Option<&Above>) -> Self {
+        let up = node.parent();
+        let reaches = up.is_some_and(|up| !rustlyn_semantics::is_body_owner(up.kind()));
+        let from_parent = |wanted: fn(&SyntaxNode) -> bool, inherited: Option<&SyntaxNode>| {
+            let up = up?;
+            if !reaches {
+                None
+            } else if wanted(up) {
+                Some(up.clone())
+            } else {
+                inherited.cloned()
+            }
+        };
+        let owner = match node.kind() {
+            SyntaxKind::FieldDeclaration | SyntaxKind::EventFieldDeclaration => Some(node.clone()),
+            kind if rustlyn_semantics::is_body_owner(kind) => Some(node.clone()),
+            // A field's initializer belongs to its declarator, the outermost
+            // one: `int a = 1, b = 2;` is two bodies.
+            SyntaxKind::VariableDeclarator => match parent.and_then(|above| above.owner.as_ref()) {
+                Some(found)
+                    if matches!(
+                        found.kind(),
+                        SyntaxKind::FieldDeclaration | SyntaxKind::EventFieldDeclaration
+                    ) =>
+                {
+                    Some(node.clone())
+                }
+                other => other.cloned(),
+            },
+            _ => parent.and_then(|above| above.owner.clone()),
+        };
+        let scope = if opens_scope(node.kind()) {
+            Some(node.clone())
+        } else {
+            parent.and_then(|above| above.scope.clone())
+        };
+        Self {
+            attribute: from_parent(
+                |node| node.kind() == SyntaxKind::Attribute,
+                parent.and_then(|above| above.attribute.as_ref()),
+            ),
+            default: from_parent(
+                is_default_value,
+                parent.and_then(|above| above.default.as_ref()),
+            ),
+            owner,
+            scope,
+            namespace: match up {
+                Some(up) if up.kind() == SyntaxKind::NamespaceDeclaration => Some(up.clone()),
+                _ => parent.and_then(|above| above.namespace.clone()),
+            },
+            directive: match up {
+                Some(up)
+                    if matches!(
+                        up.kind(),
+                        SyntaxKind::UsingDirective
+                            | SyntaxKind::NamespaceDeclaration
+                            | SyntaxKind::FileScopedNamespaceDeclaration
+                    ) =>
+                {
+                    Some(up.clone())
+                }
+                _ => parent.and_then(|above| above.directive.clone()),
+            },
+            enclosing_attribute: match up {
+                Some(up) if up.kind() == SyntaxKind::Attribute => Some(up.clone()),
+                _ => parent.and_then(|above| above.enclosing_attribute.clone()),
+            },
+        }
+    }
+}
+
+/// Whether a node is the clause of a parameter's default value, an enum
+/// member's value, or a fixed buffer's size.
+fn is_default_value(node: &SyntaxNode) -> bool {
+    (node.kind() == SyntaxKind::EqualsValueClause
+        && node.parent().is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                SyntaxKind::Parameter | SyntaxKind::EnumMemberDeclaration
+            )
+        }))
+        || (node.kind() == SyntaxKind::Argument
+            && node.parent().is_some_and(|list| {
+                list.kind() == SyntaxKind::BracketedArgumentList
+                    && list
+                        .parent()
+                        .is_some_and(|parent| parent.kind() == SyntaxKind::VariableDeclarator)
+            }))
+}
+
+/// Whether a declaration puts scopes around what is in it, as
+/// [`rustlyn_semantics::Binder::context_at`] reads them off the ancestors.
+const fn opens_scope(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::ClassDeclaration
+            | SyntaxKind::StructDeclaration
+            | SyntaxKind::InterfaceDeclaration
+            | SyntaxKind::RecordDeclaration
+            | SyntaxKind::RecordStructDeclaration
+            | SyntaxKind::EnumDeclaration
+            | SyntaxKind::DelegateDeclaration
+            | SyntaxKind::MethodDeclaration
+            | SyntaxKind::ConstructorDeclaration
+            | SyntaxKind::PropertyDeclaration
+            | SyntaxKind::IndexerDeclaration
+            | SyntaxKind::OperatorDeclaration
+            | SyntaxKind::ConversionOperatorDeclaration
+            | SyntaxKind::LocalFunctionStatement
+            | SyntaxKind::ExtensionBlockDeclaration
+            | SyntaxKind::NamespaceDeclaration
+            | SyntaxKind::FileScopedNamespaceDeclaration
+            | SyntaxKind::CompilationUnit
+    )
 }
 
 impl std::fmt::Debug for View<'_> {
@@ -891,9 +1111,35 @@ impl<'a> View<'a> {
         })
     }
 
+    /// What is above `node`, worked out from the nearest node above it that
+    /// is known, and kept for every node on the way.
+    fn above_of(&mut self, node: &SyntaxNode) -> Above {
+        above_in(&mut self.above, node)
+    }
+
+    /// The scopes `node` sits in, as the binder reads them off its
+    /// ancestors: worked out once for the declaration they are the scopes
+    /// of, not once for each of what is inside it.
+    fn context_at(&mut self, node: &SyntaxNode) -> Arc<rustlyn_semantics::Context> {
+        context_in(
+            &mut self.above,
+            &mut self.contexts,
+            self.model.binder(),
+            self.tree,
+            &self.root,
+            node,
+        )
+    }
+
     /// The bound body `node` is in, bound once per view.
     fn body_for(&mut self, node: &SyntaxNode) -> Option<Arc<BoundBody>> {
-        let owner = SemanticModel::body_owner(node)?;
+        let owner = self.above_of(node).owner?;
+        self.body_of(owner)
+    }
+
+    /// The bound body of `owner`, one of what [`SemanticModel::body_owner`]
+    /// returns, bound once per view.
+    fn body_of(&mut self, owner: SyntaxNode) -> Option<Arc<BoundBody>> {
         if owner.kind() == SyntaxKind::CompilationUnit
             && !owner
                 .children()
@@ -930,7 +1176,8 @@ impl<'a> View<'a> {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if kept.len() >= KEPT_BODIES {
-                    kept.clear();
+                    let dropped = std::mem::take(&mut *kept);
+                    rustlyn_semantics::parallel::deep(move || drop(dropped));
                 }
                 kept.insert(key, body.clone());
                 body
@@ -962,31 +1209,12 @@ impl<'a> View<'a> {
 
         // A name in an attribute's arguments is bound with the attribute,
         // not with the body of what it is on.
-        let attribute = parent
-            .ancestors()
-            .take_while(|node| !rustlyn_semantics::is_body_owner(node.kind()))
-            .find(|node| node.kind() == SyntaxKind::Attribute);
+        let above = self.above_of(&parent);
+        let attribute = above.attribute;
         // So is a parameter's default value, with the parameter, an enum
         // member's value and the size of a fixed buffer.
-        let default = parent
-            .ancestors()
-            .take_while(|node| !rustlyn_semantics::is_body_owner(node.kind()))
-            .find(|node| {
-                (node.kind() == SyntaxKind::EqualsValueClause
-                    && node.parent().is_some_and(|parent| {
-                        matches!(
-                            parent.kind(),
-                            SyntaxKind::Parameter | SyntaxKind::EnumMemberDeclaration
-                        )
-                    }))
-                    || (node.kind() == SyntaxKind::Argument
-                        && node.parent().is_some_and(|list| {
-                            list.kind() == SyntaxKind::BracketedArgumentList
-                                && list.parent().is_some_and(|parent| {
-                                    parent.kind() == SyntaxKind::VariableDeclarator
-                                })
-                        }))
-            })
+        let default = above
+            .default
             .and_then(|clause| clause.children().find(|child| child.kind().is_expression()));
         let body = match (attribute, default) {
             (Some(attribute), _) => Some(match self.bodies.get(&attribute.span()) {
@@ -1005,7 +1233,7 @@ impl<'a> View<'a> {
                     body
                 }
             }),
-            (None, None) => self.body_for(&parent),
+            (None, None) => above.owner.and_then(|owner| self.body_of(owner)),
         };
         if let Some(body) = body {
             match body.symbol_at(token.span()) {
@@ -1053,7 +1281,14 @@ impl<'a> View<'a> {
 
         // Everything the bodies do not cover: types in signatures, base
         // lists, `using` directives, attributes.
-        self.model.symbol_at(&parent).map(Resolved::Symbol)
+        let (above, contexts, tree, root) =
+            (&mut self.above, &mut self.contexts, self.tree, &self.root);
+        let binder = self.model.binder();
+        self.model
+            .symbol_at_with(&parent, &mut |at| {
+                context_in(above, contexts, binder, tree, root, at)
+            })
+            .map(Resolved::Symbol)
     }
 
     /// The label a `goto` names, or a label itself, as the place it is
@@ -1270,16 +1505,11 @@ impl<'a> View<'a> {
 
         // The name of a namespace, in `using` or `namespace`: looked up from
         // the global namespace, as far as the cursor.
-        if let Some(directive) = parent.ancestors().find(|ancestor| {
-            matches!(
-                ancestor.kind(),
-                SyntaxKind::UsingDirective
-                    | SyntaxKind::NamespaceDeclaration
-                    | SyntaxKind::FileScopedNamespaceDeclaration
-            )
-        }) && let Some(name) = directive
-            .children()
-            .find(|child| child.kind().is_type_node())
+        let above = self.above_of(parent);
+        if let Some(directive) = above.directive
+            && let Some(name) = directive
+                .children()
+                .find(|child| child.kind().is_type_node())
             && name.span().contains_span(token.span())
         {
             let symbols = self.compilation().symbols();
@@ -1307,10 +1537,7 @@ impl<'a> View<'a> {
 
         // `[Serializable]` is `SerializableAttribute`, and `[X(Name = 1)]`
         // names a property of it.
-        if let Some(attribute) = parent
-            .ancestors()
-            .find(|ancestor| ancestor.kind() == SyntaxKind::Attribute)
-        {
+        if let Some(attribute) = above.enclosing_attribute {
             let ty = self.attribute_type(&attribute);
             if let Some(name) = attribute.children().next()
                 && name.span().contains_span(token.span())
@@ -2830,6 +3057,103 @@ pub use naming::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What is kept of the nodes above one is what climbing from it says,
+    /// for every node of a file that has each kind of declaration a climb
+    /// stops at, and each kind of body.
+    #[test]
+    fn what_is_kept_of_the_nodes_above_is_what_climbing_says() {
+        let text = "using System;\n\
+                    namespace A.B {\n\
+                      [AttributeUsage(AttributeTargets.All)] class Mark : Attribute { }\n\
+                      enum E { One = 1, Two = One + 1 }\n\
+                      public unsafe struct S { public fixed int buf[4 + 1]; int a = 1, b = 2; event Action Done, Gone; }\n\
+                      class C<T> where T : class {\n\
+                        int field = 3, other = 4;\n\
+                        [Mark] int Prop { get { return field; } set { field = value; } }\n\
+                        C([Mark] int p = 5) : this(p, 1) { }\n\
+                        C(int p, int q) { }\n\
+                        int M(int x = 7) {\n\
+                          Func<int, int> f = y => { int z = y + x; return z; };\n\
+                          int Local(int w) => w + 1;\n\
+                          return f(Local(x)) + System.Math.Abs(x);\n\
+                        }\n\
+                      }\n\
+                    }\n\
+                    namespace D { class Other { void N() { } } }\n\
+                    Console.WriteLine(1);\n";
+        let semantic = compile(&[("C.cs", text)], false).expect("compiled");
+        let mut view = semantic
+            .view(semantic.tree_index(Path::new("/p/C.cs")).expect("a tree"))
+            .expect("a view");
+        let brief = |node: Option<SyntaxNode>| node.map(|node| (node.kind(), node.span()));
+        let mut checked = 0;
+        for node in view.root.clone().descendants() {
+            let above = view.above_of(&node);
+            let stops = |ancestor: &SyntaxNode| rustlyn_semantics::is_body_owner(ancestor.kind());
+            assert_eq!(
+                brief(above.owner),
+                brief(SemanticModel::body_owner(&node)),
+                "owner of {:?} at {:?}",
+                node.kind(),
+                node.span()
+            );
+            assert_eq!(
+                brief(above.attribute),
+                brief(
+                    node.ancestors()
+                        .take_while(|ancestor| !stops(ancestor))
+                        .find(|ancestor| ancestor.kind() == SyntaxKind::Attribute)
+                ),
+                "attribute of {:?} at {:?}",
+                node.kind(),
+                node.span()
+            );
+            assert_eq!(
+                brief(above.default),
+                brief(
+                    node.ancestors()
+                        .take_while(|ancestor| !stops(ancestor))
+                        .find(is_default_value)
+                ),
+                "default value of {:?} at {:?}",
+                node.kind(),
+                node.span()
+            );
+            assert_eq!(
+                brief(above.namespace),
+                brief(
+                    node.ancestors()
+                        .find(|ancestor| ancestor.kind() == SyntaxKind::NamespaceDeclaration)
+                )
+            );
+            assert_eq!(
+                brief(above.directive),
+                brief(node.ancestors().find(|ancestor| matches!(
+                    ancestor.kind(),
+                    SyntaxKind::UsingDirective
+                        | SyntaxKind::NamespaceDeclaration
+                        | SyntaxKind::FileScopedNamespaceDeclaration
+                )))
+            );
+            assert_eq!(
+                brief(above.enclosing_attribute),
+                brief(
+                    node.ancestors()
+                        .find(|ancestor| ancestor.kind() == SyntaxKind::Attribute)
+                )
+            );
+            assert_eq!(
+                format!("{:?}", view.context_at(&node)),
+                format!("{:?}", view.model.binder().context_at(view.tree, &node)),
+                "scopes of {:?} at {:?}",
+                node.kind(),
+                node.span()
+            );
+            checked += 1;
+        }
+        assert!(checked > 150, "{checked}");
+    }
 
     /// After `ConditionType.` where `ConditionType` is a property of the type
     /// of that name, the type's own members are offered — the enum's

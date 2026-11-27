@@ -104,6 +104,16 @@ impl Semantic {
         path: &Path,
         text: Option<&str>,
     ) -> Option<Vec<AnalyzerDiagnostic>> {
+        // The analyzers walk the tree and the bound bodies, as deep as they
+        // go: on a stack made for it, where the caller's may not be.
+        rustlyn_semantics::parallel::deep(|| self.analyzer_diagnostics_here(path, text))
+    }
+
+    fn analyzer_diagnostics_here(
+        &self,
+        path: &Path,
+        text: Option<&str>,
+    ) -> Option<Vec<AnalyzerDiagnostic>> {
         let tree = self.tree_index(path)?;
         let mut view = self.view_of(path, text)?;
         let mut found = view.analyze();
@@ -330,6 +340,13 @@ fn is_var_keyword(token: &SyntaxToken) -> bool {
                     | SyntaxKind::DeclarationPattern
             )
         })
+}
+
+/// Whether `callee`, what a call calls, is written `nameof`. The length is
+/// asked first: a callee can be a chain of thousands of calls, and its text
+/// is not worth building to find that it is not six letters long.
+fn is_nameof(callee: &SyntaxNode) -> bool {
+    callee.span().length() == 6 && callee.text() == "nameof"
 }
 
 /// Whether the syntax of `node` has something missing or skipped in it.
@@ -588,6 +605,93 @@ pub(super) mod tests {
         let text = "class C { public void M() { int x = Missing(); } }\n";
         assert!(found_with(text, "IDE0059").is_empty());
         assert!(found_with(text, "CS0219").is_empty());
+    }
+
+    /// The text of a class whose one method returns `chain`.
+    fn returning(chain: &str) -> String {
+        format!("class C {{ C M(C a) {{ return {chain}; }} }}\n")
+    }
+
+    /// How long the analyzers and the classifier take over `text`.
+    fn analyzed_in(text: &str) -> std::time::Duration {
+        let semantic = compile(&[("C.cs", text)], false).expect("compiled");
+        let path = Path::new("/p/C.cs");
+        let started = std::time::Instant::now();
+        semantic.analyzer_diagnostics(path, None).expect("analyzed");
+        semantic
+            .semantic_tokens(path, TextSpan::new(0, text.len() as u32), None)
+            .expect("classified");
+        started.elapsed()
+    }
+
+    #[test]
+    fn a_long_chain_costs_what_its_length_does() {
+        // What the analyzers ask of a node about the nodes above it is the
+        // depth of the tree, and a chain of calls, a sum or a ladder of
+        // `else if` is as deep as it is long: asked of each of them, the
+        // diagnostics of a thousand calls took a minute and a half, though
+        // the compiler read the same text in less than a second.
+        let calls = analyzed_in(&returning(&format!("a{}", ".M(a)".repeat(2000))));
+        assert!(
+            calls < std::time::Duration::from_secs(120),
+            "{calls:?} for two thousand calls"
+        );
+        // Four times the length takes about four times as long, not sixteen:
+        // a margin for the machine being busy, which two timings share.
+        let sum = |terms: usize| {
+            format!(
+                "class C {{ int M(int a) => {}; }}\n",
+                vec!["a"; terms].join(" + ")
+            )
+        };
+        let short = analyzed_in(&sum(2000));
+        let long = analyzed_in(&sum(8000));
+        assert!(
+            long < short * 10 + std::time::Duration::from_secs(2),
+            "{short:?} for two thousand terms, {long:?} for eight thousand"
+        );
+        let ladder = |rungs: usize| {
+            format!(
+                "class C {{ int M(int a) {{ int x = 0; if (a == 0) x = 0;\n{}else x = -1; return x; }} }}\n",
+                (1..rungs)
+                    .map(|i| format!("else if (a == {i}) x = {i};\n"))
+                    .collect::<String>()
+            )
+        };
+        let short = analyzed_in(&ladder(1000));
+        let long = analyzed_in(&ladder(4000));
+        assert!(
+            long < short * 10 + std::time::Duration::from_secs(2),
+            "{short:?} for a thousand rungs, {long:?} for four thousand"
+        );
+    }
+
+    #[test]
+    fn a_deep_tree_needs_no_deep_stack_of_the_caller() {
+        // The analyzers and the classifier walk the tree as deep as it is,
+        // which the parser lets be twelve thousand levels, and an
+        // unoptimized build takes kilobytes of stack for each. They are
+        // asked from the editor's own thread, which has a megabyte or two.
+        let text = format!(
+            "class C {{ int M(int a) => {}0; }}\n",
+            (0..9000)
+                .map(|i| format!("a == {i} ? {i} : "))
+                .collect::<String>()
+        );
+        let semantic = compile(&[("C.cs", &text)], false).expect("compiled");
+        let length = text.len() as u32;
+        let small = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let path = Path::new("/p/C.cs");
+                let found = semantic.analyzer_diagnostics(path, None);
+                let tokens = semantic.semantic_tokens(path, TextSpan::new(0, length), None);
+                (found.is_some(), tokens.map(|tokens| tokens.len()))
+            })
+            .expect("a thread");
+        let (analyzed, tokens) = small.join().expect("no overflow");
+        assert!(analyzed);
+        assert!(tokens.is_some_and(|count| count > 9000));
     }
 
     #[test]

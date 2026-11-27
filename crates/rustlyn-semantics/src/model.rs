@@ -6,7 +6,7 @@
 
 use rustlyn_syntax::{SyntaxKind, SyntaxNode};
 
-use crate::binder::{Binder, Diagnostics};
+use crate::binder::{Binder, Context, Diagnostics};
 use crate::body::BodyBinder;
 use crate::bound::{BoundBody, BoundSymbol};
 use crate::compilation::Compilation;
@@ -74,8 +74,20 @@ impl<'a> SemanticModel<'a> {
     /// may also be a local, a parameter or a member of the enclosing type.
     #[must_use]
     pub fn symbol_at(&self, node: &SyntaxNode) -> Option<SymbolId> {
-        let context = self.binder.context_at(self.tree, node);
+        self.symbol_at_with(node, &mut |at| {
+            std::sync::Arc::new(self.binder.context_at(self.tree, at))
+        })
+    }
 
+    /// [`SemanticModel::symbol_at`], with the scopes of a node as `context_of`
+    /// has them: a caller that asks about many nodes keeps them, which are
+    /// otherwise read off every ancestor of the node each time.
+    #[must_use]
+    pub fn symbol_at_with(
+        &self,
+        node: &SyntaxNode,
+        context_of: &mut dyn FnMut(&SyntaxNode) -> std::sync::Arc<Context>,
+    ) -> Option<SymbolId> {
         // `a.b` — resolve the left side first, then look `b` up inside it.
         if let Some(parent) = node.parent()
             && matches!(
@@ -85,7 +97,7 @@ impl<'a> SemanticModel<'a> {
             && parent.children().next().as_ref() != Some(node)
         {
             let left = parent.children().next()?;
-            let container = self.symbol_at(&left)?;
+            let container = self.symbol_at_with(&left, context_of)?;
             let name = identifier_text(node)?;
             // `System.EventHandler<T>` is the generic one, not the
             // `EventHandler` beside it: as many type parameters as written.
@@ -117,6 +129,7 @@ impl<'a> SemanticModel<'a> {
                 });
         }
 
+        let context = context_of(node);
         if let Some(symbol) = self.binder.resolve_namespace_or_type(node, &context) {
             return Some(symbol);
         }

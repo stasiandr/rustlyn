@@ -14,7 +14,7 @@ use rustlyn_ide::structure::{FoldKind, StructureOptions};
 
 use super::{
     RlnEdits, RlnSession, RlnStatus, RlnString, RlnText, Strings, borrow, guard, held, leak,
-    optional_text, reclaim, write_edits,
+    optional_text, reclaim, shallow, write_edits,
 };
 
 /// One foldable block. `banner` is a slice of the result's `strings`.
@@ -270,7 +270,7 @@ pub unsafe extern "C" fn rln_block_structure(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_folding_ranges_free(ranges: RlnFoldingRanges) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(ranges.items, ranges.count);
         reclaim(ranges.strings, ranges.strings_length);
     });
@@ -423,7 +423,7 @@ pub unsafe extern "C" fn rln_insert_doc_comment(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_snippet_free(snippet: RlnSnippet) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(snippet.edits.items, snippet.edits.count);
         reclaim(snippet.edits.renames, snippet.edits.rename_count);
         reclaim(snippet.edits.strings, snippet.edits.strings_length);

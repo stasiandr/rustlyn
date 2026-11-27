@@ -26,34 +26,60 @@ pub(in crate::semantic) fn keyword_for(view: &View<'_>, symbol: SymbolId) -> Opt
         .map(SpecialType::keyword)
 }
 
-/// Whether `node` is inside something that names a namespace or is a
-/// directive, where a name is written in full on purpose.
-fn in_directive(node: &SyntaxNode) -> bool {
-    node.ancestors().any(|ancestor| {
-        matches!(
-            ancestor.kind(),
-            SyntaxKind::UsingDirective
-                | SyntaxKind::ExternAliasDirective
-                | SyntaxKind::NamespaceDeclaration
-                | SyntaxKind::FileScopedNamespaceDeclaration
-        ) && ancestor
-            .children()
-            .find(|child| child.kind().is_type_node())
-            .is_some_and(|name| name.span().contains_span(node.span()))
-            || ancestor.kind() == SyntaxKind::UsingDirective
-    })
+/// What the nodes above one say of it, passed down from each node to its
+/// children: asking each node of its ancestors costs the depth of the tree,
+/// and a chain of ten thousand calls is that deep.
+#[derive(Clone, Default)]
+struct Written {
+    /// Inside a `using` directive, where a name is written in full on
+    /// purpose.
+    in_using: bool,
+    /// Inside the name a namespace declaration is given, which is written
+    /// in full as well.
+    names: std::rc::Rc<Vec<TextSpan>>,
+    /// Inside the argument of a `nameof`, which names what is written
+    /// rather than what it binds to.
+    in_nameof: bool,
 }
 
-/// Whether `node` is the argument of a `nameof`, which names what is
-/// written rather than what it binds to.
-fn in_nameof(node: &SyntaxNode) -> bool {
-    node.ancestors()
-        .filter(|ancestor| ancestor.kind() == SyntaxKind::InvocationExpression)
-        .any(|call| {
-            call.children()
-                .next()
-                .is_some_and(|callee| callee.text().trim() == "nameof")
-        })
+impl Written {
+    /// Whether `node`, below what this says, is written as it is on
+    /// purpose.
+    fn covers(&self, node: &SyntaxNode) -> bool {
+        self.in_using
+            || self.in_nameof
+            || self
+                .names
+                .iter()
+                .any(|name| name.contains_span(node.span()))
+    }
+
+    /// What this says of the children of `node`.
+    fn below(&self, node: &SyntaxNode) -> Self {
+        let mut below = self.clone();
+        match node.kind() {
+            SyntaxKind::UsingDirective => below.in_using = true,
+            SyntaxKind::ExternAliasDirective
+            | SyntaxKind::NamespaceDeclaration
+            | SyntaxKind::FileScopedNamespaceDeclaration => {
+                if let Some(name) = node.children().find(|child| child.kind().is_type_node()) {
+                    let mut names = (*self.names).clone();
+                    names.push(name.span());
+                    below.names = std::rc::Rc::new(names);
+                }
+            }
+            SyntaxKind::InvocationExpression
+                if node
+                    .children()
+                    .next()
+                    .is_some_and(|callee| super::is_nameof(&callee)) =>
+            {
+                below.in_nameof = true;
+            }
+            _ => {}
+        }
+        below
+    }
 }
 
 /// How many type arguments a simple name has: `List<int>` one.
@@ -71,22 +97,24 @@ fn arity(name: &SyntaxNode) -> usize {
 /// IDE0001, IDE0002 and IDE0049: names written longer than they need to
 /// be.
 pub(super) fn simplify_names(view: &mut View<'_>, _: &Facts, found: &mut Vec<AnalyzerDiagnostic>) {
-    let nodes: Vec<SyntaxNode> = view
-        .root
-        .descendants()
-        .filter(|node| {
-            matches!(
-                node.kind(),
-                SyntaxKind::QualifiedName
-                    | SyntaxKind::SimpleMemberAccessExpression
-                    | SyntaxKind::IdentifierName
-            )
-        })
-        .collect();
-    for node in nodes {
-        if in_directive(&node) || in_nameof(&node) {
-            continue;
+    let mut nodes: Vec<SyntaxNode> = Vec::new();
+    let mut pending = vec![(view.root.clone(), Written::default())];
+    while let Some((node, above)) = pending.pop() {
+        if matches!(
+            node.kind(),
+            SyntaxKind::QualifiedName
+                | SyntaxKind::SimpleMemberAccessExpression
+                | SyntaxKind::IdentifierName
+        ) && !above.covers(&node)
+        {
+            nodes.push(node.clone());
         }
+        let below = above.below(&node);
+        let start = pending.len();
+        pending.extend(node.children().map(|child| (child, below.clone())));
+        pending[start..].reverse();
+    }
+    for node in nodes {
         match node.kind() {
             SyntaxKind::QualifiedName => qualified_name(view, &node, found),
             SyntaxKind::SimpleMemberAccessExpression => member_access(view, &node, found),
@@ -127,7 +155,7 @@ fn qualified_name(view: &mut View<'_>, node: &SyntaxNode, found: &mut Vec<Analyz
         ));
         return;
     }
-    let context = view.model.binder().context_at(view.tree, node);
+    let context = view.context_at(node);
     let shorter = view
         .model
         .binder()
@@ -181,7 +209,7 @@ fn member_access(view: &mut View<'_>, node: &SyntaxNode, found: &mut Vec<Analyze
                 ));
                 return;
             }
-            let context = view.model.binder().context_at(view.tree, node);
+            let context = view.context_at(node);
             let shorter = view
                 .model
                 .binder()
@@ -203,7 +231,7 @@ fn member_access(view: &mut View<'_>, node: &SyntaxNode, found: &mut Vec<Analyze
             SymbolKind::NamedType,
             SymbolKind::Field | SymbolKind::Property | SymbolKind::Method | SymbolKind::Event,
         ) => {
-            let context = view.model.binder().context_at(view.tree, node);
+            let context = view.context_at(node);
             if context.enclosing_type() != Some(qualifier)
                 || symbols.get(symbol).container != Some(qualifier)
                 || left.kind() != SyntaxKind::IdentifierName
@@ -273,7 +301,7 @@ fn is_hidden_by_variable(view: &mut View<'_>, node: &SyntaxNode, name: &str) -> 
     {
         return true;
     }
-    let context = view.model.binder().context_at(view.tree, node);
+    let context = view.context_at(node);
     let symbols = view.compilation().symbols();
     context.enclosing_member().is_some_and(|member| {
         symbols.get(member).members.iter().any(|&child| {
@@ -317,7 +345,7 @@ pub(super) fn this_qualification(
         {
             continue;
         }
-        let context = view.model.binder().context_at(view.tree, &access);
+        let context = view.context_at(&access);
         let Some(ty) = context.enclosing_type() else {
             continue;
         };

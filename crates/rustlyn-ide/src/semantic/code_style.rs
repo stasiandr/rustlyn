@@ -40,8 +40,10 @@ impl Semantic {
         text: Option<&str>,
         settings: &Settings,
     ) -> Option<Vec<AnalyzerDiagnostic>> {
-        let mut view = self.view_of(path, text)?;
-        Some(view.analyze_configured(settings))
+        rustlyn_semantics::parallel::deep(|| {
+            let mut view = self.view_of(path, text)?;
+            Some(view.analyze_configured(settings))
+        })
     }
 }
 

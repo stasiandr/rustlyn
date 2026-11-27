@@ -676,7 +676,7 @@ fn is_called(token: &SyntaxToken) -> bool {
                     .ancestors()
                     .find(|ancestor| ancestor.kind() == SyntaxKind::InvocationExpression)
                     .and_then(|call| call.children().next())
-                    .is_some_and(|callee| callee.text().trim() == "nameof");
+                    .is_some_and(|callee| super::is_nameof(&callee));
             }
             _ => return false,
         }

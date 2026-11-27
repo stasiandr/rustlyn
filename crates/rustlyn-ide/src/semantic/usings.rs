@@ -21,7 +21,7 @@
 use std::collections::HashSet;
 
 use rustlyn_semantics::{MethodKind, SymbolId, SymbolKind};
-use rustlyn_syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
+use rustlyn_syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
 use rustlyn_text::TextSpan;
 
 use super::{Resolved, View};
@@ -95,16 +95,7 @@ pub(crate) fn unnecessary_usings(view: &mut View<'_>) -> Vec<TextSpan> {
         return Vec::new();
     }
 
-    let tokens: Vec<SyntaxToken> = root
-        .descendant_tokens()
-        .filter(|token| token.kind() == SyntaxKind::IdentifierToken)
-        .filter(|token| {
-            !token
-                .parent()
-                .ancestors()
-                .any(|ancestor| ancestor.kind() == SyntaxKind::UsingDirective)
-        })
-        .collect();
+    let tokens = names_outside_usings(&root);
     for token in &tokens {
         credit(view, token, &mut directives);
     }
@@ -118,6 +109,36 @@ pub(crate) fn unnecessary_usings(view: &mut View<'_>) -> Vec<TextSpan> {
         .collect();
     unnecessary.sort_by_key(|span| span.start());
     unnecessary
+}
+
+/// The identifiers of the file that are not in a `using` directive, in
+/// order. Whether one is is passed down from the nodes above it: asked of
+/// each identifier, it is the depth of the tree.
+fn names_outside_usings(root: &SyntaxNode) -> Vec<SyntaxToken> {
+    let mut found = Vec::new();
+    // Each element with whether a `using` is above its parent.
+    let mut pending = vec![(SyntaxElement::Node(root.clone()), false)];
+    while let Some((element, in_using)) = pending.pop() {
+        match element {
+            SyntaxElement::Token(token) => {
+                if token.kind() == SyntaxKind::IdentifierToken && !in_using {
+                    found.push(token);
+                }
+            }
+            SyntaxElement::Node(node) => {
+                let below = in_using || node.kind() == SyntaxKind::UsingDirective;
+                let start = pending.len();
+                // A token is in a directive when one is above its parent: the
+                // parent being the directive itself does not count.
+                pending.extend(node.children_with_tokens().map(|child| match child {
+                    SyntaxElement::Token(_) => (child, in_using),
+                    SyntaxElement::Node(_) => (child, below),
+                }));
+                pending[start..].reverse();
+            }
+        }
+    }
+    found
 }
 
 /// What `using` brings in, when the binder can say.
@@ -174,14 +195,16 @@ fn is_qualified(token: &SyntaxToken) -> bool {
 
 /// The namespaces the code at `node` is declared in, outward: what it sees
 /// without any directive.
-fn enclosing_namespaces(view: &View<'_>, node: &SyntaxNode) -> HashSet<SymbolId> {
+fn enclosing_namespaces(view: &mut View<'_>, node: &SyntaxNode) -> HashSet<SymbolId> {
     let symbols = view.compilation().symbols();
     let global = view.compilation().global_namespace();
     let mut found = HashSet::from([global]);
-    let mut declarations: Vec<SyntaxNode> = node
-        .ancestors()
-        .filter(|ancestor| ancestor.kind() == SyntaxKind::NamespaceDeclaration)
-        .collect();
+    let mut declarations: Vec<SyntaxNode> = Vec::new();
+    let mut next = view.above_of(node).namespace;
+    while let Some(declaration) = next {
+        next = view.above_of(&declaration).namespace;
+        declarations.push(declaration);
+    }
     declarations.extend(
         view.root
             .children()

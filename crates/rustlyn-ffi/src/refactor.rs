@@ -14,7 +14,7 @@ use rustlyn_ide::session::RefactorResult;
 
 use super::{
     RlnEdits, RlnSession, RlnStatus, RlnText, Strings, borrow, guard, held, leak, optional_text,
-    pack_changes, reclaim, rln_edits_free,
+    pack_changes, reclaim, rln_edits_free, shallow,
 };
 
 /// One parameter of a changed signature: `existing` is the index of a
@@ -258,7 +258,7 @@ pub unsafe extern "C" fn rln_signature_info(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_signature_info_free(info: RlnSignatureInfo) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(info.parameters, info.parameter_count);
         reclaim(info.strings, info.strings_length);
     });
@@ -328,7 +328,7 @@ pub unsafe extern "C" fn rln_dialog_members(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_dialog_members_free(members: RlnDialogMembers) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(members.members, members.member_count);
         reclaim(members.strings, members.strings_length);
     });
@@ -545,7 +545,7 @@ pub unsafe extern "C" fn rln_move_static_members(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_refactor_result_free(result: RlnRefactorResult) {
-    guard((), || unsafe { rln_edits_free(result.edits) });
+    shallow((), || unsafe { rln_edits_free(result.edits) });
 }
 
 /// The layout the header promises for the refactoring dialogs.

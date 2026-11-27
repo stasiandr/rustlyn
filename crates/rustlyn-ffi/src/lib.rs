@@ -459,7 +459,37 @@ pub struct RlnCodeActions {
 // MARK: - the boundary itself
 
 /// Runs `body`, turning a panic into a status instead of letting it cross.
+///
+/// What a request reads is a syntax tree or a bound one, and walking either
+/// recurses as deep as the tree is, which the parser lets be twelve thousand
+/// levels: more than the eight megabytes of a main thread hold, in an
+/// unoptimized build, and more than the editor's own thread may have. The
+/// work is done on a stack that size, which costs a thread for the request
+/// and nothing where the caller is on one already.
 fn guard<T>(fallback: T, body: impl FnOnce() -> T) -> T {
+    /// Moved to the thread that does the work. The pointers a request holds
+    /// belong to the caller, who is waiting for the answer, and nothing else
+    /// has them until it is given.
+    struct Handoff<T>(T);
+    // SAFETY: the caller is blocked until the work is done, as `deep` waits
+    // for it, so nothing is used from two threads at once.
+    unsafe impl<T> Send for Handoff<T> {}
+    impl<T> Handoff<T> {
+        fn into_inner(self) -> T {
+            self.0
+        }
+    }
+    let work = Handoff((fallback, body));
+    rustlyn_ide::deep(move || {
+        let (fallback, body) = work.into_inner();
+        Handoff(shallow(fallback, body))
+    })
+    .into_inner()
+}
+
+/// [`guard`] for what reads no tree: a pointer handed back, a count, a
+/// session made or dropped. A thread for each would be most of the cost.
+fn shallow<T>(fallback: T, body: impl FnOnce() -> T) -> T {
     catch_unwind(AssertUnwindSafe(body)).unwrap_or(fallback)
 }
 
@@ -546,7 +576,7 @@ pub unsafe extern "C" fn rln_session_new(
     symbols: *const *const c_char,
     symbol_count: usize,
 ) -> *mut RlnSession {
-    guard(std::ptr::null_mut(), || {
+    shallow(std::ptr::null_mut(), || {
         let Some(root) = (unsafe { borrow(root) }) else {
             return std::ptr::null_mut();
         };
@@ -575,7 +605,7 @@ pub unsafe extern "C" fn rln_session_share_assembly_cache(
     session: *mut RlnSession,
     directory: *const c_char,
 ) -> RlnStatus {
-    guard(RlnStatus::Panicked, || {
+    shallow(RlnStatus::Panicked, || {
         let (Some(session), Some(directory)) =
             (unsafe { held(session) }, unsafe { borrow(directory) })
         else {
@@ -598,6 +628,8 @@ pub unsafe extern "C" fn rln_session_free(session: *mut RlnSession) {
     if session.is_null() {
         return;
     }
+    // What the session kept of bound bodies is dropped level by level, as
+    // deep as the bodies were: on the stack made for them.
     guard((), || drop(unsafe { Box::from_raw(session) }));
 }
 
@@ -606,7 +638,7 @@ pub unsafe extern "C" fn rln_session_free(session: *mut RlnSession) {
 /// Freed with `rln_text_free`. Empty when nothing has failed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_last_error(session: *mut RlnSession) -> RlnString {
-    guard(
+    shallow(
         RlnString {
             bytes: std::ptr::null(),
             length: 0,
@@ -631,12 +663,12 @@ pub unsafe extern "C" fn rln_last_error(session: *mut RlnSession) -> RlnString {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_text_free(text: RlnString) {
-    guard((), || unsafe { reclaim(text.bytes, text.length) });
+    shallow((), || unsafe { reclaim(text.bytes, text.length) });
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_statistics(session: *mut RlnSession) -> RlnStatistics {
-    guard(RlnStatistics::default(), || {
+    shallow(RlnStatistics::default(), || {
         let Some(session) = (unsafe { held(session) }) else {
             return RlnStatistics::default();
         };
@@ -712,7 +744,7 @@ pub unsafe extern "C" fn rln_set_text(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_close(session: *mut RlnSession, path: *const c_char) {
-    guard((), || {
+    shallow((), || {
         if let (Some(session), Some(path)) = (unsafe { held(session) }, unsafe { borrow(path) }) {
             session.session.close(path);
         }
@@ -762,7 +794,7 @@ pub unsafe extern "C" fn rln_classify(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_runs_free(runs: RlnRuns) {
-    guard((), || unsafe { reclaim(runs.items, runs.count) });
+    shallow((), || unsafe { reclaim(runs.items, runs.count) });
 }
 
 /// Walks the whole of an open file so that a jump to any line is as cheap as
@@ -876,7 +908,7 @@ pub unsafe extern "C" fn rln_outline(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_outline_free(outline: RlnOutline) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(outline.declarations, outline.count);
         reclaim(outline.strings, outline.strings_length);
     });
@@ -1019,7 +1051,7 @@ fn pack_locations(locations: &[Location], strings: &mut Strings) -> Vec<RlnLocat
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_locations_free(locations: RlnLocations) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(locations.items, locations.count);
         reclaim(locations.strings, locations.strings_length);
     });
@@ -1287,7 +1319,7 @@ pub unsafe extern "C" fn rln_completions(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_completions_free(completions: RlnCompletions) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(completions.items, completions.count);
         reclaim(completions.strings, completions.strings_length);
     });
@@ -1381,7 +1413,7 @@ pub unsafe extern "C" fn rln_diagnostics(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_diagnostics_free(diagnostics: RlnDiagnostics) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(diagnostics.items, diagnostics.count);
         reclaim(diagnostics.strings, diagnostics.strings_length);
     });
@@ -1454,7 +1486,7 @@ pub unsafe extern "C" fn rln_signatures(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_signatures_free(signatures: RlnSignatures) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(signatures.items, signatures.count);
         reclaim(signatures.parameters, signatures.parameter_count);
         reclaim(signatures.strings, signatures.strings_length);
@@ -1521,7 +1553,7 @@ pub unsafe extern "C" fn rln_documentation(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_documentation_free(documentation: RlnDocumentation) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(documentation.parameters, documentation.parameter_count);
         reclaim(documentation.strings, documentation.strings_length);
     });
@@ -1567,7 +1599,7 @@ pub unsafe extern "C" fn rln_selection_ranges(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_ranges_free(ranges: RlnRanges) {
-    guard((), || unsafe { reclaim(ranges.items, ranges.count) });
+    shallow((), || unsafe { reclaim(ranges.items, ranges.count) });
 }
 
 /// The number of completion kinds, for checking a caller's table.
@@ -1632,7 +1664,7 @@ unsafe fn write_edits(out: *mut RlnEdits, changes: &rustlyn_ide::session::Change
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_edits_free(edits: RlnEdits) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(edits.items, edits.count);
         reclaim(edits.renames, edits.rename_count);
         reclaim(edits.strings, edits.strings_length);
@@ -1724,7 +1756,7 @@ pub unsafe extern "C" fn rln_code_actions(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_code_actions_free(actions: RlnCodeActions) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(actions.items, actions.count);
         reclaim(actions.edits, actions.edit_count);
         reclaim(actions.renames, actions.rename_count);
@@ -1869,7 +1901,7 @@ pub unsafe extern "C" fn rln_semantic_tokens(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_semantic_runs_free(runs: RlnSemanticRuns) {
-    guard((), || unsafe { reclaim(runs.items, runs.count) });
+    shallow((), || unsafe { reclaim(runs.items, runs.count) });
 }
 
 /// What to highlight for the cursor at `offset`: the occurrences of the
@@ -1915,7 +1947,7 @@ pub unsafe extern "C" fn rln_highlights(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_highlights_free(highlights: RlnHighlights) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(highlights.items, highlights.count)
     });
 }
@@ -1978,7 +2010,7 @@ pub unsafe extern "C" fn rln_references_detailed(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_references_free(references: RlnReferences) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(references.items, references.count);
         reclaim(references.strings, references.strings_length);
     });
@@ -2028,7 +2060,7 @@ pub unsafe extern "C" fn rln_code_lens(
 /// this call is not affected. Any thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_cancel_code_lens(session: *mut RlnSession) {
-    guard((), || {
+    shallow((), || {
         if let Some(session) = unsafe { held(session) } {
             session.session.cancel_code_lens();
         }
@@ -2077,7 +2109,7 @@ pub unsafe extern "C" fn rln_code_lens_places(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_lenses_free(lenses: RlnLenses) {
-    guard((), || unsafe { reclaim(lenses.items, lenses.count) });
+    shallow((), || unsafe { reclaim(lenses.items, lenses.count) });
 }
 
 /// The number of semantic classes, for checking a caller's table.
@@ -2190,7 +2222,7 @@ pub unsafe extern "C" fn rln_prepare_rename(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_rename_info_free(info: RlnRenameInfo) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(info.strings, info.strings_length);
     });
 }
@@ -2270,7 +2302,7 @@ pub unsafe extern "C" fn rln_rename(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_rename_result_free(result: RlnRenameResult) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(result.conflicts, result.conflict_count);
         rln_edits_free(result.edits);
     });
@@ -2765,7 +2797,7 @@ pub unsafe extern "C" fn rln_subtypes(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_hierarchy_items_free(items: RlnHierarchyItems) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(items.items, items.count);
         reclaim(items.strings, items.strings_length);
     });
@@ -2773,7 +2805,7 @@ pub unsafe extern "C" fn rln_hierarchy_items_free(items: RlnHierarchyItems) {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_calls_free(calls: RlnCalls) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(calls.items, calls.count);
         reclaim(calls.ranges, calls.range_count);
         reclaim(calls.strings, calls.strings_length);
@@ -2857,7 +2889,7 @@ pub unsafe extern "C" fn rln_search(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_search_results_free(results: RlnSearchResults) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(results.items, results.count);
         reclaim(results.ranges, results.range_count);
         reclaim(results.strings, results.strings_length);
@@ -3001,7 +3033,7 @@ pub unsafe extern "C" fn rln_completions_ex(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_completion_items_free(list: RlnCompletionItems) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(list.items, list.count);
         reclaim(list.edits, list.edit_count);
         reclaim(list.strings, list.strings_length);
@@ -3310,7 +3342,7 @@ pub unsafe extern "C" fn rln_inlay_hints(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_inlay_hints_free(hints: RlnInlayHints) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(hints.items, hints.count);
         reclaim(hints.strings, hints.strings_length);
     });
@@ -3417,7 +3449,7 @@ pub unsafe extern "C" fn rln_quick_info(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_quick_info_free(info: RlnQuickInfo) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(info.parameters, info.parameter_count);
         reclaim(info.strings, info.strings_length);
     });
@@ -3491,7 +3523,7 @@ pub unsafe extern "C" fn rln_editorconfig(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_settings_free(settings: RlnSettings) {
-    guard((), || unsafe {
+    shallow((), || unsafe {
         reclaim(settings.items, settings.count);
         reclaim(settings.strings, settings.strings_length);
     });
@@ -3572,7 +3604,7 @@ pub unsafe extern "C" fn rln_completion_filter(
     typed: *const c_char,
     out: *mut RlnFilteredItems,
 ) -> RlnStatus {
-    guard(RlnStatus::Panicked, || {
+    shallow(RlnStatus::Panicked, || {
         if out.is_null() || (names.is_null() && count > 0) {
             return RlnStatus::BadArgument;
         }
@@ -3608,7 +3640,7 @@ pub unsafe extern "C" fn rln_completion_filter(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rln_filtered_items_free(items: RlnFilteredItems) {
-    guard((), || unsafe { reclaim(items.items, items.count) });
+    shallow((), || unsafe { reclaim(items.items, items.count) });
 }
 
 /// The sizes `include/rustlyn.h` states for the structs above.
@@ -4389,5 +4421,85 @@ mod tests {
             rln_code_actions_free(actions);
             rln_session_free(session);
         }
+    }
+
+    // MARK: - a deep file on a small stack
+
+    #[test]
+    fn a_file_nested_nine_thousand_deep_is_answered_on_a_small_stack() {
+        // What a request reads is walked as deep as the tree is, which an
+        // unoptimized build needs more stack for than an editor's thread
+        // has. The work is done on a stack made for it, so the answer comes
+        // back whichever thread asked.
+        let dir = TempDir::new("deep");
+        let text = format!(
+            "class C {{ int M(int a) => {}0; }}\n",
+            (0..9000)
+                .map(|i| format!("a == {i} ? {i} : "))
+                .collect::<String>()
+        );
+        let path = dir.write("C.cs", &text);
+        let root = dir.root();
+        let content = CString::new(text.as_bytes()).expect("text with no NUL");
+        let length = text.len() as u32;
+        let small = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || unsafe {
+                let session = rln_session_new(root.as_ptr(), std::ptr::null(), std::ptr::null(), 0);
+                assert!(!session.is_null());
+                assert_eq!(
+                    rln_open_text(session, path.as_ptr(), content.as_ptr()),
+                    RlnStatus::Ok
+                );
+                let paths = [path.as_ptr()];
+                assert_eq!(
+                    rln_compile(session, paths.as_ptr(), 1, std::ptr::null_mut()),
+                    RlnStatus::Ok,
+                );
+
+                let mut diagnostics = std::mem::zeroed::<RlnDiagnostics>();
+                assert_eq!(
+                    rln_diagnostics(
+                        session,
+                        path.as_ptr(),
+                        content.as_ptr(),
+                        &raw mut diagnostics
+                    ),
+                    RlnStatus::Ok,
+                );
+                rln_diagnostics_free(diagnostics);
+
+                let mut runs = std::mem::zeroed::<RlnSemanticRuns>();
+                assert_eq!(
+                    rln_semantic_tokens(
+                        session,
+                        path.as_ptr(),
+                        content.as_ptr(),
+                        0,
+                        length,
+                        &raw mut runs
+                    ),
+                    RlnStatus::Ok,
+                );
+                assert!(runs.count > 9000);
+                rln_semantic_runs_free(runs);
+
+                let mut actions = std::mem::zeroed::<RlnCodeActions>();
+                assert_eq!(
+                    rln_code_actions(
+                        session,
+                        path.as_ptr(),
+                        content.as_ptr(),
+                        length / 2,
+                        length / 2,
+                        &raw mut actions,
+                    ),
+                    RlnStatus::Ok,
+                );
+                rln_code_actions_free(actions);
+                rln_session_free(session);
+            })
+            .expect("a thread");
+        small.join().expect("no overflow");
     }
 }

@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use rustlyn_semantics::{MethodKind, Modifiers, SemanticModel, SymbolId, SymbolKind, TypeKind};
+use rustlyn_semantics::{MethodKind, Modifiers, SymbolId, SymbolKind, TypeKind};
 use rustlyn_syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
 use rustlyn_text::TextSpan;
 
@@ -181,6 +181,17 @@ impl Semantic {
         range: TextSpan,
         text: Option<&str>,
     ) -> Option<Vec<SemanticToken>> {
+        // Finding the tokens and classifying them walk the tree as deep as
+        // it goes: on a stack made for it, where the caller's may not be.
+        rustlyn_semantics::parallel::deep(|| self.semantic_tokens_here(path, range, text))
+    }
+
+    fn semantic_tokens_here(
+        &self,
+        path: &Path,
+        range: TextSpan,
+        text: Option<&str>,
+    ) -> Option<Vec<SemanticToken>> {
         let mut view = self.view_of(path, text)?;
         let mut tokens = Vec::new();
         tokens_in(&view.root.clone(), range, &mut tokens);
@@ -281,9 +292,14 @@ impl Classifier<'_, '_> {
                 SyntaxKind::DeclarationPattern,
             ])
         {
-            let binder = self.view.model.binder();
-            let context = binder.context_at(self.view.tree, &parent);
-            if binder.lookup("var", 0, &context).is_none() {
+            let context = self.view.context_at(&parent);
+            if self
+                .view
+                .model
+                .binder()
+                .lookup("var", 0, &context)
+                .is_none()
+            {
                 return Some((SemanticClass::Keyword, none));
             }
         }
@@ -463,7 +479,7 @@ impl Classifier<'_, '_> {
     /// Whether `variable`, named by `token`, is written anywhere in the body
     /// the token is in other than where it is declared.
     fn is_reassigned(&mut self, token: &SyntaxToken, variable: Variable) -> bool {
-        let Some(owner) = SemanticModel::body_owner(token.parent()) else {
+        let Some(owner) = self.view.above_of(token.parent()).owner else {
             return false;
         };
         if !self.written.contains_key(&owner.span()) {
