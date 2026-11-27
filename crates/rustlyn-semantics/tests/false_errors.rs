@@ -787,3 +787,69 @@ fn a_class_deriving_from_a_construction_of_itself_is_bound_and_ends() {
          class P { static void Main() { object o = new F().Me; } }",
     );
 }
+
+// MARK: - a member of the name of a primary constructor parameter
+
+#[test]
+fn a_member_of_the_name_of_a_primary_constructor_parameter_is_what_a_method_reads() {
+    // In a method or accessor the type's member, declared or inherited, comes before the
+    // parameter (C# 12): `static int x` read by a static method is no use of the parameter,
+    // which a static member cannot use; the parameter wins in initializers and in the base
+    // constructor's arguments.
+    clean(
+        "class S(int x) { static int x = 5; static int G() => x; }
+         class M(string name) { public static string name() => \"m\"; public static string Call() => name(); }
+         class B(int v) { protected int v = v; }
+         class D(int v) : B(v) { public int Get() => v; public int Init = v; }
+         class T1(int a) { int a = a; public void Inc() { a++; a += 2; a = a * 2; } public int Get() => a; }
+         class T3(int p) { public int P { get; } = p; public int Q() { int p = 2; return p; } }
+         struct SS(int s) { int s = s; public int Next() => ++s; }",
+    );
+}
+
+// MARK: - constraints that are not conversions
+
+#[test]
+fn a_generic_candidate_whose_new_or_unmanaged_constraint_fails_leaves_the_other() {
+    clean(
+        "struct W<T> { public T x; }
+         abstract class Abs { }
+         class P {
+             static int Pick<T>(T t) where T : new() { return 1; }
+             static int Pick(object o) { return 2; }
+             static int Un<T>(T t) where T : unmanaged { return 1; }
+             static int Un(object o) { return 2; }
+             static int E<T>(System.Collections.Generic.List<T> l) where T : new() { return 1; }
+             static int E(System.Collections.Generic.IEnumerable<object> l) { return 2; }
+             static void Main(Abs abs, string s, W<string> w) {
+                 int a = Pick(s) + Pick(1) + Pick(abs) + Pick(new int[0]) + Un(s) + Un(1) + Un(w);
+                 int b = E(new System.Collections.Generic.List<string>());
+             }
+         }",
+    );
+}
+
+// MARK: - a string joined to a type with a plus of its own
+
+#[test]
+fn a_string_joined_to_a_type_with_a_plus_that_does_not_take_it_is_concatenated() {
+    clean(
+        "struct Tk {
+             public static implicit operator string(Tk t) { return \"c\"; }
+             public static string operator +(Tk a, string b) { return b; }
+         }
+         class P { static void Main() { Tk t = default(Tk); string a = \"a\" + t; string b = t + \"a\"; string c = \"a\" + t + \"a\"; string d = \"x\"; d += t; } }",
+    );
+}
+
+// MARK: - `union` as a name, under the released language version
+
+#[test]
+fn union_is_a_name_where_no_language_version_is_given() {
+    // C# 15's unions are read only where the version is named: the default is the newest
+    // released version, C# 14, which has no `union` keyword.
+    clean(
+        "class union { }
+         class P { static union Make() { union u = new union(); return u; } static void Main() { var x = Make(); } }",
+    );
+}

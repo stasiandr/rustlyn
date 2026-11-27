@@ -113,7 +113,10 @@ implements the behaviour.
   extends a tuple for `&&` and `||`, a lifted extension operator inside an expression tree,
   and the tie-breaking of generic against non-generic blocks (`extension<T>(S<T>)` against
   `extension(S<int>)`) that Roslyn does beyond overload resolution; where two blocks would be
-  told apart by it, one is chosen.
+  told apart by it, one is chosen. The lifted form of a block's static operator over value
+  types (`V? + V`) is a candidate beside the plain operators of its place and wins over one
+  that reaches the operands only by boxing (`extension(object)`); a plain operator that takes
+  the very same types is preferred to it, and one in a nearer place to either.
 * A `decimal` constant is folded as `System.Decimal` works it out, except for one corner
   of `%` that .NET sometimes refuses with an overflow and whose rule is not known: that
   expression is left unfolded, so a `const` made of it is not a compile-time constant to
@@ -136,14 +139,30 @@ implements the behaviour.
   reported (CS0146, CS0529); what walks the bases of such a type stops where a definition
   comes back, as Roslyn's `BaseTypeAnalysis` finds the circularity, and the program is
   emitted as written. `class L<T> : Base<L<L<T>>>`, whose bases are `Base`'s, is no cycle.
-* Type arguments are checked against `class`, `struct` and named constraints (CS0311,
-  CS0315, CS0452, CS0453) where the check can be made for certain: an argument that is or
-  holds a type parameter, a tuple, a pointer or a type that did not resolve, a constraint
-  that still names a type parameter and a nullable value type under an interface
-  constraint are taken as met, and so is a type nested in a generic one. `new()` (CS0310),
-  `unmanaged` (CS8377) and the nullable-specific CS0312 and CS0313 are not reported. A
-  generic method with one candidate is reported where it is called; with several, a
-  candidate whose inferred type arguments break its constraints is not a candidate.
+* Type arguments are checked against `class`, `struct`, `new()`, `unmanaged` and named
+  constraints (CS0311, CS0315, CS0452, CS0453, CS0310, CS8377) where the check can be made
+  for certain: an argument that is or holds a type parameter, a tuple, a pointer or a type
+  that did not resolve, a constraint that still names a type parameter and a nullable value
+  type under an interface constraint are taken as met, and so is a type nested in a generic
+  one. `new()` is met by a value type and by a non-abstract class with a public parameterless
+  constructor; `unmanaged` by a type with no reference at any depth of its fields, the fields
+  of a struct read from a referenced assembly being only those it makes visible (a
+  `KeyValuePair<int, string>` is taken as met). The nullable-specific CS0312 and CS0313 are
+  not reported. A generic method with one candidate is reported where it is called; with
+  several, a candidate whose inferred type arguments break any of its constraints is not a
+  candidate, so `F<T>(T) where T : new()` beside `F(object)` leaves the second for a `string`.
+  A constraint of `unmanaged` on a method read from a referenced assembly is read as `struct`.
+* The language version a file is read as, where none is given, is the newest released one,
+  C# 14, as Roslyn's `default` and `latest` are: `class union { }` is a class and
+  `union Pet(Cat, Dog);` is not a declaration. C# 15 (unions) is read only under `15` or
+  `preview`. The `build` and `diagnose` examples, `ParseOptions::default()` and a project
+  whose `<LangVersion>` is absent or says `default` or `latest` all follow it; a project
+  that says `preview` or `15` gets the unions.
+* A `+` with a `string` on one side and, on the other, a type that declares a `+` of its
+  own that does not take them and a conversion to `string`, concatenates the converted
+  string, as Roslyn does. Where that other operand is a nullable of such a type, the
+  concatenation calls its `ToString` and does not convert it (`"a" + n` on a `Tok?` is `aT1`
+  where Roslyn gives `aC1`).
 * A delegate made by converting a static method group is kept in a field of the type's
   `<>O` class, as Roslyn (C# 11) keeps it, with the same conditions: not for `new D(M)`,
   a method closed over a receiver or a local function that is not `static`, and not in a

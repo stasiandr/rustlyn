@@ -555,8 +555,13 @@ impl BodyBinder<'_> {
             if self.predefined_binary_applies(operator, &left.ty, &right.ty) {
                 return None;
             }
-            let (resolved, _, given) =
+            let plain =
                 self.resolve_extension_operator(name, &[left.clone(), right.clone()], span)?;
+            // Left to the lifted form, which the caller asks next.
+            if self.lifted_extension_operator_wins(operator, name, [left, right], &plain, span) {
+                return None;
+            }
+            let (resolved, _, given) = plain;
             return Some(self.extension_operator_call(resolved, given, span));
         }
         let (method, receiver) = resolved?;
@@ -855,22 +860,37 @@ impl BodyBinder<'_> {
         )
     }
 
+    /// Whether a value's type declares a `+` of its own.
+    fn declares_addition(&self, value: &BoundExpression) -> bool {
+        value
+            .ty
+            .symbol()
+            .is_some_and(|symbol| !self.binder.lookup_member(symbol, "op_Addition").is_empty())
+    }
+
     /// The operand of a `+` whose other side is a `string`, brought to
     /// `string` by the user-defined implicit conversion it has to it: the
     /// concatenation then takes two strings (§12.10.5), not a string and an
     /// object. Anything else is left as it is.
-    pub(super) fn convert_operand_to_string(&mut self, value: BoundExpression) -> BoundExpression {
+    ///
+    /// A type with a `+` of its own is asked that first (§12.4.5: the
+    /// predefined operators are candidates only where no user-defined one
+    /// applies), and `own_addition_asked` says that has been done and found
+    /// the operator no fit — `"a" + t` where `t`'s `+` takes a `Tok` and a
+    /// `string` — so the conversion goes ahead. Left unconverted, such an
+    /// operand was handed to the concatenation as an object and its
+    /// `ToString` was called instead of its conversion.
+    pub(super) fn convert_operand_to_string(
+        &mut self,
+        value: BoundExpression,
+        own_addition_asked: bool,
+    ) -> BoundExpression {
         let string = self.special(SpecialType::String);
-        // A type with a `+` of its own is asked that first.
-        let declares_addition = value
-            .ty
-            .symbol()
-            .is_some_and(|symbol| !self.binder.lookup_member(symbol, "op_Addition").is_empty());
         if value.ty == string
             || value.ty.is_error()
             || matches!(value.ty, Type::Null)
             || self.binder.special_of(&value.ty).is_some()
-            || declares_addition
+            || (!own_addition_asked && self.declares_addition(&value))
         {
             return value;
         }
@@ -1881,13 +1901,27 @@ impl BodyBinder<'_> {
         // `string` is the better one, and it runs before the concatenation.
         let (left, right) = if operator == BinaryOperator::Add {
             let string = self.special(SpecialType::String);
-            let convert_to_string =
-                |body: &mut Self, value: BoundExpression| body.convert_operand_to_string(value);
+            let other = if left.ty == string {
+                Some(&right)
+            } else if right.ty == string {
+                Some(&left)
+            } else {
+                None
+            };
+            // The `+` the other operand's type declares takes the operands
+            // as they are where it applies; where it does not, the
+            // concatenation is the one left.
+            if let Some(other) = other
+                && self.declares_addition(other)
+                && let Some(call) = self.user_defined_operator(operator, &left, &right, span)
+            {
+                return call;
+            }
             if left.ty == string {
-                let right = convert_to_string(self, right);
+                let right = self.convert_operand_to_string(right, true);
                 (left, right)
             } else if right.ty == string {
-                let left = convert_to_string(self, left);
+                let left = self.convert_operand_to_string(left, true);
                 (left, right)
             } else {
                 (left, right)

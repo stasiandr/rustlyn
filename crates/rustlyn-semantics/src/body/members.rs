@@ -12,7 +12,7 @@ use crate::bound::{
     BoundAttribute, BoundBody, BoundExpression, BoundExpressionKind, BoundStatement,
     BoundStatementKind, BoundSymbol,
 };
-use crate::symbol::{SymbolId, SymbolKind, TypeKind};
+use crate::symbol::{SymbolId, SymbolKind};
 use crate::types::Type;
 
 impl<'a> BodyBinder<'a> {
@@ -770,26 +770,30 @@ impl<'a> BodyBinder<'a> {
             .as_named_type()
             .and_then(|detail| detail.primary_constructor)
             .filter(|primary| *primary != member)?;
-        // A record's positional parameter is a property everywhere but in the
-        // initializers: `record struct Info(int Offset)` reads `Offset` in its
-        // methods as the property it declared (§15.1.1 of the records spec).
-        if !self.in_initializer
-            && matches!(
-                symbols.get(enclosing).type_kind(),
-                Some(TypeKind::Record | TypeKind::RecordStruct)
-            )
-            && symbols
-                .lookup(enclosing, name)
-                .iter()
-                .any(|found| symbols.get(*found).kind != SymbolKind::Parameter)
-        {
-            return None;
-        }
-        symbols
+        let parameter = symbols
             .lookup(primary, name)
             .iter()
             .copied()
-            .find(|candidate| symbols.get(*candidate).kind == SymbolKind::Parameter)
+            .find(|candidate| symbols.get(*candidate).kind == SymbolKind::Parameter)?;
+        // Outside the initializers and the base-constructor arguments, a
+        // member of the type found under the name comes before the primary
+        // constructor's parameter (C# 12): `class Counter(int count) { int
+        // count = count; int Get() => count; }` reads the field in `Get`, and
+        // a record's positional parameter is the property it declared.
+        // What the type inherits and may access counts as well. Only a record
+        // used to be asked, so a class's method read the parameter, a copy
+        // of what the field held at construction.
+        if !self.in_initializer
+            && !self
+                .binder
+                .lookup_member_where(enclosing, name, &|found| {
+                    symbols.get(found).kind != SymbolKind::Parameter && self.accessible(found)
+                })
+                .is_empty()
+        {
+            return None;
+        }
+        Some(parameter)
     }
 
     /// The field behind the property whose accessor is being bound, where

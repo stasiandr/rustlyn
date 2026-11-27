@@ -15,7 +15,7 @@
 
 mod cache;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rustlyn_text::SourceText;
 
@@ -214,7 +214,17 @@ pub struct GreenNode {
     leading_width: u32,
     trailing_width: u32,
     children: Box<[GreenElement]>,
+    /// Where each child starts within this node, and the width of the node
+    /// after the last, read only from a node with many children and made
+    /// the first time it is asked for: see [`Self::first_child_ending_at`].
+    starts: OnceLock<Box<[u32]>>,
 }
+
+/// How many children a node has before they are indexed by position. A
+/// class of generated members has tens of thousands, and finding the one at
+/// a position by adding up widths from the first made the cost of finding
+/// every member the square of how many there are.
+const INDEXED_FROM: usize = 32;
 
 impl GreenNode {
     #[must_use]
@@ -244,7 +254,42 @@ impl GreenNode {
             leading_width,
             trailing_width,
             children: children.into_boxed_slice(),
+            starts: OnceLock::new(),
         })
+    }
+
+    /// The first child, with where it starts within this node, that does
+    /// not end before `position` (relative to the start of this node,
+    /// leading trivia included); every child before it ends earlier.
+    ///
+    /// A node with few children is walked, and one with many is searched
+    /// over offsets made once.
+    #[must_use]
+    pub fn first_child_ending_at(&self, position: u32) -> (usize, u32) {
+        if self.children.len() < INDEXED_FROM {
+            let mut offset = 0;
+            for (index, child) in self.children.iter().enumerate() {
+                let end = offset + child.full_width();
+                if end >= position {
+                    return (index, offset);
+                }
+                offset = end;
+            }
+            return (self.children.len(), offset);
+        }
+        let starts = self.starts.get_or_init(|| {
+            let mut offset = 0;
+            let mut starts = Vec::with_capacity(self.children.len() + 1);
+            for child in &self.children {
+                starts.push(offset);
+                offset += child.full_width();
+            }
+            starts.push(offset);
+            starts.into_boxed_slice()
+        });
+        // Child `i` ends where child `i + 1` starts.
+        let index = starts[1..].partition_point(|end| *end < position);
+        (index, starts[index])
     }
 
     #[must_use]

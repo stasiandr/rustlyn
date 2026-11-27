@@ -1053,6 +1053,16 @@ impl Checker<'_> {
             (location.tree, location.span.start())
         });
         let type_name = symbols.qualified_name(ty);
+        // Each member is compared with the earlier ones of its own name and
+        // no others: comparing it with every earlier member made a type of
+        // generated members take time with the square of how many it has.
+        let mut named: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (index, member) in members.iter().enumerate() {
+            named
+                .entry(symbols.get(*member).name.as_str())
+                .or_default()
+                .push(index);
+        }
         for (index, member) in members.iter().enumerate() {
             let symbol = symbols.get(*member);
             let method = symbol.as_method();
@@ -1067,11 +1077,12 @@ impl Checker<'_> {
             }) {
                 continue;
             }
-            for earlier in &members[..index] {
+            let same_name = named[symbol.name.as_str()]
+                .iter()
+                .take_while(|earlier| **earlier < index)
+                .map(|earlier| &members[*earlier]);
+            for earlier in same_name {
                 let other = symbols.get(*earlier);
-                if other.name != symbol.name {
-                    continue;
-                }
                 let location = symbol.locations[0];
                 match (method, other.as_method()) {
                     (Some(_), Some(earlier_method)) => {

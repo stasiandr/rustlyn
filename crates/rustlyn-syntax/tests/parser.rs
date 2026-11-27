@@ -739,8 +739,13 @@ fn records_and_namespaces() {
 
 #[test]
 fn a_union_declaration_lists_its_case_types() {
-    let tree = tree_of(
-        "public readonly union Pet<T>(Cat, T?, int[]) : IPet where T : class { void M() { } }",
+    let preview = ParseOptions::default().with_language_version(LanguageVersion::Preview);
+    let tree = parse_with(
+        SourceText::new(
+            "Test.cs",
+            "public readonly union Pet<T>(Cat, T?, int[]) : IPet where T : class { void M() { } }",
+        ),
+        &preview,
     );
     assert!(!tree.has_errors(), "{:?}", tree.diagnostics());
     let union = tree
@@ -755,7 +760,7 @@ fn a_union_declaration_lists_its_case_types() {
          (SimpleBaseType IdentifierName)) (TypeParameterConstraintClause ClassConstraint) \
          (MethodDeclaration PredefinedType ParameterList Block))"
     );
-    let bodiless = tree_of("union Pet(Cat, Dog);");
+    let bodiless = parse_with(SourceText::new("Test.cs", "union Pet(Cat, Dog);"), &preview);
     assert!(!bodiless.has_errors(), "{:?}", bodiless.diagnostics());
     assert_eq!(
         shape_of(&bodiless.root()),
@@ -1995,4 +2000,117 @@ fn nested_type_arguments_are_not_read_again_for_each_level() {
             );
         }
     });
+}
+
+/// The version a file is read as where none is named is the newest released one, C# 14, as the real
+/// compiler's default is: `union` is read as a keyword only from C# 15, which `15` and `preview` name.
+/// The default was C# 15, and took `class union { }` for the start of a declaration.
+#[test]
+fn the_default_language_version_is_the_newest_released_one() {
+    assert_eq!(LanguageVersion::default(), LanguageVersion::CSharp14);
+    assert_eq!(
+        ParseOptions::default().language_version,
+        LanguageVersion::CSharp14
+    );
+    for name in ["default", "latest", "latestmajor", "LATEST", "14", "14.0"] {
+        assert_eq!(name.parse(), Ok(LanguageVersion::CSharp14), "{name}");
+    }
+    assert_eq!("15".parse(), Ok(LanguageVersion::CSharp15));
+    assert_eq!("preview".parse(), Ok(LanguageVersion::Preview));
+    assert!(LanguageVersion::Preview.at_least(LanguageVersion::CSharp15));
+    assert!(!LanguageVersion::default().at_least(LanguageVersion::CSharp15));
+}
+
+/// `union` as a name of every kind, under the default version and the ones before it.
+#[test]
+fn union_is_a_name_of_every_kind_under_the_default_language_version() {
+    let sources = [
+        "class union { }",
+        "class union<T> { }",
+        "struct union { }",
+        "interface union { }",
+        "class C { static union Make() => new union(); }",
+        "class C { union field; union Prop { get; set; } union[] arr; union? opt; }",
+        "class C { void union() { } void M(union union) { union.M(); union++; } }",
+        "class C { void M() { union x = null; var y = (union)x; var z = new List<union>(); } }",
+        "class C { void M() { union: ; goto union; } }",
+        "namespace union { class A { } }",
+        "using union = System.Int32;",
+        "class C { string s = nameof(union); object o = typeof(union); }",
+        "class C { void M() { foreach (union u in us) { } } }",
+        "class C { void M() { (union, int) t = default; } }",
+        "public union Make() { }",
+    ];
+    let released = [
+        ParseOptions::default(),
+        ParseOptions::default().with_language_version(LanguageVersion::CSharp14),
+        ParseOptions::default().with_language_version(LanguageVersion::CSharp13),
+        ParseOptions::default().with_language_version("latest".parse().expect("a version")),
+    ];
+    for options in &released {
+        for source in sources {
+            let tree = parse_with(SourceText::new("Test.cs", source), options);
+            assert!(
+                tree.root()
+                    .descendants()
+                    .all(|node| node.kind() != SyntaxKind::UnionDeclaration),
+                "{source}"
+            );
+        }
+    }
+    let tree = tree_of("class union { } class C { static union Make() => new union(); }");
+    assert!(!tree.has_errors(), "{:?}", tree.diagnostics());
+    let preview = ParseOptions::default().with_language_version(LanguageVersion::Preview);
+    let tree = parse_with(
+        SourceText::new("Test.cs", "public union Pet(Cat, Dog);"),
+        &preview,
+    );
+    assert!(
+        tree.root()
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::UnionDeclaration)
+    );
+    let fifteen = ParseOptions::default().with_language_version(LanguageVersion::CSharp15);
+    let tree = parse_with(SourceText::new("Test.cs", "union Pet(Cat, Dog);"), &fifteen);
+    assert!(!tree.has_errors(), "{:?}", tree.diagnostics());
+}
+
+/// A class of many members is searched by position without adding up the widths of the members
+/// before it: the node at a span, and the token at a position, are the same ones however many
+/// members come first, at the edges of a member and in the trivia between two.
+#[test]
+fn the_node_and_the_token_at_a_position_are_found_among_many_members() {
+    let mut source = String::from("class C {\n");
+    let mut starts = Vec::new();
+    for index in 0..500 {
+        starts.push(source.len());
+        source.push_str(&format!("  int M{index}(int x) => x + {index};\n"));
+    }
+    source.push_str("}\n");
+    let tree = tree_of(&source);
+    assert!(!tree.has_errors(), "{:?}", tree.diagnostics());
+    let root = tree.root();
+    let methods: Vec<_> = root
+        .descendants()
+        .filter(|node| node.kind() == SyntaxKind::MethodDeclaration)
+        .collect();
+    assert_eq!(methods.len(), 500);
+    for (index, method) in methods.iter().enumerate() {
+        let found = root.find_node(method.span()).expect("the method");
+        assert_eq!(found.kind(), SyntaxKind::MethodDeclaration, "{index}");
+        assert_eq!(found.span(), method.span(), "{index}");
+        // The whole line, with its trivia, is inside the class and not inside the next member.
+        let token = root
+            .find_token(method.span().start() + 4)
+            .expect("a token in the method");
+        assert!(method.full_span().contains(token.span().start()), "{index}");
+        let first = root
+            .find_token(starts[index] as u32)
+            .expect("a token at the line start");
+        assert!(first.full_span().contains(starts[index] as u32), "{index}");
+    }
+    let last = root
+        .find_token(source.len() as u32 - 2)
+        .expect("the closing brace");
+    assert_eq!(last.text(), "}");
 }

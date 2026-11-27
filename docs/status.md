@@ -203,7 +203,7 @@ assert_eq!(errors, ["Program.cs(1,30): error CS0029: Cannot implicitly convert t
 
 ### Language versions
 
-`ParseOptions::with_language_version` (`/langversion:`, default latest, C# 15) and
+`ParseOptions::with_language_version` (`/langversion:`, default the newest released, C# 14; `15` and `preview` read the unions) and
 `CompilationOptions` (`/main:`, `/checked`, `/optimize`, `/unsafe`). The binder follows
 the named version wherever Roslyn checks `LanguageVersion`: before C# 10 lambdas and
 method groups have no natural type; before C# 12 a `ref` argument does not go to an

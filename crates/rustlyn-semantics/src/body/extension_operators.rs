@@ -226,6 +226,118 @@ impl BodyBinder<'_> {
         })
     }
 
+    /// Whether the lifted form (§12.4.8) of a static operator of an extension
+    /// block beats the plain one that was resolved for these operands.
+    ///
+    /// `na + a` on a `V?` and a `V`, with blocks that extend `V` and `object`
+    /// each declaring a `+`, has the `V` operator's lifted form among its
+    /// candidates beside the `object` one that the boxing of both reaches:
+    /// the lifted form takes a `V?` and a `V?`, each of which converts to
+    /// `object` and not back, so it is the more specific and the one called.
+    /// A place nearer in scope than the other wins first, and a plain
+    /// operator that takes the very same types is preferred to a lifted one.
+    /// Before this was asked, only the plain operators were candidates, and
+    /// the `object` one was called where a lifted one was meant.
+    pub(super) fn lifted_extension_operator_wins(
+        &mut self,
+        operator: BinaryOperator,
+        name: &str,
+        operands: [&BoundExpression; 2],
+        plain: &(super::Resolved, usize, Vec<BoundExpression>),
+        span: TextSpan,
+    ) -> bool {
+        if matches!(
+            operator,
+            BinaryOperator::Equality
+                | BinaryOperator::Inequality
+                | BinaryOperator::LogicalAnd
+                | BinaryOperator::LogicalOr
+                | BinaryOperator::Coalesce
+        ) {
+            return false;
+        }
+        let mut lifted_any = false;
+        let mut probes = Vec::with_capacity(2);
+        for operand in operands {
+            if matches!(operand.ty, Type::Null) || operand.ty.is_error() {
+                return false;
+            }
+            match self.binder.nullable_underlying(&operand.ty) {
+                Some(underlying) => {
+                    lifted_any = true;
+                    probes.push(BoundExpression::new(
+                        operand.kind.clone(),
+                        underlying,
+                        operand.span,
+                    ));
+                }
+                None => probes.push(operand.clone()),
+            }
+        }
+        if !lifted_any {
+            return false;
+        }
+        let Some((lifted, lifted_level, _)) = self.resolve_extension_operator(name, &probes, span)
+        else {
+            return false;
+        };
+        let (plain_resolved, plain_level, _) = plain;
+        // Only an operator over value types has a lifted form, whose result
+        // is a value type as well, or a `bool` for a comparison.
+        let parameter_types = |body: &Self, resolved: &super::Resolved| -> Vec<Type> {
+            let symbols = body.binder.compilation().symbols();
+            let Some(detail) = symbols.get(resolved.method).as_method() else {
+                return Vec::new();
+            };
+            detail
+                .parameters
+                .iter()
+                .map(|parameter| {
+                    let mut sink = crate::binder::Diagnostics::new();
+                    body.binder
+                        .type_of(*parameter, &mut sink)
+                        .value()
+                        .substitute(&resolved.substitution)
+                })
+                .collect()
+        };
+        let lifted_parameters = parameter_types(self, &lifted);
+        let plain_parameters = parameter_types(self, plain_resolved);
+        if lifted_parameters.len() != 2
+            || plain_parameters.len() != 2
+            || !lifted_parameters
+                .iter()
+                .all(|parameter| self.wraps_in_nullable(parameter))
+        {
+            return false;
+        }
+        let result = self
+            .member_type(lifted.method, &Type::Void)
+            .substitute(&lifted.substitution);
+        let comparison = matches!(
+            operator,
+            BinaryOperator::LessThan
+                | BinaryOperator::GreaterThan
+                | BinaryOperator::LessThanOrEqual
+                | BinaryOperator::GreaterThanOrEqual
+        );
+        if !(self.wraps_in_nullable(&result) || (comparison && self.binder.is_boolean(&result))) {
+            return false;
+        }
+        if lifted_level != *plain_level {
+            return lifted_level < *plain_level;
+        }
+        let lifted_parameters: Vec<Type> = lifted_parameters
+            .into_iter()
+            .map(|parameter| self.nullable_of(parameter))
+            .collect();
+        lifted_parameters != plain_parameters
+            && lifted_parameters
+                .iter()
+                .zip(&plain_parameters)
+                .all(|(lifted, plain)| self.binder.converts_implicitly(lifted, plain))
+    }
+
     /// The call of an extension operator that overload resolution settled
     /// on, whose type arguments it inferred from the operands.
     pub(super) fn extension_operator_call(

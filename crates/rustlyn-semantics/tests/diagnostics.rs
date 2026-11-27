@@ -3135,3 +3135,86 @@ class P {{ void M() {{ Pick.Take<Bar>(null); Pick.Take<Foo>(null); Pick.Only<Bar
     assert_eq!(found.len(), 1, "{found:#?}");
     assert!(found[0].starts_with("CS0311 'Only<Bar>'"), "{found:#?}");
 }
+
+/// `new()` (CS0310) and `unmanaged` (CS8377) join `class` and `struct` among the constraints a type
+/// argument is held to: a value type meets `new()`, a class does where it is not abstract and has a
+/// public parameterless constructor, and `unmanaged` is met by a type with no reference at any depth.
+const NEW_AND_UNMANAGED: &str = "
+abstract class Abs { }
+class NoCtor { public NoCtor(int x) { } }
+class PrivCtor { private PrivCtor() { } }
+class IntCtor { internal IntCtor() { } }
+class Fine { }
+class Both { public Both() { } public Both(int x) { } }
+class PrimaryCtor(int x) { }
+struct St { public int a; }
+struct Rf { public string s; }
+struct Props { public string P { get; set; } }
+struct Ok2 { public int a; public double d; }
+struct Gen<T> { public T t; }
+enum En { A }
+interface IFoo { }
+delegate void Del();
+class WithNew<T> where T : new() { }
+class WithUnmanaged<T> where T : unmanaged { }
+static class Calls {
+    public static void N<T>() where T : new() { }
+    public static void U<T>(T t) where T : unmanaged { }
+}
+";
+
+fn new_and_unmanaged_errors(source: &str) -> Vec<String> {
+    diagnose(source)
+        .into_iter()
+        .filter(|line| line.starts_with("CS0310") || line.starts_with("CS8377"))
+        .collect()
+}
+
+#[test]
+fn a_type_argument_that_breaks_a_new_or_unmanaged_constraint_is_cs0310_and_cs8377() {
+    let source = format!(
+        "{NEW_AND_UNMANAGED}class P {{ void M() {{
+    Calls.N<Abs>(); Calls.N<NoCtor>(); Calls.N<PrivCtor>(); Calls.N<IntCtor>(); Calls.N<PrimaryCtor>();
+    Calls.N<IFoo>(); Calls.N<Del>(); Calls.N<int[]>();
+    Calls.U(new Rf()); Calls.U(new Props()); Calls.U(new Gen<Fine>());
+    var a = new WithNew<Abs>(); var b = new WithUnmanaged<Rf>(); var c = new WithUnmanaged<Fine>();
+    WithNew<NoCtor> d = null;
+}} }}"
+    );
+    let found = new_and_unmanaged_errors(&source);
+    let fragments = [
+        "CS0310 'N<Abs>': The type 'Abs' must be a non-abstract type with a public parameterless constructor in order to use it as parameter 'T' in the generic type or method 'Calls.N<T>()'",
+        "CS0310 'N<NoCtor>': The type 'NoCtor' must be a non-abstract type with a public parameterless constructor in order to use it as parameter 'T' in the generic type or method 'Calls.N<T>()'",
+        "CS0310 'N<PrivCtor>': The type 'PrivCtor' must be a non-abstract type with a public parameterless constructor in order to use it as parameter 'T' in the generic type or method 'Calls.N<T>()'",
+        "CS0310 'N<IntCtor>': The type 'IntCtor' must be a non-abstract type with a public parameterless constructor in order to use it as parameter 'T' in the generic type or method 'Calls.N<T>()'",
+        "CS0310 'N<PrimaryCtor>': The type 'PrimaryCtor' must be a non-abstract type with a public parameterless constructor in order to use it as parameter 'T' in the generic type or method 'Calls.N<T>()'",
+        "CS0310 'N<IFoo>': The type 'IFoo' must be a non-abstract type with a public parameterless constructor in order to use it as parameter 'T' in the generic type or method 'Calls.N<T>()'",
+        "CS0310 'N<Del>': The type 'Del' must be a non-abstract type with a public parameterless constructor in order to use it as parameter 'T' in the generic type or method 'Calls.N<T>()'",
+        "CS0310 'N<int[]>': The type 'int[]' must be a non-abstract type with a public parameterless constructor in order to use it as parameter 'T' in the generic type or method 'Calls.N<T>()'",
+        "CS8377 'U': The type 'Rf' must be a non-nullable value type, along with all fields at any level of nesting, in order to use it as parameter 'T' in the generic type or method 'Calls.U<T>(T)'",
+        "CS8377 'U': The type 'Props' must be a non-nullable value type, along with all fields at any level of nesting, in order to use it as parameter 'T' in the generic type or method 'Calls.U<T>(T)'",
+        "CS8377 'U': The type 'Gen<Fine>' must be a non-nullable value type, along with all fields at any level of nesting, in order to use it as parameter 'T' in the generic type or method 'Calls.U<T>(T)'",
+        "CS0310 'Abs': The type 'Abs' must be a non-abstract type with a public parameterless constructor in order to use it as parameter 'T' in the generic type or method 'WithNew<T>'",
+        "CS8377 'Rf': The type 'Rf' must be a non-nullable value type, along with all fields at any level of nesting, in order to use it as parameter 'T' in the generic type or method 'WithUnmanaged<T>'",
+        "CS8377 'Fine': The type 'Fine' must be a non-nullable value type, along with all fields at any level of nesting, in order to use it as parameter 'T' in the generic type or method 'WithUnmanaged<T>'",
+        "CS0310 'NoCtor': The type 'NoCtor' must be a non-abstract type with a public parameterless constructor in order to use it as parameter 'T' in the generic type or method 'WithNew<T>'",
+    ];
+    assert_eq!(found.len(), fragments.len(), "{found:#?}");
+    for (found, fragment) in found.iter().zip(fragments) {
+        assert!(found.starts_with(fragment), "{found}\n{fragment}");
+    }
+}
+
+#[test]
+fn a_type_argument_that_meets_a_new_or_unmanaged_constraint_is_quiet() {
+    let source = format!(
+        "{NEW_AND_UNMANAGED}class P<X> where X : new() {{ void M<Y>() where Y : struct, new() {{
+    Calls.N<Fine>(); Calls.N<Both>(); Calls.N<St>(); Calls.N<Rf>(); Calls.N<En>(); Calls.N<int?>(); Calls.N<(int, string)>();
+    Calls.N<X>(); Calls.N<Y>(); Calls.N<object>(); Calls.N<System.Exception>(); Calls.N<System.Collections.Generic.List<string>>();
+    Calls.U(1); Calls.U(new St()); Calls.U(new Ok2()); Calls.U(En.A); Calls.U(new Gen<int>()); Calls.U(new Gen<Gen<En>>()); Calls.U(new Gen<int?>());
+    Calls.U(new System.DateTime()); Calls.U(new System.Guid()); Calls.U(System.IntPtr.Zero);
+    var a = new WithNew<Fine>(); var b = new WithUnmanaged<Ok2>(); var c = new WithNew<St>();
+}} }}"
+    );
+    assert_eq!(new_and_unmanaged_errors(&source), Vec::<String>::new());
+}

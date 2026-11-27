@@ -38,8 +38,12 @@ pub enum LanguageVersion {
 impl LanguageVersion {
     /// The newest released version: what `default`, `latest` and
     /// `latestmajor` mean, and what a file is compiled as unless told
-    /// otherwise.
-    pub const LATEST: Self = Self::CSharp15;
+    /// otherwise. C# 15 is not among the released ones: its features, the
+    /// unions among them, are read only where the version is named, as
+    /// `15` or `preview`, so that `class union { }` in code written for
+    /// the released language is still a class. It used to be the default,
+    /// and took such a class for the start of a union declaration.
+    pub const LATEST: Self = Self::CSharp14;
 
     /// Whether this version has the rules of `version` — the check Roslyn
     /// spells `languageVersion >= MessageID.IDS_FeatureX.RequiredVersion()`.

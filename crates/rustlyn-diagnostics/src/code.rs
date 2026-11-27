@@ -105,6 +105,8 @@ error_codes! {
     ErrGenericConstraintNotSatisfiedValType = 315, Error, "The type '{3}' cannot be used as type parameter '{2}' in the generic type or method '{0}'. There is no boxing conversion from '{3}' to '{1}'.";
     ErrRefConstraintNotSatisfied = 452, Error, "The type '{2}' must be a reference type in order to use it as parameter '{1}' in the generic type or method '{0}'";
     ErrValConstraintNotSatisfied = 453, Error, "The type '{2}' must be a non-nullable value type in order to use it as parameter '{1}' in the generic type or method '{0}'";
+    ErrNewConstraintNotSatisfied = 310, Error, "The type '{2}' must be a non-abstract type with a public parameterless constructor in order to use it as parameter '{1}' in the generic type or method '{0}'";
+    ErrUnmanagedConstraintNotSatisfied = 8377, Error, "The type '{2}' must be a non-nullable value type, along with all fields at any level of nesting, in order to use it as parameter '{1}' in the generic type or method '{0}'";
     ErrDefaultValueMustBeConstant = 1736, Error, "Default parameter value for '{0}' must be a compile-time constant";
     ErrBadMemberFlag = 106, Error, "The modifier '{0}' is not valid for this item";
     ErrStaticNotVirtual = 112, Error, "A static member cannot be marked as '{0}'";

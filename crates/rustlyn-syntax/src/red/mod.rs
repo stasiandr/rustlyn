@@ -389,9 +389,16 @@ impl SyntaxNode {
         // position is arithmetic, and only that one is made red.
         let mut node = self.clone();
         'descend: loop {
-            let mut offset = node.0.position;
-            let mut index = 0;
+            // Only a child that reaches `position` can hold it.
+            let (mut index, first_offset) = node
+                .0
+                .green
+                .first_child_ending_at(position.saturating_sub(node.0.position));
+            let mut offset = node.0.position + first_offset;
             while let Some(green) = node.0.green.slot(index) {
+                if offset > position {
+                    break;
+                }
                 let width = green.full_width();
                 if TextSpan::new(offset, width).contains(position) {
                     match node.element_at(green, offset, index as u32) {
@@ -420,9 +427,16 @@ impl SyntaxNode {
         // the winner has to be made into a node.
         let mut node = self.clone();
         'descend: loop {
-            let mut offset = node.0.position;
-            let mut index = 0;
+            // Only a child that reaches the span's start can hold it.
+            let (mut index, first_offset) = node
+                .0
+                .green
+                .first_child_ending_at(span.start().saturating_sub(node.0.position));
+            let mut offset = node.0.position + first_offset;
             while let Some(green) = node.0.green.slot(index) {
+                if offset > span.start() {
+                    break;
+                }
                 let width = green.full_width();
                 if let GreenElement::Node(child) = green
                     && TextSpan::new(offset, width).contains_span(span)

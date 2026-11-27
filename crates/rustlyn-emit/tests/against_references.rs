@@ -12342,8 +12342,10 @@ delegate void D2(ref readonly int x);
 
 #[test]
 fn a_union_converts_from_its_cases_and_is_matched_by_what_it_holds() {
-    check(
+    check_with_options(
         "unions",
+        rustlyn_syntax::LanguageVersion::Preview,
+        rustlyn_semantics::CompilationOptions::default(),
         r#"
 [System.Runtime.CompilerServices.Union]
 struct Pet
@@ -24804,8 +24806,10 @@ fn a_union_declaration_converts_from_its_case_types_and_is_matched_by_what_it_ho
     // an implicit union conversion calls; patterns look through the union to what it holds, asking
     // `TryGetValue` and `HasValue` where the type has them, and `{ Value: ... }` on a union written
     // out is the same question.
-    check(
+    check_with_options(
         "union_declaration_conversion_and_matching",
+        rustlyn_syntax::LanguageVersion::Preview,
+        rustlyn_semantics::CompilationOptions::default(),
         r#"using System;
 namespace System.Runtime.CompilerServices {
   public class UnionAttribute : Attribute {}
@@ -29784,5 +29788,888 @@ class P {
 2,12
 3,7
 "####,
+    );
+}
+
+/// In a class or struct with a primary constructor, a simple name in a method, accessor or lambda
+/// finds the type's member of that name, declared or inherited, before the primary constructor's
+/// parameter; in an initializer and in the base constructor's arguments the parameter comes first
+/// (C# 12). Only a record's positional parameter was hidden by its property, so `int count = count;`
+/// followed by `count++` in a method incremented a captured copy of the parameter.
+#[test]
+fn a_primary_constructor_parameter_is_hidden_by_a_member_of_its_name_in_methods() {
+    check(
+        "pc_member_hides_parameter",
+        r##"using System;
+class Counter(int count) {
+  int count = count;
+  public void Inc() => this.count++;
+  public int Get() => count;
+}
+class Svc(string name) {
+  private readonly string name = name.ToUpper();
+  public string Name => name;
+}
+class Prop(int v) {
+  public int v { get; set; } = v;
+  public int Twice() => v * 2;
+  public void Set(int n) => this.v = n;
+}
+class P {
+  static void Main() {
+    var c = new Counter(5); c.Inc(); c.Inc(); Console.WriteLine(c.Get());
+    Console.WriteLine(new Svc("abc").Name);
+    var p = new Prop(3); p.Set(10); Console.WriteLine(p.Twice());
+  }
+}"##,
+        "7
+ABC
+20
+",
+    );
+}
+
+#[test]
+fn the_members_that_hide_a_primary_constructor_parameter_are_fields_properties_and_inherited_ones()
+{
+    check(
+        "pc_member_hides_parameter_variants",
+        r##"using System;
+using System.Collections.Generic;
+class Counter(int count) {
+  int count = count;
+  public void Inc() => this.count++;
+  public int Get() => count;
+  public Func<int> L() => () => count + 100;
+  public int Loc() { int count = 1000; return count; }
+  public class Nest { public int N(Counter c) => c.count; }
+}
+struct SC(int a) {
+  int a = a;
+  public int Bump() { a++; return a; }
+  public int Get() => a;
+}
+record R(int X) { public int Y => X; public int Z { get { return X + 1; } } public int W = X; }
+record R2(int X) { public int X { get; init; } = X * 2; public int Get() => X; }
+class NoMember(int q) { public int Q() => q; public Func<int> F() => () => q; }
+class Stat(int s) { public static int s = 77; public static int G() => s; public int H() => s; }
+class Prop(int v) { public int v { get; set; } = v; public int Twice() => v * 2; public int this[int i] { get => v + i; } }
+partial class Part(int p) { int p = p; }
+partial class Part { public int P() => p; }
+class Meth(int m) { public int m() => 5; public int Call() => m(); }
+class Base { protected int bz = 3; }
+class Der(int bz) : Base { public int Get() => bz; public int Init = bz; }
+class Evt(Action act) { public event Action act = act; public void Fire() => act(); }
+class Gen<T>(T t) { T t = t; public T Get() => t; }
+class Sh(int a) { public int Get() { int a = 9; return a; } public int Get2(int a) => a; }
+class P {
+  static void Main() {
+    var c = new Counter(5); c.Inc(); c.Inc(); Console.WriteLine(c.Get()); Console.WriteLine(c.L()()); Console.WriteLine(c.Loc());
+    var s = new SC(1); s.Bump(); Console.WriteLine(s.Bump());
+    var r = new R(4); Console.WriteLine($"{r.Y} {r.Z} {r.W}");
+    var r2 = new R2(4); Console.WriteLine(r2.Get());
+    Console.WriteLine(new NoMember(8).Q() + new NoMember(9).F()());
+    Console.WriteLine(new Stat(1).H() + " " + Stat.G());
+    var p = new Prop(3); p.v = 10; Console.WriteLine(p.Twice() + " " + p[1]);
+    Console.WriteLine(new Part(12).P());
+    Console.WriteLine(new Meth(1).Call());
+    Console.WriteLine(new Der(77).Get() + " " + new Der(77).Init);
+    new Evt(() => Console.WriteLine("fired")).Fire();
+    Console.WriteLine(new Gen<string>("g").Get());
+    Console.WriteLine(new Sh(2).Get() + " " + new Sh(2).Get2(4));
+  }
+}"##,
+        "7
+107
+1000
+3
+4 5 4
+8
+17
+77 77
+20 11
+12
+5
+3 77
+fired
+g
+9 4
+",
+    );
+}
+
+#[test]
+fn an_inherited_member_hides_a_parameter_only_where_it_is_accessible() {
+    check(
+        "pc_member_hides_parameter_inherited",
+        r##"using System;
+class B1 { private int pv = 3; internal int iv = 4; public static int sv = 5; public class Inner {} }
+class D1(int pv, int iv, int sv) : B1 {
+  public int A() => pv;
+  public int B() => iv;
+  public int C() => sv;
+  public Func<int> L() => () => iv + sv + pv;
+  public int Init = iv + sv + pv;
+}
+class G<T> { protected T val = default; }
+class D2(string val) : G<string> {
+  public string V() => val;
+  public string V2 { get { return val; } }
+}
+struct S1(int x, int y) {
+  public int y = y;
+  public int Sum() => x + y;
+  public int Mix() { int x = 50; return x + y; }
+  public override string ToString() => $"{x}/{y}";
+}
+class Outer(int k) {
+  int k = k + 1;
+  public class In { public int Z(Outer o) => o.k; }
+  public int Loc() { int F() => k * 10; return F(); }
+  public int Lam() { Func<int, int> f = k => k + 1; return f(k); }
+  public int LocalFnParam() { int F(int k) => k; return F(7) + k; }
+  public int Prop => k;
+  public int this[int i] { get { return k + i; } set { k = value; } }
+  public void SetK() { this[0] = 100; }
+}
+class Rd(int a, int b) {
+  public int A => a;
+  public int b = b;
+  public int Both() => a + b;
+  public Rd Copy() => new Rd(a, b);
+}
+class P {
+  static void Main() {
+    var d = new D1(10, 20, 30);
+    Console.WriteLine(d.A() + " " + d.B() + " " + d.C() + " " + d.L()() + " " + d.Init);
+    Console.WriteLine(new D2("s").V() + new D2("t").V2 + "|");
+    var s = new S1(1, 2); Console.WriteLine(s.Sum() + " " + s.Mix() + " " + s);
+    var o = new Outer(5); Console.WriteLine(o.Loc() + " " + o.Lam() + " " + o.LocalFnParam() + " " + o.Prop + " " + o[3] + " " + new Outer.In().Z(o));
+    o.SetK(); Console.WriteLine(o.Prop);
+    Console.WriteLine(new Rd(1, 2).Both() + " " + new Rd(3, 4).Copy().A);
+  }
+}"##,
+        "10 4 5 19 60
+|
+3 52 1/2
+60 7 13 6 9 6
+100
+3 3
+",
+    );
+}
+
+/// Overload resolution drops a generic candidate whose inferred type arguments break any of its
+/// constraints, `new()` and `unmanaged` among them: `E<T>(List<T>) where T : new()` beside
+/// `E(IEnumerable<object>)` leaves the second for a `List<string>`. Only `class`, `struct` and the
+/// named constraints were checked, so the generic one was chosen and its call failed verification.
+#[test]
+fn a_generic_method_whose_new_constraint_the_argument_breaks_is_not_a_candidate() {
+    check(
+        "constraint_new_candidates",
+        r##"using System;
+using System.Collections.Generic;
+class P {
+  static string E<T>(List<T> l) where T : new() => "E new";
+  static string E(IEnumerable<object> l) => "E ienum";
+  static string F<T>(T t) where T : new() => "F new";
+  static string F(object o) => "F obj";
+  static void Main() {
+    Console.WriteLine(E(new List<string>()));
+    Console.WriteLine(F("s") + F(3) + F(new List<int>()));
+  }
+}"##,
+        "E ienum
+F objF newF new
+",
+    );
+}
+
+#[test]
+fn a_new_constraint_is_met_by_a_non_abstract_class_with_a_public_parameterless_constructor() {
+    check(
+        "constraint_new_variants",
+        r##"using System;
+using System.Collections.Generic;
+abstract class Abs { }
+class NoCtor { public NoCtor(int x) { } }
+class PrivCtor { private PrivCtor() { } public static PrivCtor Make() => new PrivCtor(); }
+class ProtCtor { protected ProtCtor() { } }
+class IntCtor { internal IntCtor() { } }
+class Opt { public Opt(int x = 0) { } }
+class Pars { public Pars(params int[] x) { } }
+class Fine { }
+class Both { public Both() { } public Both(int x) { } }
+record Rec(int A);
+record Rec0();
+struct St { public int a; }
+struct StCtor { public StCtor() { } }
+enum En { A }
+interface IFoo { }
+delegate void Del();
+class Gen<T> { }
+class P {
+  static string F<T>(T t) where T : new() => "new:" + typeof(T).Name;
+  static string F(object o) => "obj";
+  static string L<T>(List<T> l) where T : new() => "gen";
+  static string L(IEnumerable<object> l) => "enum";
+  static string Out<T>(out T t) where T : new() { t = new T(); return "out"; }
+  static string Wrap<U>(U u) where U : new() => F(u);
+  static string Wrap2<U>(U u) where U : struct => F(u);
+  static string Wrap3<U>(U u) where U : class, new() => F(u);
+  static void Main() {
+    Console.WriteLine(F("s"));
+    Console.WriteLine(F(1));
+    Console.WriteLine(F(new Fine()));
+    Console.WriteLine(F(new NoCtor(1)));
+    Console.WriteLine(F(PrivCtor.Make()));
+    Console.WriteLine(F(new IntCtor()));
+    Console.WriteLine(F(new Opt()));
+    Console.WriteLine(F(new Pars()));
+    Console.WriteLine(F(new Both()));
+    Console.WriteLine(F(new Rec(1)));
+    Console.WriteLine(F(new Rec0()));
+    Console.WriteLine(F(new St()));
+    Console.WriteLine(F(new StCtor()));
+    Console.WriteLine(F(En.A));
+    Console.WriteLine(F((IFoo)null));
+    Console.WriteLine(F((Abs)null));
+    Console.WriteLine(F((Del)null));
+    Console.WriteLine(F(new int[0]));
+    Console.WriteLine(F((int?)3));
+    Console.WriteLine(F((1, 2)));
+    Console.WriteLine(F(new Gen<string>()));
+    Console.WriteLine(F(new List<int>()));
+    Console.WriteLine(F(new object()));
+    Console.WriteLine(F(new Exception()));
+    Console.WriteLine(F(DateTime.Now.Date.GetType()));
+    Console.WriteLine(F((Type)null));
+    Console.WriteLine(L(new List<string>()));
+    Console.WriteLine(L(new List<int>()));
+    Console.WriteLine(L(new List<Fine>()));
+    Console.WriteLine(L(new List<Abs>()));
+    Console.WriteLine(Wrap(1) + Wrap(new Fine()) + Wrap2(5) + Wrap3(new Fine()));
+  }
+}"##,
+        "obj
+new:Int32
+new:Fine
+obj
+obj
+obj
+obj
+obj
+new:Both
+obj
+new:Rec0
+new:St
+new:StCtor
+new:En
+obj
+obj
+obj
+obj
+new:Nullable`1
+new:ValueTuple`2
+new:Gen`1
+new:List`1
+obj
+new:Exception
+obj
+obj
+enum
+gen
+gen
+enum
+new:Int32new:Finenew:Int32new:Fine
+",
+    );
+}
+
+#[test]
+fn a_new_constraint_is_not_met_by_a_string_an_abstract_class_an_interface_or_an_array() {
+    check(
+        "constraint_new_object",
+        r##"using System;
+using System.Collections.Generic;
+abstract class Abs { }
+class NoCtor { public NoCtor(int x) { } }
+struct SP { }
+class P {
+  static string F<T>(T t) where T : new() => "F new";
+  static string F(object o) => "F obj";
+  static void Main() {
+    Console.WriteLine(F("s"));
+    Console.WriteLine(F(3) + F(new List<int>()));
+    Console.WriteLine(F(new NoCtor(1)));
+    Console.WriteLine(F((Abs)null));
+    Console.WriteLine(F(new SP()));
+    Console.WriteLine(F((IDisposable)null));
+    Console.WriteLine(F(new int[0]));
+    Console.WriteLine(F(DateTime.Now));
+    Console.WriteLine(F(new Action(() => { })));
+  }
+}"##,
+        "F obj
+F newF new
+F obj
+F obj
+F new
+F obj
+F obj
+F new
+F obj
+",
+    );
+}
+
+#[test]
+fn an_unmanaged_constraint_is_not_met_by_a_type_that_holds_a_reference() {
+    check(
+        "constraint_unmanaged_candidates",
+        r##"using System;
+struct W<T> { public T x; }
+struct Ref { public string s; }
+struct Pl { public int a; public double b; }
+class P {
+  static string N1<T>(T t) where T : unmanaged => "unmanaged";
+  static string N1(object o) => "obj";
+  static void Main() {
+    Console.WriteLine(N1(new W<int>()));
+    Console.WriteLine(N1(new W<string>()));
+    Console.WriteLine(N1(new Ref()));
+    Console.WriteLine(N1(new Pl()));
+    Console.WriteLine(N1(new W<Ref>()));
+    Console.WriteLine(N1(new W<W<Pl>>()));
+    Console.WriteLine(N1((1, "a")));
+    Console.WriteLine(N1((1, 2.0)));
+  }
+}"##,
+        "unmanaged
+obj
+obj
+unmanaged
+obj
+unmanaged
+obj
+unmanaged
+",
+    );
+}
+
+#[test]
+fn an_unmanaged_constraint_looks_through_fields_properties_events_and_generic_structs() {
+    check(
+        "constraint_unmanaged_variants",
+        r##"using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+enum En : byte { A }
+struct Fx { public int a; public static string s = ""; public const string c = "x"; }
+struct Prop { public string P { get; set; } }
+struct Prop2 { public int P { get; set; } }
+struct Dg { public Action a; }
+struct Ar { public int[] a; }
+struct Ptr { public unsafe int* p; }
+unsafe struct Fb { public fixed int buf[4]; }
+struct Nest<T> { public T v; }
+struct Gn<T, U> { public T t; public U u; }
+struct Nn { public int? x; }
+struct Pair { public Gn<int, long> g; public En e; }
+struct Obj { public object o; }
+class P {
+  static string N<T>(T t) where T : unmanaged => "un";
+  static string N(object o) => "obj";
+  static string NS<T>(T t) where T : struct => "st";
+  static string NS(object o) => "obj";
+  static string Id<U>(U u) where U : unmanaged => N(u);
+  static unsafe void Main() {
+    Console.WriteLine(N(1) + N(1.5) + N('c') + N(true) + N(1m) + N(En.A) + N(DateTime.Now) + N(Guid.Empty) + N(IntPtr.Zero) + N(TimeSpan.Zero));
+    Console.WriteLine(N((int?)1));
+    Console.WriteLine(N(new Fx()));
+    Console.WriteLine(N(new Prop()));
+    Console.WriteLine(N(new Prop2()));
+    Console.WriteLine(N(new Dg()));
+    Console.WriteLine(N(new Ar()));
+    Console.WriteLine(N(new Ptr()));
+    Console.WriteLine(N(new Fb()));
+    Console.WriteLine(N(new Gn<int, long>()));
+    Console.WriteLine(N(new Gn<int, string>()));
+    Console.WriteLine(N(new Gn<Gn<int, int>, Gn<En, double>>()));
+    Console.WriteLine(N(new Gn<Gn<int, int>, Gn<En, object>>()));
+    Console.WriteLine(N(new Nn()));
+    Console.WriteLine(N(new Pair()));
+    Console.WriteLine(N(new Obj()));
+    Console.WriteLine(N(new KeyValuePair<int, int>()));
+    Console.WriteLine(N((1, 2)));
+    Console.WriteLine(N((1, (2, "x"))));
+    Console.WriteLine(N("s"));
+    Console.WriteLine(N(new int[0]));
+    Console.WriteLine(N(new List<int>()));
+    Console.WriteLine(NS(new Obj()) + NS(1) + NS("s"));
+    Console.WriteLine(Id(3));
+    Console.WriteLine(N(new Nest<int>()));
+  }
+}"##,
+        "unununununununununun
+obj
+un
+obj
+un
+obj
+obj
+un
+un
+un
+obj
+un
+obj
+un
+un
+obj
+un
+un
+obj
+obj
+obj
+obj
+ststobj
+un
+un
+",
+    );
+}
+
+/// `"a" + t` where `t`'s type declares `+(Tok, string)` and a conversion to `string`: that `+` does
+/// not take a `string` and a `Tok`, so the predefined concatenation is the candidate, through the
+/// conversion. The operand was left as it was for the type's having a `+` at all, and was joined
+/// through its `ToString`.
+#[test]
+fn a_string_joined_to_a_type_whose_plus_does_not_take_it_is_joined_to_its_conversion() {
+    check(
+        "string_concat_conversion_beside_own_plus",
+        r##"using System;
+struct Tok { public int V; public override string ToString() => "T" + V; public static implicit operator string(Tok t) => "C" + t.V; public static string operator +(Tok a, string b) => "[Tok+str]"; }
+class P {
+  static void Main() {
+    var t = new Tok { V = 1 };
+    Console.WriteLine("a" + t);
+    Console.WriteLine(t + "a");
+    Console.WriteLine("a" + t + "a");
+    Console.WriteLine(t + t);
+  }
+}"##,
+        "aC1
+[Tok+str]
+aC1a
+[Tok+str]
+",
+    );
+}
+
+#[test]
+fn a_concatenation_goes_through_the_conversion_where_the_types_own_plus_does_not_apply() {
+    check(
+        "string_concat_conversion_variants",
+        r##"using System;
+struct Tok { public int V; public override string ToString() => "T" + V; public static implicit operator string(Tok t) => "C" + t.V; public static string operator +(Tok a, string b) => "[Tok+str]"; }
+struct Tok2 { public int V; public override string ToString() => "T" + V; public static implicit operator string(Tok2 t) => "C" + t.V; public static string operator +(string b, Tok2 a) => "[str+Tok2]"; }
+struct Tok3 { public int V; public override string ToString() => "T" + V; public static implicit operator string(Tok3 t) => "C" + t.V; public static string operator +(Tok3 a, Tok3 b) => "[Tok3+Tok3]"; }
+struct Tok4 { public int V; public override string ToString() => "T" + V; public static implicit operator string(Tok4 t) => "C" + t.V; public static implicit operator Tok4(string s) => new Tok4 { V = s.Length }; public static string operator +(Tok4 a, Tok4 b) => "[Tok4+Tok4]"; }
+class C5 { public override string ToString() => "T5"; public static implicit operator string(C5 t) => "C5"; public static string operator +(C5 a, string b) => "[C5+str]"; }
+struct Tok6 { public override string ToString() => "T6"; public static implicit operator string(Tok6 t) => "C6"; public static string operator +(Tok6 a, int b) => "[Tok6+int]"; }
+struct Tok7 { public override string ToString() => "T7"; public static explicit operator string(Tok7 t) => "C7"; public static string operator +(Tok7 a, string b) => "[Tok7+str]"; }
+class P {
+  static void Main() {
+    var t = new Tok { V = 1 };
+    Console.WriteLine("a" + t);
+    Console.WriteLine(t + "a");
+    Console.WriteLine("a" + t + "a");
+    Console.WriteLine(t + t);
+    string s = "x"; s += t; Console.WriteLine(s);
+    s = "y"; s += t + "q"; Console.WriteLine(s);
+    var u = new Tok2 { V = 2 };
+    Console.WriteLine("a" + u); Console.WriteLine(u + "a"); Console.WriteLine("a" + u + "b");
+    s = "x"; s += u; Console.WriteLine(s);
+    var w = new Tok3 { V = 3 };
+    Console.WriteLine("a" + w); Console.WriteLine(w + "a"); Console.WriteLine(w + w);
+    s = "x"; s += w; Console.WriteLine(s);
+    var z = new Tok4 { V = 4 };
+    Console.WriteLine("a" + z); Console.WriteLine(z + "a"); Console.WriteLine(z + z);
+    s = "x"; s += z; Console.WriteLine(s);
+    var c = new C5();
+    Console.WriteLine("a" + c); Console.WriteLine(c + "a"); s = "x"; s += c; Console.WriteLine(s);
+    var k = new Tok6();
+    Console.WriteLine("a" + k); Console.WriteLine(k + "a"); Console.WriteLine(k + 1); s = "x"; s += k; Console.WriteLine(s);
+    var e = new Tok7();
+    Console.WriteLine("a" + e); Console.WriteLine(e + "a");
+    var arr = new[] { "p" }; arr[0] += t; Console.WriteLine(arr[0]);
+  }
+}"##,
+        "aC1
+[Tok+str]
+aC1a
+[Tok+str]
+xC1
+y[Tok+str]
+[str+Tok2]
+C2a
+[str+Tok2]b
+[str+Tok2]
+aC3
+C3a
+[Tok3+Tok3]
+xC3
+[Tok4+Tok4]
+[Tok4+Tok4]
+[Tok4+Tok4]
+[Tok4+Tok4]
+aC5
+[C5+str]
+xC5
+aC6
+C6a
+[Tok6+int]
+xC6
+aT7
+[Tok7+str]
+pC1
+",
+    );
+}
+
+/// `na + a` on a `V?` and a `V`, with blocks that extend `V` and `object` each declaring a `+`: the
+/// lifted form of the `V` operator is a candidate beside the `object` one, and its operands are the
+/// more specific. Only the plain operators were candidates, so the `object` one was called.
+#[test]
+fn a_lifted_extension_operator_beats_the_one_of_object_that_boxing_reaches() {
+    check(
+        "extension_operator_lifted_beats_object",
+        r##"using System;
+struct V { public int X; }
+static class E {
+  extension(V) { public static V operator +(V a, V b) => new V { X = a.X + b.X }; }
+  extension(object) { public static object operator +(object a, object b) => "objadd"; }
+}
+class P {
+  static void Main() {
+    V a = new V { X = 1 }; V? na = a; V? nn = null;
+    Console.WriteLine(a + a);
+    Console.WriteLine((na + a).HasValue);
+    Console.WriteLine((na + nn).HasValue);
+    object o = 1; Console.WriteLine(o + o);
+    Console.WriteLine(1 + 2);
+    Console.WriteLine("s" + 1);
+  }
+}"##,
+        "V
+True
+False
+objadd
+3
+s1
+",
+    );
+}
+
+#[test]
+fn a_lifted_extension_operator_is_a_candidate_for_every_operand_order_and_operator() {
+    check(
+        "extension_operator_lifted_variants",
+        r##"using System;
+struct V { public int X; public override string ToString() => "V" + X; }
+struct W { public int X; public override string ToString() => "W" + X; }
+enum Col { R, G }
+static class E {
+  extension(V) {
+    public static V operator +(V a, V b) => new V { X = a.X + b.X };
+    public static V operator *(V a, int b) => new V { X = a.X * b };
+    public static bool operator <(V a, V b) => a.X < b.X;
+    public static bool operator >(V a, V b) => a.X > b.X;
+    public static V operator -(V a) => new V { X = -a.X };
+  }
+  extension(object) {
+    public static object operator +(object a, object b) => "objadd";
+    public static object operator *(object a, object b) => "objmul";
+    public static bool operator <(object a, object b) => false;
+    public static bool operator >(object a, object b) => false;
+  }
+  extension(W) {
+    public static object operator +(W a, W b) => "W+W obj result";
+  }
+  extension(Col) {
+    public static Col operator |(Col a, Col b) => Col.G;
+  }
+}
+class P {
+  static void Main() {
+    V a = new V { X = 1 }; V? na = a; V? nn = null; object o = 5; V b = new V { X = 10 };
+    Console.WriteLine(na + a);
+    Console.WriteLine(a + na);
+    Console.WriteLine(na + na);
+    Console.WriteLine(na + nn);
+    Console.WriteLine((na + nn).HasValue);
+    Console.WriteLine(na * 3);
+    Console.WriteLine((nn * 3).HasValue);
+    Console.WriteLine(na < b);
+    Console.WriteLine(na > b);
+    Console.WriteLine(nn < b);
+    Console.WriteLine(-na);
+    Console.WriteLine(a + o);
+    Console.WriteLine(o + na);
+    Console.WriteLine(na + o);
+    Console.WriteLine(a + a);
+    W w = new W { X = 2 }; W? nw = w;
+    Console.WriteLine(w + w);
+    Console.WriteLine(nw + w);
+    Console.WriteLine(nw + 1);
+    Console.WriteLine(1 + 2);
+    Console.WriteLine(na + 1);
+    Col? nc = Col.R; Console.WriteLine(nc | Col.G);
+  }
+}"##,
+        "V2
+V2
+V2
+
+False
+V3
+False
+True
+False
+False
+V-1
+objadd
+objadd
+objadd
+V2
+W+W obj result
+objadd
+objadd
+3
+objadd
+G
+",
+    );
+}
+
+/// The language version a file is read as, where none is given, is the newest released one, C# 14:
+/// `union` in a type position is a name, as the real compiler's default reads it. The default was
+/// C# 15, whose unions took `class union { }` for the start of a declaration.
+#[test]
+fn union_is_an_identifier_under_the_default_language_version() {
+    check(
+        "union_identifier_default",
+        r##"using System;
+class union { public int x = 1; public static union operator +(union a, union b) => new union { x = a.x + b.x }; }
+class Q { public int union = 5; public int Union(int union) => union + 1; public static int union2() => 3; }
+class P {
+  static union Make() => new union();
+  static void Main() {
+    var union = new union(); union += new union(); Console.WriteLine(union.x);
+    union u2 = Make(); Console.WriteLine(u2.x);
+    int union3 = 3; Console.WriteLine(union3 + new Q().union + new Q().Union(2) + Q.union2());
+    union[] arr = new union[2]; Console.WriteLine(arr.Length);
+    var l = new System.Collections.Generic.List<union>(); l.Add(u2); Console.WriteLine(l.Count);
+    if (u2 is union uu) Console.WriteLine(uu.x);
+  }
+}"##,
+        "2
+1
+14
+2
+1
+1
+",
+    );
+}
+
+#[test]
+fn union_is_an_identifier_in_every_position_under_the_default_language_version() {
+    check(
+        "union_identifier_positions",
+        r##"using System;
+using System.Collections.Generic;
+namespace union { public class Inner { public static string Name() => "ns"; } }
+class union<T> { public T Value; }
+class P {
+  int uni = 1;
+  static string union(string s) => s;
+  static union<int> Make() => new union<int> { Value = 3 };
+  static List<union<string>> L() => new List<union<string>> { new union<string> { Value = "x" } };
+  static void M(int union) { Console.WriteLine(union); }
+  static void Main() {
+    int union = 5;
+    Console.WriteLine(union);
+    union++;
+    Console.WriteLine(nameof(union));
+    Console.WriteLine(Make().Value + L()[0].Value);
+    M(union);
+    Func<int, int> f = union => union * 2;
+    Console.WriteLine(f(4));
+    Console.WriteLine(union.ToString());
+    union: Console.WriteLine("label");
+    if (union > 100) goto union;
+    var p = new P();
+    Console.WriteLine(p.uni);
+    global::union.Inner.Name();
+    Console.WriteLine(typeof(union<int>).Name);
+    foreach (var union2 in new[] { 1 }) { Console.WriteLine(union2); }
+    var t = (union: 1, other: 2); Console.WriteLine(t.union);
+  }
+}"##,
+        "5
+union
+3x
+6
+8
+6
+label
+1
+union`1
+1
+1
+",
+    );
+}
+
+#[test]
+fn union_is_a_type_name_in_every_type_position_under_the_default_language_version() {
+    check(
+        "union_identifier_types",
+        r##"using System;
+public class union { public override string ToString() => "u"; }
+public struct S { public union union; public union Get() => union; }
+public interface IU { union U { get; } }
+class P : IU {
+  public union U => new union();
+  static union Make() => new union();
+  static T Id<T>(T t) => t;
+  static void Main() {
+    union u = Make(); var l = new System.Collections.Generic.List<union>(); l.Add(u);
+    Console.WriteLine(Id<union>(u) + " " + l.Count + " " + new S { union = u }.Get() + " " + new P().U);
+    union[] arr = { u }; Console.WriteLine(arr.Length);
+    union? n = null; Console.WriteLine(n == null);
+    object o = u; if (o is union uu) Console.WriteLine("is " + uu);
+    var x = (union)o; Console.WriteLine(x);
+    Console.WriteLine(typeof(union).Name + nameof(union));
+    union.Equals(u, u);
+  }
+}"##,
+        "u 1 u u
+1
+True
+is u
+u
+unionunion
+",
+    );
+}
+
+#[test]
+fn the_features_of_csharp_14_are_on_under_the_default_language_version() {
+    check(
+        "default_language_version_csharp14",
+        r##"using System;
+using System.Collections.Generic;
+delegate bool TryP(string s, out int v);
+class Box { public int V; public string Name { get; set => field = value?.Trim(); } = "x"; }
+struct Acc { public int N; public void operator +=(int x) { N += x; } public static Acc operator +(Acc a, int x) => new Acc { N = a.N + x }; }
+static class Ext {
+  extension(string s) { public int Twice => s.Length * 2; public static string Hello => "hello"; }
+  extension(List<int> l) { public int Total() { int t = 0; foreach (var i in l) t += i; return t; } }
+}
+partial class Pc { public partial Pc(int x); public partial event Action E; }
+partial class Pc { int v; public partial Pc(int x) { v = x; } public partial event Action E { add { } remove { } } public int V => v; }
+class P {
+  static void Main() {
+    Box b = new Box(); b.Name = "  hi "; Console.WriteLine("[" + b.Name + "]");
+    Box n = null; n?.V = 5; n?.Name = "z"; Console.WriteLine(n == null);
+    n = new Box(); n?.V = 7; Console.WriteLine(n.V);
+    Acc a = new Acc(); a += 3; Console.WriteLine(a.N);
+    Console.WriteLine("abc".Twice + string.Hello + new List<int> { 1, 2, 3 }.Total());
+    TryP p = (s, out v) => int.TryParse(s, out v); Console.WriteLine(p("12", out var r) + " " + r);
+    Console.WriteLine(nameof(List<>) + new Pc(4).V);
+    ReadOnlySpan<int> sp = new int[] { 1, 2 }; Console.WriteLine(sp.Length);
+    var s = "a"; s ??= "b"; Console.WriteLine(s);
+  }
+}"##,
+        "[hi]
+True
+7
+3
+6hello6
+True 12
+List4
+2
+a
+",
+    );
+}
+
+/// A type with tens of thousands of members, as generated code and large partial classes have.
+/// Finding the declaration of each member walked the class's children from the first, the
+/// duplicate-name check compared each member with every one before it, and each field was asked
+/// whether it was a property's backing field by a search of all the members, so a class of
+/// 20,000 methods took fourteen seconds and one of 40,000 more than a minute. A class four times
+/// as large takes about four times as long; it is timed against one a quarter its size, the best of
+/// two, and given twice the ratio a linear cost has.
+#[test]
+fn a_type_with_many_members_is_compiled_in_time_proportional_to_them() {
+    let Some(bytes) = references() else {
+        println!("note: skipped; no .NET shared framework was found");
+        return;
+    };
+    let members = |count: usize| {
+        let mut source = String::from("using System;\nclass P {\n");
+        for index in 0..count {
+            source.push_str(&format!(
+                "  static int M{index}(int x) => x + {index}; int f{index}; public int P{index} {{ get; set; }}\n"
+            ));
+        }
+        source.push_str("  static void Main() { Console.WriteLine(M5(1)); }\n}\n");
+        source
+    };
+    let time = |source: &str, runs: usize| {
+        (0..runs)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let compilation = compiled("Timing", source, &bytes);
+                rustlyn_emit::emit(&compilation, "Timing").expect("emitted");
+                started.elapsed()
+            })
+            .min()
+            .expect("a run")
+    };
+    let (small, large) = (time(&members(1500), 2), time(&members(6000), 1));
+    assert!(
+        large < small * 8,
+        "1,500 of each took {small:?} and 6,000 took {large:?}, which is more than linear"
+    );
+}
+
+/// Under `preview` a union declaration is read, and `union` before a name is its keyword.
+#[test]
+fn a_union_declaration_is_read_under_the_preview_language_version() {
+    check_with_options(
+        "union_declaration_preview",
+        rustlyn_syntax::LanguageVersion::Preview,
+        rustlyn_semantics::CompilationOptions::default(),
+        r#"using System;
+namespace System.Runtime.CompilerServices {
+  public class UnionAttribute : Attribute {}
+  public interface IUnion { object? Value { get; } }
+}
+public class Cat { }
+public class Dog { }
+public union Pet(Cat, Dog);
+class Program {
+  static void Main() {
+    Pet p = new Cat();
+    Console.WriteLine(p.Value is Cat);
+  }
+}
+"#,
+        "True\n",
     );
 }

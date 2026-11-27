@@ -1583,7 +1583,12 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
     /// for the `field` keyword is the storage of.
     fn property_behind(&self, plan: &TypePlan, field: SymbolId) -> Option<SymbolId> {
         let symbols = self.emitter.compilation.symbols();
-        if symbols.get(field).kind != SymbolKind::Field {
+        // The binder names such a field `<P>k__BackingField`, which no
+        // field the source wrote can be called; asking only of those keeps
+        // a type with thousands of fields from searching its members for
+        // each.
+        if symbols.get(field).kind != SymbolKind::Field || !symbols.get(field).name.starts_with('<')
+        {
             return None;
         }
         symbols

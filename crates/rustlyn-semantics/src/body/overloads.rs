@@ -1574,8 +1574,10 @@ impl BodyBinder<'_> {
     ///
     /// Only what can be decided is decided: an argument that is itself a
     /// type parameter, or a constraint that still mentions one, is taken as
-    /// satisfied, and only `class`, `struct` and the named constraints are
-    /// checked.
+    /// satisfied. `class`, `struct`, `new()`, `unmanaged` and the named
+    /// constraints are checked; before `new()` and `unmanaged` were, a
+    /// generic candidate its inferred `string` could not instantiate beat the
+    /// non-generic one that was the right call.
     pub(super) fn satisfies_constraints(
         &self,
         parameters: &[SymbolId],
@@ -1634,6 +1636,21 @@ impl BodyBinder<'_> {
             if detail.value_type
                 && (argument.is_reference_type(symbols)
                     || self.binder.nullable_underlying(argument).is_some())
+            {
+                return false;
+            }
+            // `new()` and `unmanaged` are not conversions: a `string` or an
+            // abstract class does not have the first, a struct holding a
+            // reference does not have the second. Where the argument cannot
+            // be settled the candidate stays.
+            if detail.constructor
+                && crate::constraints::meets_constructor_constraint(self.binder, argument)
+                    == Some(false)
+            {
+                return false;
+            }
+            if detail.unmanaged
+                && crate::constraints::is_unmanaged_type(self.binder, argument) == Some(false)
             {
                 return false;
             }

@@ -1104,7 +1104,8 @@ impl BodyBinder<'_> {
         let value = if operator == BinaryOperator::Add
             && self.binder.special_of(&stored) == Some(SpecialType::String)
         {
-            self.convert_operand_to_string(value)
+            // The type's own `+` has been asked above, for any place.
+            self.convert_operand_to_string(value, true)
         } else {
             value
         };

@@ -20,7 +20,7 @@ use rustlyn_syntax::{SyntaxKind, SyntaxNode};
 
 use crate::binder::{Binder, Diagnostics};
 use crate::bound::{BoundBody, BoundExpressionKind};
-use crate::symbol::{SymbolId, SymbolKind};
+use crate::symbol::{Accessibility, Modifiers, SymbolId, SymbolKind, TypeKind};
 use crate::types::Type;
 
 /// What the types a file's declarations write, outside any body, get wrong
@@ -522,6 +522,23 @@ fn violation(
             vec![owner.to_string(), name, shown],
         ));
     }
+    // `unmanaged` after `struct`'s own failures, where it says more.
+    if detail.unmanaged
+        && (argument.is_reference_type(symbols)
+            || nullable_value
+            || is_unmanaged_type(binder, argument) == Some(false))
+    {
+        return Some((
+            ErrorCode::ErrUnmanagedConstraintNotSatisfied,
+            vec![owner.to_string(), name, shown],
+        ));
+    }
+    if detail.constructor && meets_constructor_constraint(binder, argument) == Some(false) {
+        return Some((
+            ErrorCode::ErrNewConstraintNotSatisfied,
+            vec![owner.to_string(), name, shown],
+        ));
+    }
     if ref_like || nullable_value {
         return None;
     }
@@ -548,6 +565,149 @@ fn violation(
         return Some((code, vec![owner.to_string(), shown_constraint, name, shown]));
     }
     None
+}
+
+/// Whether a type argument meets a `new()` constraint (§15.2.5): a value
+/// type does, a type parameter that says `new()`, `struct` or `unmanaged`
+/// does, and a class does where it is not abstract and declares a public
+/// parameterless constructor. An interface, a delegate, an array and `string`
+/// do not. `None` where it cannot be settled: an error type, a type
+/// parameter with none of those constraints, `dynamic`.
+pub(crate) fn meets_constructor_constraint(binder: &Binder<'_>, argument: &Type) -> Option<bool> {
+    let symbols = binder.compilation().symbols();
+    match argument {
+        Type::Array { .. } => Some(false),
+        Type::Tuple(_) => Some(true),
+        Type::TypeParameter(parameter) => {
+            let detail = symbols.get(*parameter).as_type_parameter()?;
+            (detail.constructor || detail.value_type || detail.unmanaged).then_some(true)
+        }
+        Type::Named { symbol, .. } => {
+            let named = symbols.get(*symbol);
+            match named.type_kind()? {
+                TypeKind::Struct | TypeKind::RecordStruct | TypeKind::Enum => Some(true),
+                TypeKind::Interface | TypeKind::Delegate => Some(false),
+                TypeKind::Class | TypeKind::Record => {
+                    if named.modifiers.contains(Modifiers::ABSTRACT)
+                        || named.modifiers.contains(Modifiers::STATIC)
+                    {
+                        return Some(false);
+                    }
+                    let constructors = symbols.lookup(*symbol, ".ctor");
+                    // A class always has a constructor: one that is not
+                    // there is one that has not been read.
+                    if constructors.is_empty() {
+                        return None;
+                    }
+                    Some(constructors.iter().any(|constructor| {
+                        let constructor = symbols.get(*constructor);
+                        constructor.accessibility == Accessibility::Public
+                            && !constructor.modifiers.contains(Modifiers::STATIC)
+                            && constructor
+                                .as_method()
+                                .is_some_and(|detail| detail.parameters.is_empty())
+                    }))
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether a type argument meets an `unmanaged` constraint (§8.8): a type
+/// that is never a reference and holds none, at any depth: a primitive, an
+/// enumeration, a pointer, a tuple or a struct, generic or not, whose
+/// instance fields all are. `None` where it cannot be settled: an error
+/// type, a type parameter that is not `unmanaged`, `dynamic`, or a struct
+/// nested deeper than is followed.
+pub(crate) fn is_unmanaged_type(binder: &Binder<'_>, argument: &Type) -> Option<bool> {
+    unmanaged_within(binder, argument, 0)
+}
+
+fn unmanaged_within(binder: &Binder<'_>, ty: &Type, depth: usize) -> Option<bool> {
+    if depth > 24 {
+        return None;
+    }
+    let symbols = binder.compilation().symbols();
+    match ty {
+        Type::Pointer(_) | Type::FunctionPointer(_) => Some(true),
+        Type::Array { .. } | Type::Null | Type::ByRef(_) => Some(false),
+        Type::Tuple(elements) => {
+            let mut all = Some(true);
+            for element in elements {
+                match unmanaged_within(binder, &element.ty, depth + 1) {
+                    Some(false) => return Some(false),
+                    None => all = None,
+                    Some(true) => {}
+                }
+            }
+            all
+        }
+        Type::TypeParameter(parameter) => symbols
+            .get(*parameter)
+            .as_type_parameter()
+            .and_then(|detail| detail.unmanaged.then_some(true)),
+        Type::Named { symbol, .. } => match symbols.get(*symbol).type_kind()? {
+            TypeKind::Enum => Some(true),
+            TypeKind::Struct | TypeKind::RecordStruct => {
+                let substitution = binder.type_substitution(ty);
+                let mut all = Some(true);
+                for member in &symbols.get(*symbol).members {
+                    let field = symbols.get(*member);
+                    if field.modifiers.contains(Modifiers::STATIC)
+                        || field.modifiers.contains(Modifiers::CONST)
+                    {
+                        continue;
+                    }
+                    // What a source struct stores is its fields, the field
+                    // behind each automatic property and the delegate behind
+                    // each field-like event. A struct read from metadata
+                    // shows only the fields that are visible, so what it
+                    // holds is no more than a lower bound.
+                    // The field a primary constructor's parameter is kept in
+                    // (`<p>P`) is declared wherever the name is read, and is
+                    // there only where the parameter is captured: unsettled.
+                    if field.kind == SymbolKind::Field && field.name.starts_with('<') {
+                        all = None;
+                        continue;
+                    }
+                    let stored = match field.kind {
+                        SymbolKind::Field => Some(binder.type_of(*member, &mut Diagnostics::new())),
+                        SymbolKind::Property
+                            if !binder.compilation().is_from_metadata(*member)
+                                && !field.modifiers.contains(Modifiers::ABSTRACT)
+                                && !field.modifiers.contains(Modifiers::EXTERN)
+                                && field.as_property().is_some_and(|detail| !detail.is_indexer)
+                                && binder.is_automatic_property(*member) =>
+                        {
+                            Some(binder.type_of(*member, &mut Diagnostics::new()))
+                        }
+                        SymbolKind::Event if !binder.compilation().is_from_metadata(*member) => {
+                            let explicit = binder
+                                .compilation()
+                                .declaration_node(*member)
+                                .is_some_and(|node| node.kind() == SyntaxKind::EventDeclaration);
+                            if !explicit {
+                                return Some(false);
+                            }
+                            None
+                        }
+                        _ => None,
+                    };
+                    let Some(stored) = stored else { continue };
+                    let field_type = stored.substitute(&substitution);
+                    match unmanaged_within(binder, &field_type, depth + 1) {
+                        Some(false) => return Some(false),
+                        None => all = None,
+                        Some(true) => {}
+                    }
+                }
+                all
+            }
+            _ => Some(false),
+        },
+        _ => None,
+    }
 }
 
 /// How a type reads in a message: `int?` for a `Nullable<int>`.
