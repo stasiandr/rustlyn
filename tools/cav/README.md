@@ -120,6 +120,32 @@ CAV_TESTS=/home/user/cav-more/tests python3 tools/cav/extract_more.py '**/Unions
 CAV_TESTS=/home/user/cav-more/tests RESULTS=/tmp/r OUT=/tmp/o BUILD=target/fast/examples/build tools/cav/run.sh 8
 ```
 
+## Calibration: which failures are real
+
+An `output` or `runtime` failure is not always a bug of ours: the expectation may have been
+written for .NET Framework (an expression tree printed as `ConvertChecked(arg)` rather than
+`ConvertChecked(arg, Int32)`), for Windows or for another culture. `roslyn.sh` is `run.sh` with
+the real `csc` of the SDK beside `DOTNET` (`CSC` names another) in place of `build`: same tests,
+options, libraries, arguments and comparison, results in `$RESULTS`/`$OUT`, and `ONLY=<file>` (also
+understood by `run.sh`) restricts either to the test names in a file, one per line. A test without
+`--langversion` is compiled with `preview`, as the Roslyn tests are; `15`, which this csc does not
+know, becomes `preview`, and a test that fails for want of `/unsafe` is retried with it, since we do
+not insist on it. `--path` is not passed (the names of `file` types differ), and tests with an `.il`
+library fail with `ilasm`, there being none.
+
+```sh
+awk '$2 != "compile" && $2 != "ilasm" { print $1 }' /home/user/cav/results/fail.txt > /tmp/failed.txt
+DOTNET=/opt/dotnet/dotnet ONLY=/tmp/failed.txt RESULTS=/tmp/lr OUT=/tmp/lr/out tools/cav/roslyn.sh 2
+tools/cav/calibrate.sh /home/user/cav/results /tmp/lr   # → /home/user/cav/results/calibrated.txt
+```
+
+`calibrate.sh` writes `<name> <reason> <verdict>` for every failure and prints a summary by class.
+`real`: Roslyn's program prints what the test expects, ours does not. `environment-same` /
+`environment-differs`: Roslyn's program does not print it either, and ours prints the same /
+something else than Roslyn's (so `environment-differs` is worth a look). `environment-nocompile`:
+Roslyn does not compile the test against these assemblies; `skipped`: needs ilasm; `unknown`:
+roslyn.sh did not run it.
+
 ## Target: C# 11 on net8.0
 
 The parity measure is not all extracted tests but those that matter for projects

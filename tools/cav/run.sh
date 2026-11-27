@@ -9,6 +9,7 @@
 # A library whose first line is `// cav-aliases: A,B` is referenced as `extern alias` A and B.
 # A library <name>.ref<k>.il is assembled with ilasm, with the flags its first line
 # `// cav-ilasm: ...` gives.
+# ONLY=<file> restricts the run to the test names (one per line) in that file.
 # Runs under bash 3.2 and BSD tools (macOS) as well as on Linux: `timeout` falls back to perl's alarm.
 # Environment: CAV_HOME (where the rest lives by default: /home/user), CAV, CAV_TESTS (the tests,
 # default $CAV/tests), BUILD (the `build` example binary),
@@ -91,7 +92,7 @@ one() {
   fi
 }
 export -f one args_of limit lines; export CAV CAV_TESTS FW BUILD FWVER TFM RESULTS OUT ILASM DOTNET LANGVERSION
-find $CAV_TESTS -maxdepth 1 -name "${2:-*}.cs" | grep -Ev '\.(ref|part)[0-9]*\.cs$' | xargs -P ${1:-8} -n 1 bash -c 'one "$0"'
+find $CAV_TESTS -maxdepth 1 -name "${2:-*}.cs" | grep -Ev '\.(ref|part)[0-9]*\.cs$' | { if [ -n "$ONLY" ]; then grep -Fxf <(sed "s|^|$CAV_TESTS/|; s|\$|.cs|" $ONLY); else cat; fi; } | xargs -P ${1:-8} -n 1 bash -c 'one "$0"'
 pass=$(awk 'END { print NR }' $RESULTS/pass.txt); fail=$(awk 'END { print NR }' $RESULTS/fail.txt)
 echo "pass: $pass  fail: $fail  ($(( 100 * pass / (pass + fail) ))%)"
 awk '{print $2}' $RESULTS/fail.txt | sort | uniq -c | sort -rn
