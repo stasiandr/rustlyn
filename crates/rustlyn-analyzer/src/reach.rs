@@ -34,6 +34,7 @@ pub mod packages;
 pub mod render;
 
 mod text;
+mod uses;
 
 #[cfg(test)]
 mod tests;
@@ -128,6 +129,8 @@ pub struct Report {
     pub findings: Vec<Finding>,
     /// Changed members of own code that lead to none.
     pub unaffected: usize,
+    /// Changed packages that lead to none.
+    pub unaffected_packages: usize,
     /// Whether a change was judged at all.
     pub judged: bool,
     /// The request's past changes, judged, in its order.
@@ -174,6 +177,8 @@ pub struct Judgement {
     pub findings: Vec<Finding>,
     /// Changed members of own code that lead to no sink.
     pub unaffected: usize,
+    /// Changed packages that lead to no sink.
+    pub unaffected_packages: usize,
 }
 
 impl Judgement {
@@ -222,6 +227,7 @@ pub fn analyze(request: &Request, config: &Config) -> Result<Report, String> {
     let mut hubs: BTreeMap<(String, usize), ListedHub> = BTreeMap::new();
     let mut findings: Vec<Finding> = Vec::new();
     let mut unaffected: BTreeMap<(String, String), bool> = BTreeMap::new();
+    let mut unaffected_packages: BTreeMap<(String, String), bool> = BTreeMap::new();
     let past: Vec<Vec<FileDiff>> = request
         .revisions
         .iter()
@@ -229,6 +235,8 @@ pub fn analyze(request: &Request, config: &Config) -> Result<Report, String> {
         .collect();
     let mut past_findings: Vec<Vec<Finding>> = vec![Vec::new(); past.len()];
     let mut past_unaffected: Vec<BTreeMap<(String, String), bool>> =
+        vec![BTreeMap::new(); past.len()];
+    let mut past_unaffected_packages: Vec<BTreeMap<(String, String), bool>> =
         vec![BTreeMap::new(); past.len()];
     let known = Packages::read(&request.root);
     let package_changes = files.as_deref().map(|files| {
@@ -352,7 +360,7 @@ pub fn analyze(request: &Request, config: &Config) -> Result<Report, String> {
                     findings.push(finding);
                 }
                 for key in judged.unaffected {
-                    unaffected.entry(key).or_insert(true);
+                    unaffected_packages.entry(key).or_insert(true);
                 }
             }
             phases.push(("judge", lap.elapsed().as_millis()));
@@ -380,7 +388,7 @@ pub fn analyze(request: &Request, config: &Config) -> Result<Report, String> {
                 past_findings[index].push(finding);
             }
             for key in judged.unaffected {
-                past_unaffected[index].entry(key).or_insert(true);
+                past_unaffected_packages[index].entry(key).or_insert(true);
             }
         }
         if !request.revisions.is_empty() {
@@ -417,6 +425,7 @@ pub fn analyze(request: &Request, config: &Config) -> Result<Report, String> {
     };
     report.findings = judge::merge(findings);
     report.unaffected = left(&report.findings, &unaffected);
+    report.unaffected_packages = left(&report.findings, &unaffected_packages);
     let scripts: Vec<&Listed> = cone.values().collect();
     for (index, revision) in request.revisions.iter().enumerate() {
         let mut findings = std::mem::take(&mut past_findings[index]);
@@ -436,6 +445,7 @@ pub fn analyze(request: &Request, config: &Config) -> Result<Report, String> {
             id: revision.id.clone(),
             title: revision.title.clone(),
             unaffected: left(&findings, &past_unaffected[index]),
+            unaffected_packages: left(&findings, &past_unaffected_packages[index]),
             findings,
         });
     }

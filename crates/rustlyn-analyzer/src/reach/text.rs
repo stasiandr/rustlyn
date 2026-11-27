@@ -290,12 +290,6 @@ pub(crate) fn writes_through(text: &[u8], start: usize, end: usize, limit: usize
     false
 }
 
-/// The identifiers of a line of code, for looking names up in removed text.
-pub(crate) fn words(line: &str) -> impl Iterator<Item = &str> {
-    line.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .filter(|word| !word.is_empty() && !word.starts_with(|c: char| c.is_ascii_digit()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

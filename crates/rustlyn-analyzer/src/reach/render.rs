@@ -82,7 +82,10 @@ pub fn revision_headline(revision: &Judgement) -> String {
         } else {
             format!(" {}", sinks.join(", "))
         };
-        format!("AFFECTS{to} ({certain} findings)")
+        format!(
+            "AFFECTS{to} ({certain} {})",
+            if certain == 1 { "finding" } else { "findings" }
+        )
     } else if possible > 0 {
         format!("possibly ({possible})")
     } else {
@@ -163,6 +166,31 @@ fn findings_text(out: &mut String, findings: &[Finding], all: usize, possible: b
     }
 }
 
+/// What of a change does not lead to a sink, counted by what it is:
+/// `1 changed member does not lead there`, `2 changed packages do not lead
+/// there`.
+fn not_leading(members: usize, packages: usize) -> String {
+    let count = |n: usize, one: &str, many: &str| {
+        format!("{n} changed {}", if n == 1 { one } else { many })
+    };
+    let (text, plural) = match (members, packages) {
+        (m, 0) => (count(m, "member", "members"), m != 1),
+        (0, p) => (count(p, "package", "packages"), p != 1),
+        (m, p) => (
+            format!(
+                "{} and {}",
+                count(m, "member", "members"),
+                count(p, "package", "packages")
+            ),
+            true,
+        ),
+    };
+    format!(
+        "{text} {} not lead there",
+        if plural { "do" } else { "does" }
+    )
+}
+
 impl Report {
     /// The headline: what the change comes to.
     #[must_use]
@@ -200,8 +228,8 @@ impl Report {
         let possible = self.findings.len() - certain;
         let sinks = sinks_of(&self.findings);
         let rest = format!(
-            "{} possibly, {} changed members do not lead there",
-            possible, self.unaffected
+            "{possible} possibly, {}",
+            not_leading(self.unaffected, self.unaffected_packages)
         );
         if certain == 0 {
             return format!("Reach «{}»: not affected. {rest}.", self.name);
@@ -212,8 +240,9 @@ impl Report {
             format!(" {}", sinks.join(", "))
         };
         format!(
-            "Reach «{}»: AFFECTS{to} — {certain} findings; {rest}.",
-            self.name
+            "Reach «{}»: AFFECTS{to} — {certain} {}; {rest}.",
+            self.name,
+            if certain == 1 { "finding" } else { "findings" }
         )
     }
 
@@ -400,6 +429,10 @@ impl Report {
             ),
             ("unaffected", Json::Int(self.unaffected as i64)),
             (
+                "unaffected_packages",
+                Json::Int(self.unaffected_packages as i64),
+            ),
+            (
                 "configurations",
                 Json::Array(
                     self.summaries
@@ -439,6 +472,10 @@ impl Report {
                                     Json::Array(revision.findings.iter().map(finding).collect()),
                                 ),
                                 ("unaffected", Json::Int(revision.unaffected as i64)),
+                                (
+                                    "unaffected_packages",
+                                    Json::Int(revision.unaffected_packages as i64),
+                                ),
                             ])
                         })
                         .collect(),

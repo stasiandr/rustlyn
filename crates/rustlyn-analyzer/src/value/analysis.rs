@@ -957,16 +957,27 @@ impl Context {
         let units = model.units();
         let offset = model.offset(declaration.line, declaration.character);
         let outline = self.outline(&declaration.path);
+        // A parameter the members capture is a field the compiler names
+        // `<t>P` and places at the start of the type: it is written by the
+        // same callers as the parameter.
+        let short = declaration.short_name();
+        let captured = short
+            .strip_prefix('<')
+            .and_then(|rest| rest.strip_suffix(">P"));
         let owner = outline
             .declarations
             .iter()
             .filter(|d| {
                 d.kind.is_type()
                     && !d.parameters.is_empty()
-                    && parameters(d, units).is_some_and(|list| list.contains(offset))
+                    && if captured.is_some() {
+                        d.full_range.contains(offset)
+                    } else {
+                        parameters(d, units).is_some_and(|list| list.contains(offset))
+                    }
             })
             .min_by_key(|d| d.full_range.length)?;
-        let index = parameter_index(&declaration.short_name(), owner)?;
+        let index = parameter_index(captured.unwrap_or(&short), owner)?;
         Some((owner.clone(), index))
     }
 

@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustlyn_ide::Session;
-use rustlyn_ide::outline::DeclarationKind;
+use rustlyn_ide::outline::{AccessorKind, DeclarationKind};
 use rustlyn_ide::semantic::UseKind;
 use rustlyn_ide::session::{Call, Uses};
 
@@ -127,11 +127,17 @@ impl Impact {
     }
 }
 
+/// An accessor of a property or an indexer and the bytes it spans.
+type Accessor = (AccessorKind, std::ops::Range<usize>);
+
 /// The texts and members of the files asked about so far.
 struct Files<'a> {
     root: &'a str,
     session: &'a Session,
     texts: HashMap<String, Option<(String, Members)>>,
+    /// The accessors of a property or an indexer, by file and where the
+    /// declaration starts.
+    accessors: HashMap<(String, usize), Vec<Accessor>>,
 }
 
 impl Files<'_> {
@@ -145,6 +151,57 @@ impl Files<'_> {
                 Some((text, members))
             })
             .as_ref()
+    }
+
+    /// The accessor of the property or indexer `member` that holds the place
+    /// at `line` and `character` (UTF-16 units) of the file: what runs when
+    /// it is only read, or only assigned. `All` for any other member and for
+    /// a place no single accessor holds.
+    fn accessor_at(
+        &mut self,
+        path: &str,
+        member: &Member,
+        line: usize,
+        character: usize,
+    ) -> Touched {
+        if !matches!(
+            member.kind,
+            DeclarationKind::Property | DeclarationKind::Indexer
+        ) {
+            return Touched::All;
+        }
+        let Some((text, _)) = self.get(path) else {
+            return Touched::All;
+        };
+        let text = text.clone();
+        let accessors = self
+            .accessors
+            .entry((path.to_owned(), member.span.start))
+            .or_insert_with(|| rustlyn_ide::outline::accessors(&text, member.span.clone()));
+        let starts = line_starts(&text);
+        let Some(&start) = starts.get(line) else {
+            return Touched::All;
+        };
+        let end = starts.get(line + 1).copied().unwrap_or(text.len());
+        let mut units = 0;
+        let mut at = end;
+        for (index, c) in text[start..end].char_indices() {
+            if units >= character {
+                at = start + index;
+                break;
+            }
+            units += c.len_utf16();
+        }
+        let hit: Vec<AccessorKind> = accessors
+            .iter()
+            .filter(|(_, span)| span.start <= at && at < span.end)
+            .map(|(kind, _)| *kind)
+            .collect();
+        match hit.as_slice() {
+            [AccessorKind::Get] => Touched::Getter,
+            [AccessorKind::Set | AccessorKind::Init] => Touched::Setter,
+            _ => Touched::All,
+        }
     }
 
     fn absolute(&self, path: &str) -> String {
@@ -205,11 +262,12 @@ pub fn walk_with(
         root,
         session,
         texts,
+        accessors: HashMap::new(),
     };
     let mut impact = Impact::default();
     // Which accessor of a changed property or indexer was changed: only its
     // callers that run that accessor are reached.
-    let touched: HashMap<usize, Touched> = changes
+    let mut touched: HashMap<usize, Touched> = changes
         .iter()
         .enumerate()
         .map(|(index, change)| (index, change.touched))
@@ -219,6 +277,8 @@ pub fn walk_with(
     let mut data: HashSet<usize> = HashSet::new();
     // Nodes the walk reached through a call to a base.
     let mut dispatched: HashSet<usize> = HashSet::new();
+    // Nodes whose callers were asked for.
+    let mut expanded: HashSet<usize> = HashSet::new();
 
     for change in changes {
         let index = impact.nodes.len();
@@ -274,14 +334,15 @@ pub fn walk_with(
             let member = node.member.clone();
             let depth = node.depth + 1;
             let answer = answers.remove(&index).unwrap_or_default();
-            let mut found: Vec<(Member, Edge)> = Vec::new();
+            expanded.insert(index);
+            let mut found: Vec<(Member, Edge, Touched)> = Vec::new();
             if let Some(uses) = answer.uses {
                 let only_reads = node.change.is_none();
-                for (user, edge) in users(&mut files, &member, index, uses) {
+                for (user, edge, accessor) in users(&mut files, &member, index, uses) {
                     if only_reads && edge.relation == Relation::Writes {
                         continue;
                     }
-                    found.push((user, edge));
+                    found.push((user, edge, accessor));
                 }
             }
             // A call through an interface or a base was on the path from the
@@ -297,14 +358,14 @@ pub fn walk_with(
                 found.extend(
                     callers(&mut files, &member, index, calls, accessor)
                         .into_iter()
-                        .filter(|(_, e)| !dispatched_here || e.relation != Relation::CallsBase),
+                        .filter(|(_, e, _)| !dispatched_here || e.relation != Relation::CallsBase),
                 );
             }
             impact.nodes[index].fan_in = impact.nodes[index].fan_in.max(found.len());
             if dispatched_here && found.len() > DISPATCH_HUB {
                 continue;
             }
-            for (user, edge) in found.into_iter().take(limits.fan_out) {
+            for (user, edge, accessor) in found.into_iter().take(limits.fan_out) {
                 let known = impact.index_of(&user.key);
                 let through_base = edge.relation == Relation::CallsBase;
                 match add(&mut impact, user, depth, edge, limits) {
@@ -312,9 +373,25 @@ pub fn walk_with(
                         if dispatched_here || through_base {
                             dispatched.insert(next);
                         }
+                        // A property reached by the code of one accessor
+                        // runs for the callers of that accessor only.
+                        touched.insert(next, accessor);
                         queue.push_back(next);
                     }
-                    Some(_) => {}
+                    Some(next) => {
+                        // Reached by the other accessor too: all of it runs,
+                        // and what was asked of it under one is asked again.
+                        let before = touched.get(&next).copied().unwrap_or(Touched::All);
+                        if impact.nodes[next].change.is_none() && before != accessor {
+                            touched.insert(next, Touched::All);
+                            if before != Touched::All
+                                && expanded.contains(&next)
+                                && !queue.contains(&next)
+                            {
+                                queue.push_back(next);
+                            }
+                        }
+                    }
                     None => impact.truncated = true,
                 }
             }
@@ -474,7 +551,7 @@ fn callers(
     from: usize,
     calls: Vec<Call>,
     touched: Touched,
-) -> Vec<(Member, Edge)> {
+) -> Vec<(Member, Edge, Touched)> {
     let runs = |kind: UseKind| match touched {
         Touched::All => true,
         Touched::Getter => kind != UseKind::Write,
@@ -493,6 +570,7 @@ fn callers(
             continue;
         };
         let line = range.start_line as usize;
+        let character = range.start_character as usize;
         let Some((text, members)) = files.get(&path) else {
             continue;
         };
@@ -502,12 +580,14 @@ fn callers(
             .as_ref()
             .filter(|at| at.path == call.path)
             .and_then(|at| members.named_at(text, at.line as usize, at.character as usize));
-        let Some(caller) = named.or_else(|| members.enclosing(line)) else {
+        let Some(caller) = named.or_else(|| members.enclosing(line)).cloned() else {
             continue;
         };
         if caller.key == member.key {
             continue;
         }
+        // Of a property's accessors, the one the call is in.
+        let accessor = files.accessor_at(&path, &caller, line, character);
         // `x.ToString()` on any object "may" reach an override of
         // `ToString`: noise, not a dependency.
         if call.through_base && UNIVERSAL_MEMBERS.contains(&member.short_name()) {
@@ -519,20 +599,26 @@ fn callers(
             Relation::Calls
         };
         result.push((
-            caller.clone(),
+            caller,
             Edge {
                 from,
                 relation,
                 path,
                 line,
             },
+            accessor,
         ));
     }
     result
 }
 
 /// Who mentions a member, and how: reads, writes or just names it.
-fn users(files: &mut Files<'_>, member: &Member, from: usize, uses: Uses) -> Vec<(Member, Edge)> {
+fn users(
+    files: &mut Files<'_>,
+    member: &Member,
+    from: usize,
+    uses: Uses,
+) -> Vec<(Member, Edge, Touched)> {
     let mut result = Vec::new();
     for location in uses.locations {
         let path = files.relative(&location.path);
@@ -543,7 +629,7 @@ fn users(files: &mut Files<'_>, member: &Member, from: usize, uses: Uses) -> Vec
         let Some((text, members)) = files.get(&path) else {
             continue;
         };
-        let Some(user) = members.enclosing(line) else {
+        let Some(user) = members.enclosing(line).cloned() else {
             continue;
         };
         if user.key == member.key {
@@ -552,6 +638,10 @@ fn users(files: &mut Files<'_>, member: &Member, from: usize, uses: Uses) -> Vec
         let relation = if member.is_type() {
             Relation::Uses
         } else {
+            // `nameof(a.X)` names the member and runs nothing.
+            if names_only(text, line, location.character as usize) {
+                continue;
+            }
             let units: Vec<u16> = text.encode_utf16().collect();
             let offset = utf16_offset_of_line(text, line) + location.character as usize;
             match flow::access(&units, Utf16Range::new(offset, location.length as usize)) {
@@ -559,17 +649,75 @@ fn users(files: &mut Files<'_>, member: &Member, from: usize, uses: Uses) -> Vec
                 Access::Write { .. } => Relation::Writes,
             }
         };
+        // Of a property's accessors, the one the use is in.
+        let accessor = files.accessor_at(&path, &user, line, location.character as usize);
         result.push((
-            user.clone(),
+            user,
             Edge {
                 from,
                 relation,
                 path,
                 line,
             },
+            accessor,
         ));
     }
     result
+}
+
+/// Whether the name at `line` and `character` (UTF-16 units) is in the
+/// argument of a `nameof(…)`: `nameof(x)`, `nameof(a.b.X)`.
+fn names_only(text: &str, line: usize, character: usize) -> bool {
+    let starts = line_starts(text);
+    let Some(&start) = starts.get(line) else {
+        return false;
+    };
+    let end = starts.get(line + 1).copied().unwrap_or(text.len());
+    let mut units = 0;
+    let mut at = None;
+    for (index, c) in text[start..end].char_indices() {
+        if units >= character {
+            at = Some(start + index);
+            break;
+        }
+        units += c.len_utf16();
+    }
+    let Some(mut at) = at else {
+        return false;
+    };
+    let bytes = text.as_bytes();
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
+    let space_back = |mut i: usize| {
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        i
+    };
+    // Back over `a.b.` to the parenthesis.
+    loop {
+        let before = space_back(at);
+        if before > 0 && bytes[before - 1] == b'.' {
+            let name_end = space_back(before - 1);
+            let mut name_start = name_end;
+            while name_start > 0 && ident(bytes[name_start - 1]) {
+                name_start -= 1;
+            }
+            if name_start == name_end {
+                return false;
+            }
+            at = name_start;
+            continue;
+        }
+        if before == 0 || bytes[before - 1] != b'(' {
+            return false;
+        }
+        let word_end = space_back(before - 1);
+        let mut word_start = word_end;
+        while word_start > 0 && ident(bytes[word_start - 1]) {
+            word_start -= 1;
+        }
+        return &text[word_start..word_end] == "nameof";
+    }
 }
 
 /// The project's fields and properties the changed lines write to.

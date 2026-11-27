@@ -15,6 +15,21 @@ use super::diff::split_lines;
 ///
 /// When git cannot be run or refuses.
 pub fn git_patch(root: &str, base: Option<&str>, staged: bool) -> Result<String, String> {
+    git_patch_noted(root, base, staged).map(|(patch, _)| patch)
+}
+
+/// [`git_patch`], with what could not be put into the patch: a source file
+/// that git calls binary is compared here, and one that cannot be read is
+/// named.
+///
+/// # Errors
+///
+/// When git cannot be run or refuses.
+pub fn git_patch_noted(
+    root: &str,
+    base: Option<&str>,
+    staged: bool,
+) -> Result<(String, Vec<String>), String> {
     let mut args = vec!["diff", "--relative", "--no-color", "--no-ext-diff"];
     if staged {
         args.push("--cached");
@@ -29,6 +44,10 @@ pub fn git_patch(root: &str, base: Option<&str>, staged: bool) -> Result<String,
     // is also the name of a file is not taken for a path to compare.
     args.push("--");
     let mut patch = git(root, &args)?;
+    let mut notes = Vec::new();
+    if patch.contains("\nBinary files ") || patch.starts_with("Binary files ") {
+        patch = mend_binary(root, &patch, base, staged, has_head, &mut notes);
+    }
     if !staged {
         let untracked = git(
             root,
@@ -41,7 +60,161 @@ pub fn git_patch(root: &str, base: Option<&str>, staged: bool) -> Result<String,
             patch += &added_file_patch(path, &text);
         }
     }
-    Ok(patch)
+    Ok((patch, notes))
+}
+
+/// The patch with each source file git calls binary compared as text: a
+/// UTF-16 file has NUL bytes in it, and `git diff` prints "Binary files …
+/// differ" for it, with no line to find a member by. Both versions are read
+/// through git and decoded as the compiler decodes them.
+fn mend_binary(
+    root: &str,
+    patch: &str,
+    base: &str,
+    staged: bool,
+    has_head: bool,
+    notes: &mut Vec<String>,
+) -> String {
+    // What the two sides of the patch are: a range says both, a single
+    // revision compares with the index or the working copy.
+    let (old_rev, new_rev) = if let Some((a, b)) = base.split_once("...") {
+        let b = if b.is_empty() { "HEAD" } else { b };
+        let a = if a.is_empty() { "HEAD" } else { a };
+        let merged = git(root, &["merge-base", a, b])
+            .map(|out| out.trim().to_owned())
+            .unwrap_or_else(|_| a.to_owned());
+        (Some(merged), Some(b.to_owned()))
+    } else if let Some((a, b)) = base.split_once("..") {
+        let a = if a.is_empty() { "HEAD" } else { a };
+        let b = if b.is_empty() { "HEAD" } else { b };
+        (Some(a.to_owned()), Some(b.to_owned()))
+    } else {
+        (has_head.then(|| base.to_owned()), None)
+    };
+    let mut out = String::new();
+    let mut section = String::new();
+    let mut flush = |section: &mut String, out: &mut String| {
+        if section.is_empty() {
+            return;
+        }
+        let binary = section
+            .lines()
+            .find_map(|line| line.strip_prefix("Binary files ")?.strip_suffix(" differ"));
+        let mended = binary.and_then(|sides| {
+            let (a, b) = sides.split_once(" and ")?;
+            let path = [b, a]
+                .into_iter()
+                .filter(|side| *side != "/dev/null")
+                .map(|side| {
+                    let side = side.trim_matches('"');
+                    side.strip_prefix("b/")
+                        .or_else(|| side.strip_prefix("a/"))
+                        .unwrap_or(side)
+                })
+                .next()?;
+            if !std::path::Path::new(path)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("cs"))
+            {
+                return None;
+            }
+            let old = if a == "/dev/null" {
+                Ok(String::new())
+            } else {
+                match &old_rev {
+                    Some(rev) => show(root, &format!("{rev}:./{path}")),
+                    None => Ok(String::new()),
+                }
+            };
+            let new = if b == "/dev/null" {
+                Ok(String::new())
+            } else if let Some(rev) = &new_rev {
+                show(root, &format!("{rev}:./{path}"))
+            } else if staged {
+                show(root, &format!(":./{path}"))
+            } else {
+                rustlyn_ide::document::read_source(Path::new(root).join(path))
+                    .map_err(|e| e.to_string())
+            };
+            match (old, new) {
+                (Ok(old), Ok(new)) => Some(text_patch(path, &old, &new, a == "/dev/null", b == "/dev/null")),
+                (Err(error), _) | (_, Err(error)) => {
+                    notes.push(format!(
+                        "{path}: git calls it binary and it could not be read as text ({error}); its change is not analyzed"
+                    ));
+                    None
+                }
+            }
+        });
+        out.push_str(mended.as_deref().unwrap_or(section));
+        section.clear();
+    };
+    for line in patch.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            flush(&mut section, &mut out);
+        }
+        section.push_str(line);
+    }
+    flush(&mut section, &mut out);
+    out
+}
+
+/// A file's text at `object` (`rev:./path`), as the compiler reads a file.
+fn show(root: &str, object: &str) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show", object])
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(rustlyn_ide::document::decode_source(&output.stdout))
+}
+
+/// A unified patch with no lines of context for the change from `old` to
+/// `new`.
+fn text_patch(path: &str, old: &str, new: &str, added: bool, deleted: bool) -> String {
+    let old_lines = split_lines(old);
+    let new_lines = split_lines(new);
+    let mut out = format!("diff --git a/{path} b/{path}\n");
+    out.push_str(&if added {
+        format!("new file mode 100644\n--- /dev/null\n+++ b/{path}\n")
+    } else if deleted {
+        format!("deleted file mode 100644\n--- a/{path}\n+++ /dev/null\n")
+    } else {
+        format!("--- a/{path}\n+++ b/{path}\n")
+    });
+    for change in crate::diff::changes(old, new, crate::diff::MAX_EDITS) {
+        let (old_range, new_range) = (change.old_lines, change.lines);
+        // git counts from the line before for an empty range.
+        let start = |range: &std::ops::Range<usize>| {
+            if range.is_empty() {
+                range.start
+            } else {
+                range.start + 1
+            }
+        };
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            start(&old_range),
+            old_range.len(),
+            start(&new_range),
+            new_range.len()
+        ));
+        for line in old_range {
+            out.push('-');
+            out.push_str(old_lines.get(line).copied().unwrap_or_default());
+            out.push('\n');
+        }
+        for line in new_range {
+            out.push('+');
+            out.push_str(new_lines.get(line).copied().unwrap_or_default());
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// A revision (or a range of them) as git may be handed one: `base` comes
@@ -271,5 +444,122 @@ mod tests {
         assert!(revision("").is_err());
         assert!(revision("-n").is_err());
         assert!(revision("HEAD\n--output=x").is_err());
+    }
+
+    fn utf16(text: &str) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        bytes
+    }
+
+    fn commit(root: &str, message: &str) {
+        let run = |args: &[&str]| git(root, args).expect("git");
+        run(&[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "add",
+            ".",
+        ]);
+        run(&[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            message,
+        ]);
+    }
+
+    const WIDE: &str =
+        "class B {\n    public int M() { return 1; }\n    public int N() { return M(); }\n}\n";
+
+    /// A source file git calls binary (UTF-16 has NUL bytes) is compared as
+    /// text, in the working copy, in the index and between revisions.
+    #[test]
+    fn a_utf_16_source_is_compared_as_text() {
+        let project = Project::new("git-wide", &[("A.cs", "class A { }\n")]);
+        let root = project.root();
+        git(&root, &["init", "-q"]).expect("git");
+        project.write_bytes("W.cs", &utf16(WIDE));
+        commit(&root, "one");
+        let changed = WIDE.replace("return 1;", "return 2;");
+        project.write_bytes("W.cs", &utf16(&changed));
+        let summary = |patch: &str| -> Vec<(String, Vec<usize>)> {
+            parse(patch)
+                .into_iter()
+                .map(|file| (file.path.clone(), file.new_lines()))
+                .collect()
+        };
+        // The working copy.
+        let (patch, notes) = git_patch_noted(&root, None, false).expect("patch");
+        assert_eq!(
+            summary(&patch),
+            vec![("W.cs".to_owned(), vec![1])],
+            "{patch}"
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+        // Staged, and nothing else staged.
+        git(&root, &["add", "W.cs"]).expect("git");
+        let (patch, _) = git_patch_noted(&root, None, true).expect("patch");
+        assert_eq!(
+            summary(&patch),
+            vec![("W.cs".to_owned(), vec![1])],
+            "{patch}"
+        );
+        // Between two revisions.
+        commit(&root, "two");
+        let (patch, _) = git_patch_noted(&root, Some("HEAD~1..HEAD"), false).expect("patch");
+        let files = parse(&patch);
+        assert_eq!(files.len(), 1, "{patch}");
+        assert_eq!(
+            files[0].blocks[0].removed,
+            vec!["    public int M() { return 1; }"]
+        );
+        // A file that is new, and one that is gone.
+        project.write_bytes("V.cs", &utf16("class V { }\n"));
+        std::fs::remove_file(Path::new(&root).join("W.cs")).expect("removed");
+        let (patch, _) = git_patch_noted(&root, None, false).expect("patch");
+        let files = parse(&patch);
+        let status: Vec<(&str, Status)> =
+            files.iter().map(|f| (f.path.as_str(), f.status)).collect();
+        assert_eq!(
+            status,
+            vec![("W.cs", Status::Deleted), ("V.cs", Status::Added)],
+            "{patch}"
+        );
+    }
+
+    /// Text that is not source stays what git says of it.
+    #[test]
+    fn a_binary_file_that_is_not_source_is_left_alone() {
+        let project = Project::new("git-bin", &[("A.cs", "class A { }\n")]);
+        let root = project.root();
+        git(&root, &["init", "-q"]).expect("git");
+        project.write_bytes("data.bin", &[0, 1, 2, 3]);
+        commit(&root, "one");
+        project.write_bytes("data.bin", &[0, 1, 2, 4]);
+        let (patch, notes) = git_patch_noted(&root, None, false).expect("patch");
+        assert!(parse(&patch).is_empty(), "{patch}");
+        assert!(notes.is_empty());
+    }
+
+    /// The patch of two texts says what the lines were and are.
+    #[test]
+    fn a_text_patch_is_read_back_as_the_change() {
+        let old = "a\nb\nc\nd\n";
+        let new = "a\nB\nc\nd\ne\n";
+        let files = parse(&text_patch("X.cs", old, new, false, false));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].new_lines(), vec![1, 4]);
+        assert_eq!(files[0].old_text(new), old);
+        let files = parse(&text_patch("X.cs", "", new, true, false));
+        assert_eq!(files[0].status, Status::Added);
+        assert_eq!(files[0].old_text(new), "");
+        let files = parse(&text_patch("X.cs", old, "", false, true));
+        assert_eq!(files[0].status, Status::Deleted);
+        assert_eq!(files[0].old_text(""), old);
     }
 }

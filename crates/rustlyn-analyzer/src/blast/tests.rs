@@ -3,7 +3,7 @@
 //! that does not run what it names is not. Each case is by construction:
 //! the member named in the comment is the one C# runs there.
 
-use super::changes::{Touched, changes};
+use super::changes::{How, Touched, changes};
 use super::diff::parse;
 use super::testing::{Project, patch};
 use super::walk::{Impact, Limits, Relation, walk};
@@ -498,4 +498,299 @@ fn a_construct_is_a_plain_call() {
         .find(|e| e.from == index)
         .expect("an edge");
     assert_eq!(edge.relation, Relation::Calls);
+}
+
+/// The walk of a change to one file of a project: `old` is what the file
+/// was, `new` what it is on disk.
+fn walked_change(files: &[(&str, &str)], path: &str, old: &str, new: &str, depth: usize) -> Impact {
+    let mut all: Vec<(&str, &str)> = files.to_vec();
+    all.push((path, new));
+    let project = Project::new("changed", &all);
+    let session = project.session();
+    let parsed = parse(&patch(path, old, new));
+    let limits = Limits {
+        depth,
+        nodes: 400,
+        fan_out: 100,
+    };
+    walk(&project.root(), &session, &changes(&parsed[0], new), limits)
+}
+
+/// The members reached from `key` by reading what it writes, by name.
+fn readers_of(impact: &Impact, key: &str) -> Vec<String> {
+    let index = impact.index_of(key).expect("in the walk");
+    let mut found: Vec<String> = impact
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.edges
+                .iter()
+                .any(|e| e.from == index && e.relation == Relation::Reads)
+        })
+        .map(|n| n.member.short_name().to_owned())
+        .collect();
+    found.sort();
+    found
+}
+
+const GENERIC: &str = "class Base {
+  public static implicit operator int(Base b) { return 1; }
+  public static bool operator ==(Base a, Base b) { return true; }
+  public static bool operator !=(Base a, Base b) { return false; }
+  public override bool Equals(object o) { return true; }
+  public override int GetHashCode() { return 1; }
+  public int this[int i] { get { return i; } }
+}
+class Gen<T> where T : Base {
+  public int Conv(T a) { int i = a; return i; }
+  public bool Eq(T a, T b) { return a == b; }
+  public int Idx(T a) { return a[0]; }
+}
+class Loose<T> {
+  public bool Eq(T a, T b) { return false; }
+}
+";
+
+/// A value of a type parameter runs the members of its constraint, and the
+/// body that does so never writes the constraint's name.
+#[test]
+fn a_change_reaches_the_bodies_that_use_it_through_a_constraint() {
+    let new = GENERIC.replace(
+        "return 1; }\n  public static bool",
+        "return 2; }\n  public static bool",
+    );
+    let impact = walked_change(&[], "A.cs", GENERIC, &new, 1);
+    assert_eq!(
+        callers_of(&impact, "Base.implicit operator int(Base)"),
+        vec!["Conv"]
+    );
+    let new = GENERIC.replace(
+        "operator ==(Base a, Base b) { return true; }",
+        "operator ==(Base a, Base b) { return false; }",
+    );
+    let impact = walked_change(&[], "A.cs", GENERIC, &new, 1);
+    assert_eq!(callers_of(&impact, "Base.==(Base, Base)"), vec!["Eq"]);
+    let new = GENERIC.replace("get { return i; }", "get { return i + 1; }");
+    let impact = walked_change(&[], "A.cs", GENERIC, &new, 1);
+    assert_eq!(callers_of(&impact, "Base.this[](int)"), vec!["Idx"]);
+}
+
+const CONDITIONAL: &str = "class Coll {
+  public override string ToString() { return \"C\"; }
+  public override bool Equals(object o) { return false; }
+  public override int GetHashCode() { return 1; }
+}
+class Use {
+  void f1(Coll a) { var s = a.ToString(); }
+  void f2(Coll a) { var s = a?.ToString(); }
+  void f4(Coll a) { var s = a?.Equals(null); }
+  void f5(Coll a) { var s = a?.GetHashCode(); }
+  void f9(Coll a) { var s = object.Equals(a, a); }
+  void g2(object o) { var s = o?.ToString(); }
+}
+";
+
+/// `a?.ToString()` runs the override of the type of `a`.
+#[test]
+fn a_conditional_call_of_an_override_is_a_call() {
+    let new = CONDITIONAL.replace("return \"C\";", "return \"D\";");
+    let impact = walked_change(&[], "A.cs", CONDITIONAL, &new, 1);
+    assert_eq!(callers_of(&impact, "Coll.ToString()"), vec!["f1", "f2"]);
+    let new = CONDITIONAL.replace("return false;", "return true;");
+    let impact = walked_change(&[], "A.cs", CONDITIONAL, &new, 1);
+    assert_eq!(callers_of(&impact, "Coll.Equals(object)"), vec!["f4"]);
+    let new = CONDITIONAL.replace("GetHashCode() { return 1; }", "GetHashCode() { return 2; }");
+    let impact = walked_change(&[], "A.cs", CONDITIONAL, &new, 1);
+    assert_eq!(callers_of(&impact, "Coll.GetHashCode()"), vec!["f5"]);
+}
+
+const ACCESSORS: &str = "class P {
+  int _v;
+  public int Prop {
+    get {
+      return _v;
+    }
+    set {
+      _v = value;
+    }
+  }
+  public int this[int i] {
+    get {
+      return i;
+    }
+    set {
+      _v = i;
+    }
+  }
+}
+class U {
+  int r1(P p) => p.Prop;
+  void w1(P p) { p.Prop = 1; }
+  void rw1(P p) { p.Prop += 1; }
+  int ri(P p) => p[0];
+  void wi(P p) { p[0] = 1; }
+}
+";
+
+/// A field read in a getter makes the callers of the getter affected, not
+/// those that only run the setter.
+#[test]
+fn a_property_that_reads_a_field_in_its_getter_is_read_by_the_getters_callers() {
+    // The indexer's setter writes `_v`; the getter of `Prop` reads it.
+    let new = ACCESSORS.replace("_v = i;", "_v = i + 1;");
+    let impact = walked_change(&[], "A.cs", ACCESSORS, &new, 4);
+    assert_eq!(readers_of(&impact, "P._v"), vec!["Prop"]);
+    assert_eq!(callers_of(&impact, "P.Prop"), vec!["r1", "rw1"]);
+    // The setter of `Prop` writes it, and nothing of the property reads it.
+    let new = ACCESSORS.replace("_v = value;", "_v = value + 1;");
+    let impact = walked_change(&[], "A.cs", ACCESSORS, &new, 4);
+    assert_eq!(callers_of(&impact, "P.Prop"), vec!["rw1", "w1"]);
+    // A change to the getter itself: those that read it.
+    let new = ACCESSORS.replace("return _v;", "return _v + 1;");
+    let impact = walked_change(&[], "A.cs", ACCESSORS, &new, 1);
+    assert_eq!(callers_of(&impact, "P.Prop"), vec!["r1", "rw1"]);
+}
+
+/// A property that reads a field in both accessors is run by every caller.
+#[test]
+fn a_property_that_reads_in_both_accessors_has_every_caller() {
+    let old = ACCESSORS.replace("_v = value;", "_v = value + _v;");
+    let new = old.replace("_v = i;", "_v = i + 1;");
+    let impact = walked_change(&[], "A.cs", &old, &new, 4);
+    assert_eq!(callers_of(&impact, "P.Prop"), vec!["r1", "rw1", "w1"]);
+}
+
+const NAMES: &str = "class A {
+  public int X;
+  public void Set() { X = 1; }
+}
+class U {
+  int r8(A a) { return nameof(a.X).Length; }
+  const string K = nameof(A.X);
+  int r(A a) { return a.X; }
+  string s(A a) { return nameof ( a.X ); }
+}
+";
+
+/// `nameof` names a field and reads nothing.
+#[test]
+fn nameof_is_not_a_read() {
+    let new = NAMES.replace("X = 1;", "X = 2;");
+    let impact = walked_change(&[], "A.cs", NAMES, &new, 2);
+    assert_eq!(readers_of(&impact, "A.X"), vec!["r"]);
+}
+
+const TWINS: &str = "interface IShape { double Area(); }
+class Square : IShape {
+  double IShape.Area() => 3;
+  public double Area() => 4;
+}
+class Use {
+  void u4(Square s) { s.Area(); }
+  void u5(IShape s) { s.Area(); }
+}
+";
+
+/// Members of a type with one name are two members, whichever is written
+/// first: the change is to the one whose lines it is on.
+#[test]
+fn an_explicit_implementation_and_a_public_member_of_one_name_are_apart() {
+    let new = TWINS.replace("=> 4;", "=> 44;");
+    let impact = walked_change(&[], "A.cs", TWINS, &new, 1);
+    let changed: Vec<(&str, Option<How>)> = impact
+        .nodes
+        .iter()
+        .filter(|n| n.change.is_some())
+        .map(|n| (n.member.key.as_str(), n.change))
+        .collect();
+    assert_eq!(changed, vec![("Square.Area()", Some(How::Body))]);
+    assert_eq!(callers_of(&impact, "Square.Area()"), vec!["u4"]);
+    let new = TWINS.replace("=> 3;", "=> 33;");
+    let impact = walked_change(&[], "A.cs", TWINS, &new, 1);
+    assert_eq!(callers_of(&impact, "Square.IShape.Area()"), vec!["u5"]);
+    assert!(impact.index_of("Square.Area()").is_none());
+}
+
+const ONE_LINE: &str = "class C { public int A() { return 1; } public int B() { return 2; } public int P { get; set; } }\n";
+
+fn changed_keys(old: &str, new: &str) -> Vec<(String, How)> {
+    let files = parse(&patch("A.cs", old, new));
+    changes(&files[0], new)
+        .into_iter()
+        .map(|change| (change.member.key, change.how))
+        .collect()
+}
+
+/// A change on a line that holds several members is to the member the bytes
+/// are in; where the bytes cannot say, to each of the members on the line,
+/// and not to the type around them.
+#[test]
+fn a_change_on_a_line_of_several_members_is_to_the_member_it_is_in() {
+    let new = ONE_LINE.replace("{ get; set; } }", "{ get; set; } = 3; }");
+    assert_eq!(
+        changed_keys(ONE_LINE, &new),
+        vec![("C.P".to_owned(), How::Body)]
+    );
+    let new = ONE_LINE.replace("return 2;", "return 3;");
+    assert_eq!(
+        changed_keys(ONE_LINE, &new),
+        vec![("C.B()".to_owned(), How::Body)]
+    );
+    let new = ONE_LINE.replace("return 1;", "return 4;");
+    assert_eq!(
+        changed_keys(ONE_LINE, &new),
+        vec![("C.A()".to_owned(), How::Body)]
+    );
+    // A comment after the members is to each of them, not to the type.
+    let new = ONE_LINE.replace(" }\n", " } // x\n");
+    let keys: Vec<String> = changed_keys(ONE_LINE, &new)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert!(!keys.contains(&"C".to_owned()), "{keys:?}");
+}
+
+/// A property with an initializer on one line is the same member as on
+/// several: its callers are reached.
+#[test]
+fn an_initializer_added_on_a_line_of_members_reaches_the_properties_callers() {
+    let user = "class U { int up(C c) { return c.P; } int ua(C c) { return c.A(); } }\n";
+    let new = ONE_LINE.replace("{ get; set; } }", "{ get; set; } = 3; }");
+    let impact = walked_change(&[("U.cs", user)], "A.cs", ONE_LINE, &new, 1);
+    assert_eq!(callers_of(&impact, "C.P"), vec!["up"]);
+    assert!(impact.index_of("C.A()").is_none());
+}
+
+const FORWARDING: &str = "using System.Collections;
+interface IShape { double Area(); }
+class Sq : IShape, IEnumerable {
+  public double Area() => 4;
+  double IShape.Area() => Area();
+  public IEnumerator GetEnumerator() => null;
+  IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+}
+class Use {
+  void a(IShape s) { s.Area(); }
+  void b(IEnumerable e) { e.GetEnumerator(); }
+}
+";
+
+/// An explicit implementation that forwards to the member that changed is a
+/// caller of it, and what calls it through its interface may run it.
+#[test]
+fn a_forwarding_explicit_implementation_is_a_caller_and_is_called_through_its_interface() {
+    let new = FORWARDING.replace("Area() => 4;", "Area() => 44;");
+    let impact = walked_change(&[], "A.cs", FORWARDING, &new, 3);
+    assert_eq!(callers_of(&impact, "Sq.Area()"), vec!["Area"]);
+    assert_eq!(callers_of(&impact, "Sq.IShape.Area()"), vec!["a"]);
+    let new = FORWARDING.replace("GetEnumerator() => null;", "GetEnumerator() => null; // x");
+    let impact = walked_change(&[], "A.cs", FORWARDING, &new, 3);
+    assert_eq!(
+        callers_of(&impact, "Sq.GetEnumerator()"),
+        vec!["GetEnumerator"]
+    );
+    assert_eq!(
+        callers_of(&impact, "Sq.IEnumerable.GetEnumerator()"),
+        vec!["b"]
+    );
 }

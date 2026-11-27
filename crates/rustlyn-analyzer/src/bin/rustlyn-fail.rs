@@ -14,6 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use rustlyn_analyzer::blast::{project, setup};
+use rustlyn_analyzer::cli;
 use rustlyn_analyzer::fail::{English, Lines, Wording, offsets, report, split_target};
 
 const USAGE: &str = "rustlyn-fail ROOT File.cs[:line[:column]] [--all] [--no-cache]
@@ -25,7 +26,7 @@ can happen given the values of its inputs across the project.";
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("{USAGE}");
+        cli::say(USAGE);
         return;
     }
     let all = args.iter().any(|a| a == "--all");
@@ -78,15 +79,15 @@ fn main() {
                     continue;
                 }
                 if shown > 0 {
-                    println!();
+                    cli::say("");
                 }
-                print!("{}", report(&found, &root, &mut lines, &wording));
+                cli::say_raw(&report(&found, &root, &mut lines, &wording));
                 shown += 1;
             }
             Err(refusal) => eprintln!("rustlyn-fail: no answer: {refusal}"),
         }
     }
     if shown == 0 && line.is_none() {
-        println!("{}", wording.nothing_in_file());
+        cli::say(&wording.nothing_in_file());
     }
 }

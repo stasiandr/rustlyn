@@ -37,6 +37,7 @@
 //! requests are built and answers interpreted, and the caller sends them.
 
 pub mod blast;
+pub mod cli;
 pub mod deep;
 pub mod diff;
 pub mod fail;

@@ -77,11 +77,19 @@ Without `--diff` it diffs the git working copy against `--base` (default `HEAD`)
 The exit code is 0 when there are no high risks, 3 when there are, and 2 on an
 error: a ROOT that is not a folder, a `--diff` file that cannot be read or has
 no line of a diff in it, a failing `git`. An empty diff is not an error; it is a
-change with no members. `--json` prints a report for agents. `--mcp` runs the
+change with no members. A source file that `git diff` calls binary (a UTF-16
+file has NUL bytes) is compared as text all the same: both versions are read
+through git and decoded as the compiler decodes them, for the working copy,
+`--staged` and a revision range. One that cannot be read that way is named in a
+`note:` line of the report (`notes` in the JSON, when there are any), so that a change that was not
+looked at is not taken for one with no effect. A closed pipe (`… | head`) ends
+the tool quietly; so it does the three others. `--json` prints a report for agents. `--mcp` runs the
 same analysis as a Model Context Protocol server over stdio: a `root` that is
 not a folder and a `diff` that is not a diff are an error result (`isError`),
 and a JSON-RPC batch (an array of requests) is answered with an array of
-answers, as JSON-RPC 2.0 has it.
+answers, as JSON-RPC 2.0 has it. An argument of another type than the tool's
+(`depth: "x"`, `staged: "yes"`) and a `format` other than `json` or `text` are
+an error result naming the argument, not a call with the default.
 
 Sources are read as the compiler reads them: UTF-8, UTF-16 with a byte-order
 mark, and — as `csc` does — any other bytes as Latin-1; a patch is read by line
@@ -114,6 +122,9 @@ writes the member's name:
   attribute (the constructor it binds and the properties it sets by name; the
   member it is on is the caller);
 * an indexer used as `m[i]`, its getter by a read, its setter by an assignment;
+* a member of the type a value is constrained to: on a `T` with `where T :
+  Base` (or an interface, or a parameter that is itself constrained that way)
+  the conversion, `==` or indexer of `Base` runs where the body writes `T`;
 * operators: binary, unary, compound assignment, `++` and `--`, `true` and
   `false` (`if (m)`, `a && b`), implicit and explicit conversions, wherever a
   value of the one type is taken as the other (assigned, passed, cast);
@@ -128,8 +139,11 @@ writes the member's name:
   `Console.WriteLine`, `string.Format`, `StringBuilder.Append` or `Debug.Log`.
   A value typed `object` or as an interface shows nothing, and is not a caller.
 
+`m?.ToString()`, `m?.Equals(x)` and `m?.GetHashCode()` run the override of the
+type of `m`, as `m.ToString()` does.
+
 A name that is not a run is not a caller: `nameof(m.F)`, `typeof(T)` and a
-documentation `cref`. Another type's member of the same name is another
+documentation `cref`; a field named only in `nameof` is not read there. Another type's member of the same name is another
 member, and so is the overload the compiler did not bind. A call by name
 through an interface or a base member is listed as `calls_base`, as before. A
 construct that runs a base class's member on a value of the changed member's
@@ -142,9 +156,21 @@ enumerator).
 A property's getter and setter are different code. When the changed lines are
 all in the getter, the callers are the code that reads the property; when all
 in the setter (or `init`), the code that assigns it; `p.P += 1` does both. A
-change outside the accessors, or in both, reaches all of them. Two members
-written on one line are told apart by where the change is on the line, and a
-caller is the member the compiler names, not the innermost one on its line.
+change outside the accessors, or in both, reaches all of them. The same holds
+for what a property reads: a field read only in its getter makes the callers
+of the getter affected, not those that only assign the property (and the other
+way round); a property that reads it in both accessors has every caller. Two
+members written on one line are told apart by where the change is on the line
+(by the bytes the old and the new text of the line differ in), and a caller is
+the member the compiler names, not the innermost one on its line. Where the
+bytes cannot tell — the line was not replaced by one, or the change spans two
+members — every member written on the line that the change touches is
+changed, not the type around them. An explicit implementation
+(`double IShape.Area()`) and a public member of the same name (`public double
+Area()`) are two members, whichever is written first; the key of the first
+has the interface in it (`Square.IShape.Area()`). An explicit implementation
+that forwards to the member that changed is a caller of it, and what calls it
+through its interface is listed as `calls_base`: it may run it.
 
 A change in code the build leaves out — an `#if` that is off for the project —
 is not in the compiler's view. It is not dropped: the member is named from the
@@ -258,7 +284,7 @@ A changed member of the cone is a finding for certain when the change is on
 the lines that matter, and a possible one (`--possible`) otherwise:
 
 ```
-Reach «ads»: AFFECTS Ads — 1 findings; 0 possibly, 3 changed members do not lead there.
+Reach «ads»: AFFECTS Ads — 1 finding; 0 possibly, 3 changed members do not lead there.
 ✎ Game.ConsentSystem.SetStatus(bool) [path]  Assets/Game/Consent.cs:17
    → writes Game.TrackingStatus  Assets/Game/Consent.cs:18
    → read by Game.TrackingSystem.OnUpdate()  Assets/Game/Consent.cs:28
@@ -266,7 +292,19 @@ Reach «ads»: AFFECTS Ads — 1 findings; 0 possibly, 3 changed members do not 
 ```
 
 Removed lines are read as text: a call that is gone is not in the new code to
-be found, so a removed line that names a sink's type is reported by the name.
+be found, so a removed line that names a sink's type is reported by the name,
+and one that runs a member of the cone — a call `Name(…)`, `new Name(…)` or
+`new Name { … }` (or a target-typed `new(…)` whose declaration gives the type),
+a property or field read or set, a method group, an object initializer, an
+attribute, `: base(…)` and `: this(…)` — by the member. A removed line that
+only mentions a type (`o is Gate`, `o as Gate`, a cast, a declaration, a
+generic argument, `typeof`, `nameof`, a base list), or has the name in a string
+or a comment, runs nothing and names nothing. A name counts when every member
+it may be is in the cone — of its kind, taking that many arguments — so that
+`Launch()` of one type with another type's `Launch()` outside the cone is not
+named. The old text's lines are read by their syntax, without binding them: it
+is a decision by the shape of the text, and `Gate g = Make();` where `Make`
+returns something else is not told apart from any other declaration.
 A changed scene, prefab or asset is reported when the change is in the
 serialized data of a script whose fields the cone reads.
 
@@ -285,7 +323,9 @@ concerns a sink (a `package` finding, certain) when
    matter (`used_by`, the member closest to a sink, then its way on; the
    finding says how many members use it).
 
-Any other package is not affected and counts under `unaffected`. A package
+Any other package is not affected and counts under `unaffected_packages` (the
+headline counts members and packages apart: `1 changed member and 2 changed
+packages do not lead there`). A package
 owns the files of its folder: `Library/PackageCache/<name>@…/`, and the folder
 of a lock entry that is `embedded` (`file:<folder>`) or `local` (`file:<path
 relative to Packages>`). A manifest or a lock that is not JSON, before or after,
@@ -337,7 +377,8 @@ that is another name for it (`ref int r = ref T; r = 5;`), the callers of a
 `ref`-returning member (`Slot() = 5`), `Interlocked.Exchange`/`CompareExchange`/
 `Add`/`And`/`Or` and `Volatile.Write`, the arguments of the callers of the
 primary constructor whose parameter a member is initialized from (`class
-C(int t) { public int T = t; }`), the same for a record's positional parameter
+C(int t) { public int T = t; }`, also where another member uses `t` and the
+compiler keeps it as a field of its own, `<t>P`), the same for a record's positional parameter
 (`record R(int V)` with `new R(4)`), and the assignments an indexer's setter is
 reached by (`this[0] = 5` for a `set { T = value; }`).
 

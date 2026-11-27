@@ -534,3 +534,170 @@ fn a_use_of_a_base_member_on_another_type_is_not_a_use_of_the_member() {
         .collect();
     assert_eq!(from, Vec::<(String, bool)>::new());
 }
+
+const CONSTRAINED: &str = r#"public interface IShape { int Size(); int this[int i] { get; } }
+public class Base
+{
+    public static Base operator +(Base a, Base b) { return a; }
+    public static implicit operator int(Base b) { return 1; }
+    public static bool operator ==(Base a, Base b) { return true; }
+    public static bool operator !=(Base a, Base b) { return false; }
+    public override bool Equals(object o) { return true; }
+    public override int GetHashCode() { return 1; }
+    public int this[int i] { get { return i; } }
+}
+public class Child : Base { }
+public class Alien { public static implicit operator int(Alien a) { return 2; } }
+public class Gen<T> where T : Base
+{
+    public int Conv(T a) { int i = a; return i; }
+    public bool Eq(T a, T b) { return a == b; }
+    public int Idx(T a) { return a[0]; }
+}
+public class Chain<T, U> where U : T where T : Base
+{
+    public bool Eq(U a, U b) { return a == b; }
+    public int Idx(U a) { return a[0]; }
+}
+public class Loose<T>
+{
+    public int Conv(T a) { return 0; }
+    public bool Eq(T a, T b) { return false; }
+}
+public class OfAlien<T> where T : Alien
+{
+    public int Conv(T a) { int i = a; return i; }
+}
+public class Method
+{
+    public int Conv<T>(T a) where T : Child { int i = a; return i; }
+}
+public class Via<T> where T : IShape
+{
+    public int Idx(T a) { return a[0]; }
+}
+"#;
+
+fn constrained_callers(marker: &str) -> Vec<String> {
+    let Some(semantic) = compile(&[("C.cs", CONSTRAINED)], true) else {
+        return Vec::new();
+    };
+    let path = Path::new("/p/C.cs");
+    let symbol = semantic
+        .call_hierarchy_item(path, at(CONSTRAINED, marker, 0), None)
+        .expect("the member")
+        .symbol;
+    let mut from: Vec<String> = semantic
+        .incoming_calls(symbol)
+        .iter()
+        .map(|call| format!("{}.{}", call.from.container, call.from.name))
+        .collect();
+    from.sort();
+    from
+}
+
+/// A value of a type parameter has the members of what it is constrained to:
+/// its conversion, `==` and indexer run where the body writes `T`, which
+/// never names `Base`. A parameter constrained through another is one too;
+/// a parameter with no such constraint, or another one, is not.
+#[test]
+fn a_member_reached_through_a_constraint_is_run_by_the_body() {
+    assert_eq!(
+        constrained_callers("operator int(Base b)"),
+        vec!["Gen`1.Conv", "Method.Conv"]
+    );
+    assert_eq!(
+        constrained_callers("==(Base a, Base b)"),
+        vec!["Chain`2.Eq", "Gen`1.Eq"]
+    );
+    assert_eq!(
+        constrained_callers("this[int i] { get { return i; } }"),
+        vec!["Chain`2.Idx", "Gen`1.Idx"]
+    );
+    // Another class's conversion is for the parameter constrained to it.
+    assert_eq!(
+        constrained_callers("operator int(Alien a)"),
+        vec!["OfAlien`1.Conv"]
+    );
+}
+
+/// What a constraint to an interface runs is the interface's member.
+#[test]
+fn an_interface_constraint_runs_the_interfaces_indexer() {
+    assert_eq!(
+        constrained_callers("this[int i] { get; }"),
+        vec!["Via`1.Idx"]
+    );
+}
+
+const CONDITIONAL: &str = r#"public class Coll
+{
+    public override string ToString() { return "C"; }
+    public override bool Equals(object o) { return false; }
+    public override int GetHashCode() { return 1; }
+    public string Foo() { return "f"; }
+}
+public class Other
+{
+    public override string ToString() { return "O"; }
+}
+public class Use
+{
+    void f1(Coll a) { var s = a.ToString(); }
+    void f2(Coll a) { var s = a?.ToString(); }
+    void f3(Coll a) { var s = a?.Foo(); }
+    void f4(Coll a) { var s = a?.Equals(null); }
+    void f5(Coll a) { var s = a?.GetHashCode(); }
+    void f6(Coll a) { var s = a?.ToString().Length; }
+    void f7(Coll a) { var s = a.GetHashCode(); }
+    void f8(Coll a) { var s = a.Equals(a); }
+    void f9(Coll a) { var s = object.Equals(a, a); }
+    void g1(Other o) { var s = o?.ToString(); }
+    void g2(object o) { var s = o?.ToString(); }
+    void g3(Coll a, Other o) { var s = a?.Foo() + o?.ToString(); }
+}
+"#;
+
+fn conditional_callers(marker: &str) -> Vec<String> {
+    let Some(semantic) = compile(&[("C.cs", CONDITIONAL)], true) else {
+        return Vec::new();
+    };
+    let path = Path::new("/p/C.cs");
+    let symbol = semantic
+        .call_hierarchy_item(path, at(CONDITIONAL, marker, 0), None)
+        .expect("the member")
+        .symbol;
+    let mut from: Vec<String> = semantic
+        .incoming_calls(symbol)
+        .iter()
+        .filter(|call| !call.through_base)
+        .map(|call| call.from.name.clone())
+        .collect();
+    from.sort();
+    from
+}
+
+/// `a?.M()` runs the member of the type of `a`, as `a.M()` does: an
+/// override of `ToString`, `Equals` or `GetHashCode` among them, which the
+/// binder records as the member of `object` on a conditional access. Another
+/// type's override, and an `object`'s, are not run.
+#[test]
+fn a_conditional_access_runs_the_members_of_the_receiver() {
+    assert_eq!(
+        conditional_callers("ToString() { return \"C\"; }"),
+        vec!["f1", "f2", "f6"]
+    );
+    assert_eq!(
+        conditional_callers("Equals(object o) { return false; }"),
+        vec!["f4", "f8"]
+    );
+    assert_eq!(
+        conditional_callers("GetHashCode() { return 1; }"),
+        vec!["f5", "f7"]
+    );
+    assert_eq!(conditional_callers("Foo() {"), vec!["f3", "g3"]);
+    assert_eq!(
+        conditional_callers("ToString() { return \"O\"; }"),
+        vec!["g1", "g3"]
+    );
+}

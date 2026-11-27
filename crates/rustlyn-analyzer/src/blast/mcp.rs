@@ -37,6 +37,12 @@ pub trait Host {
         Vec::new()
     }
 
+    /// The values `format` may have; a host that renders the report in
+    /// other ways names them here.
+    fn formats(&self) -> Vec<&'static str> {
+        vec!["json", "text"]
+    }
+
     /// The host's steps for one call.
     fn steps(&self, _root: &str, _arguments: &Json) -> Vec<Box<dyn BlastStep>> {
         Vec::new()
@@ -195,18 +201,60 @@ impl Server {
         })
     }
 
+    /// An argument of a type the tool does not take, or a `format` it does
+    /// not know, is refused: a call that asks for something else than it
+    /// gets is not answered as if it had asked for the default.
+    fn check(&self, arguments: &Json) -> Result<(), String> {
+        let mut known: Vec<(&str, &str)> = vec![
+            ("root", "string"),
+            ("diff", "string"),
+            ("base", "string"),
+            ("staged", "boolean"),
+            ("depth", "integer"),
+            ("format", "string"),
+        ];
+        known.extend(self.host.arguments().into_iter().map(|(n, k, _)| (n, k)));
+        for (name, kind) in known {
+            let Some(value) = arguments.get(name) else {
+                continue;
+            };
+            let fits = match kind {
+                "string" => matches!(value, Json::String(_)),
+                "boolean" => matches!(value, Json::Bool(_)),
+                "integer" => value.as_int().is_some(),
+                "number" => matches!(value, Json::Int(_) | Json::Float(_)),
+                _ => true,
+            };
+            if !fits && !matches!(value, Json::Null) {
+                let article = if kind.starts_with('i') { "an" } else { "a" };
+                return Err(format!("{name} must be {article} {kind}"));
+            }
+        }
+        if let Some(format) = arguments.str("format") {
+            let formats = self.host.formats();
+            if !formats.contains(&format) {
+                return Err(format!(
+                    "format must be {}, not {format:?}",
+                    formats.join(" or ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn blast(&mut self, arguments: &Json) -> Result<String, String> {
+        self.check(arguments)?;
         let root = arguments
             .str("root")
             .ok_or("root is required: the project root")?;
         let root = setup::canonical_root(root);
         setup::existing_root(&root)?;
-        let patch = match arguments.str("diff") {
+        let (patch, notes) = match arguments.str("diff") {
             Some(diff) => {
                 setup::valid_patch(diff)?;
-                diff.to_owned()
+                (diff.to_owned(), Vec::new())
             }
-            None => setup::git_patch(
+            None => setup::git_patch_noted(
                 &root,
                 arguments.str("base"),
                 arguments.bool("staged").unwrap_or(false),
@@ -218,6 +266,7 @@ impl Server {
         }
         let mut request = Request::new(root.clone(), patch);
         request.limits = limits;
+        request.notes = notes;
         let session = match self.sessions.remove(&root) {
             Some(session) => project::recompile(&root, session)?,
             None => project::compiled(&root, setup::cache_dir(self.host.cache_tool(), &root))?,
@@ -474,5 +523,76 @@ mod tests {
         let (failed, text) = ask(&mut server, &project.root(), "this is not a diff\n");
         assert!(failed, "{text}");
         assert!(text.contains("not a unified diff"), "{text}");
+    }
+
+    fn call_with(server: &mut Server, arguments: Json) -> Json {
+        let call = object(vec![
+            ("jsonrpc", Json::String("2.0".into())),
+            ("id", Json::Int(9)),
+            ("method", Json::String("tools/call".into())),
+            (
+                "params",
+                object(vec![
+                    ("name", Json::String(TOOL.into())),
+                    ("arguments", arguments),
+                ]),
+            ),
+        ]);
+        server.handle(&call.to_text()).expect("reply")
+    }
+
+    /// An argument of the wrong type, or a `format` the tool does not have,
+    /// is an error result that names it: not a call with the default.
+    #[test]
+    fn a_wrong_argument_is_an_error_naming_it() {
+        let mut server = Server::default();
+        let project = Project::new("mcp-args", &[("A.cs", "class A { }\n")]);
+        let mut bad = |extra: (&str, Json)| {
+            let reply = call_with(
+                &mut server,
+                object(vec![("root", Json::String(project.root())), extra]),
+            );
+            let result = reply.object("result").expect("result").clone();
+            let text = result.objects("content").expect("content")[0]
+                .str("text")
+                .expect("text")
+                .to_owned();
+            (result.bool("isError"), text)
+        };
+        for (extra, name) in [
+            (("depth", Json::String("x".into())), "depth"),
+            (("depth", Json::Bool(true)), "depth"),
+            (("depth", Json::Float(1.5)), "depth"),
+            (("format", Json::String("xml".into())), "format"),
+            (("format", Json::Int(3)), "format"),
+            (("staged", Json::String("yes".into())), "staged"),
+            (("base", Json::Int(1)), "base"),
+            (("diff", Json::Bool(false)), "diff"),
+        ] {
+            let (is_error, text) = bad(extra);
+            assert_eq!(is_error, Some(true), "{name}: {text}");
+            assert!(text.starts_with(name), "{name}: {text}");
+        }
+        // What is right is not refused: the tool's own types, and `null`.
+        let diff = patch("A.cs", "class A { }\n", "class A { int x; }\n");
+        project.write("A.cs", "class A { int x; }\n");
+        for extra in [
+            ("format", Json::String("text".into())),
+            ("format", Json::String("json".into())),
+            ("depth", Json::Int(2)),
+            ("depth", Json::Null),
+            ("staged", Json::Bool(false)),
+        ] {
+            let reply = call_with(
+                &mut server,
+                object(vec![
+                    ("root", Json::String(project.root())),
+                    ("diff", Json::String(diff.clone())),
+                    extra,
+                ]),
+            );
+            let result = reply.object("result").expect("result");
+            assert!(result.bool("isError").is_none(), "{}", reply.to_text());
+        }
     }
 }

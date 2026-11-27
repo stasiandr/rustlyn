@@ -155,6 +155,10 @@ impl RiskModel for CompilerRisks<'_> {
             .map(|(i, _)| i)
             .take(FAILABILITY_MEMBERS)
             .collect();
+        // The long members first: one of them left for last keeps a thread
+        // busy while the others are idle.
+        let mut chosen = chosen;
+        chosen.sort_by_key(|&i| std::cmp::Reverse(context.impact.nodes[i].member.lines.len()));
         let next = AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for _ in 0..threads(chosen.len()) {

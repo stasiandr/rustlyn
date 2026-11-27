@@ -1421,7 +1421,30 @@ impl View<'_> {
                     _ => None,
                 }
             }
-            Some(access) if access.kind() == SyntaxKind::MemberBindingExpression => None,
+            // `a?.ToString()`: the value the conditional access starts with
+            // is the receiver, as `a` is of `a.ToString()`.
+            Some(access) if access.kind() == SyntaxKind::MemberBindingExpression => {
+                let start = access
+                    .ancestors()
+                    .find(|node| {
+                        node.kind() == SyntaxKind::ConditionalAccessExpression
+                            && node
+                                .children()
+                                .next()
+                                .is_some_and(|first| !first.span().contains_span(access.span()))
+                    })
+                    .and_then(|conditional| conditional.children().next());
+                let Some(start) = start else {
+                    return called;
+                };
+                let Some(body) = self.body_for(&start) else {
+                    return called;
+                };
+                match body.type_at(start.span()) {
+                    Some(Type::Named { symbol, .. }) => Some(*symbol),
+                    _ => None,
+                }
+            }
             _ => self
                 .model
                 .binder()

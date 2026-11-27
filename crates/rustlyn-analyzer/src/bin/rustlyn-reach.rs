@@ -23,6 +23,7 @@
 use std::io::Read;
 
 use rustlyn_analyzer::blast::setup;
+use rustlyn_analyzer::cli;
 use rustlyn_analyzer::reach::{Config, Request, analyze, git};
 
 const USAGE: &str = "rustlyn-reach [ROOT] --config FILE [--diff FILE|-] [--base REV] [--merge-base REV] [--staged] [--possible] [--json] [--no-cache] [--timings]
@@ -92,7 +93,7 @@ fn run() -> Result<i32, String> {
             "--no-cache" => cache = false,
             "--timings" => timings = true,
             "-h" | "--help" => {
-                println!("{USAGE}");
+                cli::say(USAGE);
                 return Ok(0);
             }
             other if other.starts_with('-') => {
@@ -151,11 +152,15 @@ fn run() -> Result<i32, String> {
     };
     let report = analyze(&request, &config)?;
     if json {
-        println!("{}", report.json_text(cone));
+        cli::say(&report.json_text(cone));
     } else if cone {
-        println!("{}\n{}", report.headline(), report.cone_text(users));
+        cli::say(&format!(
+            "{}\n{}",
+            report.headline(),
+            report.cone_text(users)
+        ));
     } else {
-        println!("{}", report.text(possible));
+        cli::say(&report.text(possible));
     }
     if timings {
         let all: Vec<String> = report

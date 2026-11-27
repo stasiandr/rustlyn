@@ -779,3 +779,52 @@ fn s77_a_reference_that_escapes_is_said_to() {
         found.tree
     );
 }
+
+#[test]
+fn s78_primary_constructor_parameter_that_members_capture() {
+    // A parameter the members use is a field of the compiler's making; the
+    // callers of the constructor write it all the same.
+    case(&[(
+        "A.cs",
+        "class E(int t) { public int $0T = t; public int G() => t; }\nclass Use { E Make() { return new E(4003); } }\n",
+    )])
+    .path("E.T <- E.<t>P <- Use.Make <- 4003")
+    .sources("literal 4003");
+}
+
+#[test]
+fn s79_captured_parameter_asked_for_by_itself() {
+    case(&[(
+        "A.cs",
+        "class E(int $0t) { public int G() => t; }\nclass Use { E Make() { return new E(4004); } }\n",
+    )])
+    .sources("literal 4004");
+}
+
+#[test]
+fn s80_captured_parameter_of_a_struct_and_one_not_captured() {
+    case(&[(
+        "A.cs",
+        "struct S(int t) { public int $0T = t; public int G() => t + 1; }\nclass Use { S Make() { return new S(4005); } }\n",
+    )])
+    .sources("literal 4005");
+    case(&[(
+        "A.cs",
+        "class P(int t) { public int $0T = t; }\nclass Use { P Make() { return new P(4006); } }\n",
+    )])
+    .sources("literal 4006");
+}
+
+#[test]
+fn s81_captured_parameter_of_two_with_two_callers() {
+    let found = case(&[(
+        "A.cs",
+        "class E(int a, int b) { public int $0B = b; public int G() => a + b; }\nclass Use { void M() { var x = new E(1, 4007); var y = new E(2, 4008); } }\n",
+    )]);
+    let tree = &found.tree;
+    assert!(tree.contains("4007") && tree.contains("4008"), "{tree}");
+    assert!(
+        !tree.contains("literal 1\n") && !tree.contains("literal 2\n"),
+        "{tree}"
+    );
+}

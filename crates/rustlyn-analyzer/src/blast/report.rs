@@ -32,6 +32,10 @@ pub struct Request {
     /// against the disk (or against what the patch compares with) is part
     /// of the report too.
     pub unsaved: HashMap<String, String>,
+    /// What the host could not put into the patch (a changed file it could
+    /// not read): said again in the report, so that a change that was not
+    /// looked at is not taken for one with no effect.
+    pub notes: Vec<String>,
 }
 
 impl Request {
@@ -42,6 +46,7 @@ impl Request {
             patch: patch.into(),
             limits: Limits::default(),
             unsaved: HashMap::new(),
+            notes: Vec::new(),
         }
     }
 }
@@ -57,6 +62,8 @@ pub struct Report {
     /// What each step found, in the order the steps ran.
     pub findings: Vec<StepFindings>,
     pub milliseconds: u128,
+    /// What was not analyzed, from the request.
+    pub notes: Vec<String>,
     /// How many milliseconds each phase took, to see what is slow.
     pub phases: Vec<(&'static str, u128)>,
 }
@@ -156,6 +163,7 @@ pub fn analyze(request: &Request, session: &Session, extensions: &Extensions<'_>
         risks,
         findings,
         milliseconds: started.elapsed().as_millis(),
+        notes: request.notes.clone(),
         phases,
     }
 }
@@ -388,6 +396,12 @@ impl Report {
             ("top_risks", Json::Array(top)),
             ("nodes", Json::Array(nodes)),
         ];
+        if !self.notes.is_empty() {
+            all.push((
+                "notes",
+                Json::Array(self.notes.iter().cloned().map(Json::String).collect()),
+            ));
+        }
         for step in &self.findings {
             all.push((
                 step.step,
@@ -415,6 +429,7 @@ impl Report {
     pub fn text_with(&self, wording: &dyn Wording) -> String {
         let nodes = &self.impact.nodes;
         let mut out = vec![wording.summary(self)];
+        out.extend(self.notes.iter().map(|note| format!("note: {note}")));
         let mut printed = vec![false; nodes.len()];
         for (index, node) in nodes.iter().enumerate() {
             if node.change.is_some() {

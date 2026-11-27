@@ -244,6 +244,43 @@ impl Semantic {
             .iter()
             .map(|&ty| symbols.get(ty).name.clone())
             .collect();
+        // A value of a type parameter constrained to one of the types is a
+        // value of it: `a == b` on a `T : Base` runs `Base`'s operator, and
+        // the body writes `T`, never `Base`. A parameter constrained to
+        // another such parameter is one too.
+        let mut parameters: Vec<SymbolId> = symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.kind == SymbolKind::TypeParameter
+                    && symbol
+                        .locations
+                        .iter()
+                        .any(|location| self.paths.contains_key(&location.tree))
+            })
+            .map(|symbol| symbol.id)
+            .collect();
+        let mut reaching: HashSet<SymbolId> = HashSet::new();
+        loop {
+            let before = parameters.len();
+            parameters.retain(|&parameter| {
+                let constrained = model
+                    .base_types_of(parameter)
+                    .iter()
+                    .any(|bound| match bound {
+                        Type::Named { symbol, .. } => types.contains(symbol),
+                        Type::TypeParameter(other) => reaching.contains(other),
+                        _ => false,
+                    });
+                if constrained {
+                    reaching.insert(parameter);
+                    names.insert(symbols.get(parameter).name.clone());
+                }
+                !constrained
+            });
+            if parameters.len() == before {
+                break;
+            }
+        }
         let mut holders: HashSet<SymbolId> = HashSet::new();
         for member in self.member_types() {
             if member.mentions.iter().any(|ty| types.contains(ty)) {

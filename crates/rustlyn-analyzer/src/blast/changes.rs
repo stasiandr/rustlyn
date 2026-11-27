@@ -232,16 +232,62 @@ impl Members {
         self.list.iter().find(|m| m.offset == at)
     }
 
-    /// The innermost member that holds `line` and, when `columns` (bytes
-    /// from the start of the file) says where on the line the change is,
-    /// holds all of it: with two members on a line, the one that was
-    /// changed.
-    fn at_columns(&self, line: usize, columns: Option<&Range<usize>>) -> Option<&Member> {
-        let inner = self.enclosing_columns(line, columns)?;
-        if inner.is_type() && !inner.head.contains(&line) {
-            return None;
+    /// Whether the bytes `at` of `line` are inside a member that is not a
+    /// type: where text was put into a name, as against between two members.
+    fn in_member(&self, line: usize, at: &Range<usize>) -> bool {
+        self.list.iter().any(|m| {
+            !m.is_type()
+                && m.lines.contains(&line)
+                && m.span.start <= at.start
+                && at.end <= m.span.end
+        })
+    }
+
+    /// The members a change at `line` and `columns` is in. Where the bytes
+    /// say which member holds all of it, that one; where they do not (the
+    /// line was not replaced by one, or the change spans two members), every
+    /// member written on the line that the bytes touch — a change that
+    /// cannot be told apart is not given to one of them by luck, nor to the
+    /// type around them.
+    fn at_columns_all(&self, line: usize, columns: Option<&Range<usize>>) -> Vec<&Member> {
+        let holds = |m: &&Member| m.lines.contains(&line);
+        if let Some(c) = columns
+            && let Some(one) = self
+                .list
+                .iter()
+                .filter(holds)
+                .filter(|m| m.span.start <= c.start && c.end <= m.span.end)
+                .min_by_key(|m| (m.lines.len(), m.span.len()))
+        {
+            // A type holds a change in its body that no member holds (a
+            // comment after a member on its line): that is for the members
+            // written there, below.
+            if !one.is_type() || one.head.contains(&line) {
+                return vec![one];
+            }
         }
-        Some(inner)
+        let on: Vec<&Member> = self.list.iter().filter(holds).collect();
+        let Some(least) = on.iter().map(|m| m.lines.len()).min() else {
+            return Vec::new();
+        };
+        let mut tight: Vec<&Member> = on.into_iter().filter(|m| m.lines.len() == least).collect();
+        if let Some(c) = columns {
+            let touching: Vec<&Member> = tight
+                .iter()
+                .copied()
+                .filter(|m| m.span.start <= c.end && c.start <= m.span.end)
+                .collect();
+            if !touching.is_empty() {
+                tight = touching;
+            }
+        }
+        // The type around members written on its line is not what changed
+        // when one of them can have been.
+        if tight.iter().any(|m| !m.is_type()) {
+            tight.retain(|m| !m.is_type());
+        }
+        tight.retain(|m| !m.is_type() || m.head.contains(&line));
+        tight
     }
 
     #[must_use]
@@ -332,22 +378,34 @@ pub fn changes_by(
                 .flatten()
                 .zip(new_lines.get(line))
                 .and_then(|(old, now)| columns(&new_starts, line, now, old));
-            let Some(member) = new.at_columns(line, at.as_ref()) else {
-                continue;
-            };
-            let before = old.by_key(&member.key);
-            let how = if before.is_none() && !renamed_from.contains_key(member.key.as_str()) {
-                How::Added
-            } else if renamed_from.contains_key(member.key.as_str())
-                || !has_body(member)
-                || (member.head.contains(&line)
-                    && before.is_none_or(|b| b.signature != member.signature))
+            // Text only the other side has changed this one in no byte.
+            let theirs = paired
+                .then(|| old_lines.get(block.old_lines.start + k))
+                .flatten()
+                .zip(new_lines.get(line))
+                .and_then(|(old, now)| columns(&old_starts, block.old_lines.start + k, old, now));
+            if at
+                .as_ref()
+                .is_some_and(|r| r.is_empty() && !new.in_member(line, r))
+                && theirs.as_ref().is_some_and(|r| !r.is_empty())
             {
-                How::Signature
-            } else {
-                How::Body
-            };
-            note(member, how, line);
+                continue;
+            }
+            for member in new.at_columns_all(line, at.as_ref()) {
+                let before = old.by_key(&member.key);
+                let how = if before.is_none() && !renamed_from.contains_key(member.key.as_str()) {
+                    How::Added
+                } else if renamed_from.contains_key(member.key.as_str())
+                    || !has_body(member)
+                    || (member.head.contains(&line)
+                        && before.is_none_or(|b| b.signature != member.signature))
+                {
+                    How::Signature
+                } else {
+                    How::Body
+                };
+                note(member, how, line);
+            }
         }
         for (k, line) in block.old_lines.clone().enumerate() {
             if block.removed.get(k).is_some_and(|l| l.trim().is_empty()) {
@@ -358,36 +416,47 @@ pub fn changes_by(
                 .flatten()
                 .zip(old_lines.get(line))
                 .and_then(|(now, old)| columns(&old_starts, line, old, now));
-            let Some(was) = old.at_columns(line, at.as_ref()) else {
+            let theirs = paired
+                .then(|| new_lines.get(block.new_lines.start + k))
+                .flatten()
+                .zip(old_lines.get(line))
+                .and_then(|(now, old)| columns(&new_starts, block.new_lines.start + k, now, old));
+            if at
+                .as_ref()
+                .is_some_and(|r| r.is_empty() && !old.in_member(line, r))
+                && theirs.as_ref().is_some_and(|r| !r.is_empty())
+            {
                 continue;
-            };
-            let now = new.by_key(&was.key).or_else(|| {
-                renamed_from
-                    .iter()
-                    .find(|(_, o)| o.key == was.key)
-                    .and_then(|(n, _)| new.by_key(n))
-            });
-            match now {
-                Some(now) => {
-                    let how = if (was.head.contains(&line) && was.signature != now.signature)
-                        || !has_body(was)
-                        || now.key != was.key
-                    {
-                        How::Signature
-                    } else {
-                        How::Body
-                    };
-                    // Lines are new ones: a removed line lands on the line
-                    // that replaced it, or on the member's name.
-                    let replaced = block.new_lines.start + k;
-                    let at = if paired && now.lines.contains(&replaced) {
-                        replaced
-                    } else {
-                        now.line
-                    };
-                    note(now, how, at);
+            }
+            for was in old.at_columns_all(line, at.as_ref()) {
+                let now = new.by_key(&was.key).or_else(|| {
+                    renamed_from
+                        .iter()
+                        .find(|(_, o)| o.key == was.key)
+                        .and_then(|(n, _)| new.by_key(n))
+                });
+                match now {
+                    Some(now) => {
+                        let how = if (was.head.contains(&line) && was.signature != now.signature)
+                            || !has_body(was)
+                            || now.key != was.key
+                        {
+                            How::Signature
+                        } else {
+                            How::Body
+                        };
+                        // Lines are new ones: a removed line lands on the line
+                        // that replaced it, or on the member's name.
+                        let replaced = block.new_lines.start + k;
+                        let at = if paired && now.lines.contains(&replaced) {
+                            replaced
+                        } else {
+                            now.line
+                        };
+                        note(now, how, at);
+                    }
+                    None => note(was, How::Removed, line),
                 }
-                None => note(was, How::Removed, line),
             }
         }
     }
@@ -570,7 +639,16 @@ pub(crate) fn differing(own: &str, other: &str) -> (usize, usize) {
     while !own.is_char_boundary(end) {
         end += 1;
     }
-    (start, end.max(start))
+    // The blank that one line has more than the other is shared by either
+    // side of it: `{ } }` and `{ } = 3; }` differ by `= 3;`, not by `= 3; `.
+    let (mut start, mut end) = (start, end.max(start));
+    while start < end && own.as_bytes()[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && own.as_bytes()[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    (start, end)
 }
 
 /// A field, an event or an enum member has no body: any change to it is a
@@ -606,7 +684,7 @@ fn member(path: &str, text: &str, starts: &[usize], d: &Declaration) -> Member {
     // A `{` at the end of the signature's line leaves that line in the
     // header; a `{` on a line of its own is the body already.
     let head_end = head_last + 1;
-    let name = d.qualified_name();
+    let name = explicit_name(text, name_start, d.qualified_name());
     let key = match d.kind {
         DeclarationKind::Method
         | DeclarationKind::Constructor
@@ -640,6 +718,42 @@ fn member(path: &str, text: &str, starts: &[usize], d: &Declaration) -> Member {
             .split_whitespace()
             .collect(),
     }
+}
+
+/// The qualified name of a member, with the interface of an explicit
+/// implementation in it: `double IShape.Area()` and `public double Area()`
+/// are two members of a type, and a key that told them apart by nothing
+/// would be the first one's for both.
+fn explicit_name(text: &str, name_start: usize, name: String) -> String {
+    let bytes = text.as_bytes();
+    if name_start == 0 || bytes.get(name_start - 1) != Some(&b'.') {
+        return name;
+    }
+    // Back over the interface, `IShape` or `IDictionary<string, JToken?>`:
+    // spaces inside its type arguments are part of it.
+    let mut start = name_start - 1;
+    let mut depth = 0usize;
+    while start > 0 {
+        let byte = bytes[start - 1];
+        match byte {
+            b'>' => depth += 1,
+            b'<' => depth = depth.saturating_sub(1),
+            b if depth == 0
+                && (b.is_ascii_whitespace()
+                    || matches!(b, b'(' | b'{' | b'}' | b';' | b'[' | b']')) =>
+            {
+                break;
+            }
+            _ => {}
+        }
+        start -= 1;
+    }
+    let interface = text.get(start..name_start - 1).unwrap_or_default();
+    let short = name.rsplit('.').next().unwrap_or(&name);
+    if interface.is_empty() || short.is_empty() {
+        return name;
+    }
+    format!("{}{interface}.{short}", &name[..name.len() - short.len()])
 }
 
 /// The words of `head` that are not inside `[…]`: an attribute's name and

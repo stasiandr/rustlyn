@@ -993,7 +993,9 @@ fn a_package_only_game_logic_uses_is_not_affected() {
     let report = bump("pkg-ui", "com.vendor.ui");
     assert!(!report.affects(), "{}", report.text(true));
     assert!(report.findings.is_empty(), "{}", report.text(true));
-    assert_eq!(report.unaffected, 1);
+    // A package is counted as one, not as a member.
+    assert_eq!(report.unaffected, 0);
+    assert_eq!(report.unaffected_packages, 1);
 }
 
 #[test]
@@ -1076,7 +1078,8 @@ fn a_package_bump_in_a_past_revision() {
     let finding = &report.revisions[0].findings[0];
     assert_eq!(finding.kind, FindingKind::Package);
     assert_eq!(finding.count, 1);
-    assert_eq!(report.revisions[1].unaffected, 1, "{text}");
+    assert_eq!(report.revisions[1].unaffected, 0, "{text}");
+    assert_eq!(report.revisions[1].unaffected_packages, 1, "{text}");
     assert_eq!(report.revisions[2].findings[0].chain[0].step, "package_of");
 }
 
@@ -1271,4 +1274,225 @@ fn members_on_one_line_are_judged_each() {
     let report = run(&project, CONFIG, Some(patch("Game/One.cs", ONE, &new)));
     assert!(report.affects(), "{}", report.text(true));
     assert_eq!(report.findings[0].name, "Game.One.A()");
+}
+
+/// A project whose constructor, method, property and base class are on the
+/// way to a sink, and a `Work` that is not: what its removed lines name is
+/// what they run.
+const NAMING: &str = "using Vendor.Ads;
+namespace Game {
+    public class Gate {
+        public Gate(string id) { Tracker.Start(); }
+        public Gate(int n) { Tracker.Start(); }
+        public static int Max = 1;
+    }
+    public class Door : Gate {
+        public Door(int n) : base(n) { }
+    }
+    public class Tail {
+        public Tail(string s) { Tracker.Start(); }
+        public Tail(int n) : this(\"x\") { }
+    }
+    public class Opts {
+        public int Level { get { Tracker.Stop(); return 1; } set { Tracker.Stop(); } }
+    }
+    public static class Boot {
+        public static void Launch() { Tracker.Start(); }
+    }
+    public class Caller {
+        public System.Action Hook;
+        public void Work(object o, Gate g) {
+            int before = 0;
+            BODY
+        }
+    }
+}
+";
+
+/// What removing `old` from `Work`, in favour of `new`, comes to.
+fn removal(name: &str, old: &str, new: &str) -> Report {
+    let before = NAMING.replace("BODY", old);
+    let after = NAMING.replace("BODY", new);
+    let project = project(name);
+    project.write("Game/Naming.cs", &after);
+    run(
+        &project,
+        CONFIG,
+        Some(patch("Game/Naming.cs", &before, &after)),
+    )
+}
+
+/// A removed line that only mentions a type does not run its constructor: a
+/// test of the type, a cast, a declaration, a generic argument, `typeof`,
+/// `nameof`, a string or a comment.
+#[test]
+fn a_removed_line_that_only_mentions_a_type_names_no_constructor() {
+    let cases = [
+        ("var b = o is Gate;", "var b = o is Gate && true;"),
+        ("var b = o as Gate;", "var b = (o as Gate) == null;"),
+        ("Gate h = g;", "var h = g;"),
+        ("var x = (Gate)o;", "var x = o;"),
+        ("var t = typeof(Gate);", "var t = typeof(string);"),
+        ("var n = nameof(Gate);", "var n = \"Gate\";"),
+        (
+            "var l = new System.Collections.Generic.List<Gate>();",
+            "var l = new System.Collections.Generic.List<int>();",
+        ),
+        ("Gate[] all = null;", "var all = 1;"),
+        ("var s = \"new Gate(1)\";", "var s = \"\";"),
+        ("// new Gate(2) was here", "// gone"),
+        ("/* new Gate(3) */ before++;", "before++;"),
+        ("var v = Gate.Max;", "var v = 1;"),
+    ];
+    for (k, (old, new)) in cases.into_iter().enumerate() {
+        let report = removal(&format!("type-mention-{k}"), old, new);
+        assert!(!report.affects(), "{old}: {}", report.text(true));
+        assert!(report.findings.is_empty(), "{old}: {}", report.text(true));
+    }
+}
+
+/// A removed line that runs something on the way to a sink names it, by the
+/// syntax of what is gone.
+#[test]
+fn a_removed_line_that_runs_a_member_names_it() {
+    let cases = [
+        // A constructor, by `new`, a target type and an initializer.
+        (
+            "var x = new Gate(\"a\");",
+            "var x = 1;",
+            "Game.Gate.Gate(string)",
+        ),
+        (
+            "var x = new Game.Gate(\"a\");",
+            "var x = 1;",
+            "Game.Gate.Gate(string)",
+        ),
+        (
+            "Gate x = new(\"a\");",
+            "var x = 1;",
+            "Game.Gate.Gate(string)",
+        ),
+        (
+            "var x = new Gate(\"a\") { };",
+            "var x = 1;",
+            "Game.Gate.Gate(string)",
+        ),
+        // A method call, a method group.
+        ("Boot.Launch();", "before++;", "Game.Boot.Launch()"),
+        ("Hook += Boot.Launch;", "before++;", "Game.Boot.Launch()"),
+        // A property read, set by an object initializer.
+        ("var l = new Opts().Level;", "var l = 0;", "Game.Opts.Level"),
+        (
+            "var p = new Opts { Level = 3 };",
+            "var p = 1;",
+            "Game.Opts.Level",
+        ),
+        (
+            "Opts p = null; p.Level = 4;",
+            "before++;",
+            "Game.Opts.Level",
+        ),
+    ];
+    for (k, (old, new, member)) in cases.into_iter().enumerate() {
+        let report = removal(&format!("run-{k}"), old, new);
+        assert!(report.affects(), "{old}: {}", report.text(true));
+        let finding = &report.findings[0];
+        assert_eq!(finding.kind, FindingKind::Removed, "{old}");
+        assert!(finding.certain, "{old}");
+        assert!(
+            finding.chain.iter().any(|hop| hop.target == member),
+            "{old}: {:?}",
+            finding.chain
+        );
+    }
+}
+
+/// `: base(…)` and `: this(…)` run the constructors of the base and of the
+/// type, when every one that may be meant is on the way to a sink.
+#[test]
+fn a_removed_constructor_chain_names_the_constructors_it_ran() {
+    let first = project("chained");
+    let old = NAMING.replace("BODY", "before++;");
+    let new = old.replace("public Door(int n) : base(n) { }", "public Door(int n) { }");
+    first.write("Game/Naming.cs", &new);
+    let report = run(&first, CONFIG, Some(patch("Game/Naming.cs", &old, &new)));
+    assert!(report.affects(), "{}", report.text(true));
+    let finding = &report.findings[0];
+    assert_eq!(finding.name, "Game.Door.Door(int)");
+    assert!(
+        finding
+            .chain
+            .iter()
+            .any(|hop| hop.target.starts_with("Game.Gate.Gate(")),
+        "{:?}",
+        finding.chain
+    );
+    // The same of `: this(…)`.
+    let second = project("chained-this");
+    let new = old.replace(
+        "public Tail(int n) : this(\"x\") { }",
+        "public Tail(int n) { }",
+    );
+    second.write("Game/Naming.cs", &new);
+    let report = run(&second, CONFIG, Some(patch("Game/Naming.cs", &old, &new)));
+    assert!(report.affects(), "{}", report.text(true));
+    assert!(
+        report.findings[0]
+            .chain
+            .iter()
+            .any(|hop| hop.target == "Game.Tail.Tail(string)"),
+        "{:?}",
+        report.findings[0].chain
+    );
+}
+
+/// A name the cone shares with a member outside it says nothing of which
+/// was run.
+#[test]
+fn a_removed_call_of_a_name_the_cone_shares_is_not_named() {
+    let both = "namespace Game { public class Lamp { public void Launch() { } } }\n";
+    let project = project("shared-name");
+    project.write("Game/Lamp.cs", both);
+    let old = NAMING.replace("BODY", "new Lamp().Launch();");
+    let new = NAMING.replace("BODY", "before++;");
+    project.write("Game/Naming.cs", &new);
+    let report = run(&project, CONFIG, Some(patch("Game/Naming.cs", &old, &new)));
+    assert!(!report.affects(), "{}", report.text(true));
+}
+
+/// A package alone changed: the headline counts packages, not members, and
+/// says one where there is one.
+#[test]
+fn the_headline_counts_members_and_packages_apart() {
+    let report = bump("headline-ui", "com.vendor.ui");
+    let headline = report.headline();
+    assert!(
+        headline.contains("1 changed package does not lead there"),
+        "{headline}"
+    );
+    assert!(!headline.contains("member"), "{headline}");
+    assert_eq!(report.unaffected, 0);
+    assert_eq!(report.unaffected_packages, 1);
+    let json = report.json(false);
+    assert_eq!(json.int("unaffected"), Some(0));
+    assert_eq!(json.int("unaffected_packages"), Some(1));
+}
+
+#[test]
+fn the_headline_words_one_and_many() {
+    let new = CONSENT.replace("health.Value -= 1;", "health.Value -= 2;");
+    let report = change("headline-member", "Game/Consent.cs", CONSENT, &new);
+    let headline = report.headline();
+    assert!(
+        headline.contains("1 changed member does not lead there"),
+        "{headline}"
+    );
+    let new = CONSENT.replace("SetStatus(granted);", "SetStatus(!granted);");
+    let report = change("headline-finding", "Game/Consent.cs", CONSENT, &new);
+    let headline = report.headline();
+    assert!(headline.contains("— 1 finding;"), "{headline}");
+    assert!(
+        headline.contains("0 changed members do not lead there"),
+        "{headline}"
+    );
 }

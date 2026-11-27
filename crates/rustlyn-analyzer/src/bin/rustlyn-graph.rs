@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rustlyn_analyzer::blast::{project, setup};
+use rustlyn_analyzer::cli;
 use rustlyn_analyzer::fail::{line_start_utf16, split_target};
 use rustlyn_analyzer::value::headless;
 use rustlyn_analyzer::value::{Compiler, English, IndexSymbols, Project, Projects, Reach};
@@ -40,7 +41,7 @@ fn main() {
 fn run() -> Result<i32, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("{USAGE}");
+        cli::say(USAGE);
         return Ok(0);
     }
     let mut reach = Reach::default();
@@ -103,7 +104,7 @@ fn run() -> Result<i32, String> {
             &projects,
             reach,
             verbose,
-            &mut |l| println!("{l}"),
+            &mut |l| cli::say(l),
             &mut |l| eprintln!("{l}"),
         ));
     }
@@ -123,18 +124,21 @@ fn run() -> Result<i32, String> {
         return Err(format!("{} is not a value", found.name));
     };
     if json {
-        println!("{}", headless::json(&graph, &English));
+        cli::say(&headless::json(&graph, &English));
     } else {
-        println!("{}", headless::tree(&graph, &English));
-        println!("sources: {}", headless::sources_summary(&graph, &English));
+        cli::say(&headless::tree(&graph, &English));
+        cli::say(&format!(
+            "sources: {}",
+            headless::sources_summary(&graph, &English)
+        ));
     }
     let mut code = 0;
     for chain in &expect {
         let titles: Vec<String> = chain.split("<-").map(|t| t.trim().to_owned()).collect();
         if graph.has_path(&titles, &English) {
-            println!("✓ {chain}");
+            cli::say(&format!("✓ {chain}"));
         } else {
-            println!("✗ {chain}");
+            cli::say(&format!("✗ {chain}"));
             code = 1;
         }
     }

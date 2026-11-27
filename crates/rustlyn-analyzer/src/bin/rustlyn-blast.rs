@@ -18,6 +18,7 @@ use std::io::Read;
 
 use rustlyn_analyzer::blast::compiler_risks::CompilerRisks;
 use rustlyn_analyzer::blast::{Extensions, Level, Limits, Request, analyze, mcp, project, setup};
+use rustlyn_analyzer::cli;
 
 const USAGE: &str = "rustlyn-blast [ROOT] [--diff FILE|-] [--base REV] [--staged] [--depth N] [--nodes N] [--json] [--no-cache] [--timings]
 rustlyn-blast --mcp
@@ -92,7 +93,7 @@ fn run() -> Result<i32, String> {
             "--mcp" => serve = true,
             "--timings" => timings = true,
             "-h" | "--help" => {
-                println!("{USAGE}");
+                cli::say(USAGE);
                 return Ok(0);
             }
             other if other.starts_with('-') => {
@@ -108,6 +109,7 @@ fn run() -> Result<i32, String> {
     }
     let root = setup::canonical_root(&root.unwrap_or_else(|| ".".to_owned()));
     setup::existing_root(&root)?;
+    let mut notes = Vec::new();
     let patch = match diff.as_deref() {
         Some("-") => {
             let mut bytes = Vec::new();
@@ -120,7 +122,11 @@ fn run() -> Result<i32, String> {
             let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
             rustlyn_ide::document::decode_lines(&bytes)
         }
-        None => setup::git_patch(&root, base.as_deref(), staged)?,
+        None => {
+            let (patch, found) = setup::git_patch_noted(&root, base.as_deref(), staged)?;
+            notes = found;
+            patch
+        }
     };
     setup::valid_patch(&patch)?;
     let mut phases = Vec::new();
@@ -132,20 +138,18 @@ fn run() -> Result<i32, String> {
     let session = project::compiled_timed(&root, folder, &mut phases)?;
     let mut request = Request::new(root, patch);
     request.limits = limits;
+    request.notes = notes;
     let model = CompilerRisks::new(&request.root, &session);
     let extensions = Extensions {
         risks: vec![&model],
         ..Extensions::default()
     };
     let report = analyze(&request, &session, &extensions);
-    println!(
-        "{}",
-        if json {
-            report.json_text()
-        } else {
-            report.text()
-        }
-    );
+    cli::say(&if json {
+        report.json_text()
+    } else {
+        report.text()
+    });
     if timings {
         let all: Vec<String> = phases
             .iter()

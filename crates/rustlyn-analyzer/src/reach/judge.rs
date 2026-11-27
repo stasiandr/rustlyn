@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
+use rustlyn_ide::outline::DeclarationKind;
 use rustlyn_ide::semantic::Semantic;
 
 use super::Listed;
@@ -19,8 +20,9 @@ use super::cone::{Cone, Role, Step, Via};
 use super::config::{Config, glob_matches};
 use super::graph::{Graph, NodeId};
 use super::packages::{Changes, Packages};
-use super::text::words;
-use crate::blast::changes::{How, Members, changes_by};
+use super::uses::{blank_noncode, uses};
+use crate::blast::changes::{How, Member, Members, changes_by};
+use crate::blast::diff::split_lines;
 use crate::blast::diff::{FileDiff, Status};
 
 /// What a finding is about.
@@ -217,7 +219,14 @@ pub fn judge(
                 });
             } else if file.status == Status::Deleted && config.is_own(&file.path) {
                 // A file that is gone: by what its lines named.
-                let named = words.named(config, "removed", &gone, &gone.join("\n"));
+                let segments = [gone.join("\n")];
+                let named = words.named(
+                    config,
+                    "removed",
+                    &segments,
+                    &gone.join("\n"),
+                    Within::default(),
+                );
                 settle(
                     &mut judged,
                     graph,
@@ -238,9 +247,20 @@ pub fn judge(
         // What the removed lines may name a sink by is judged against the
         // whole file, before and after.
         let around = format!("{text}\n{}", gone.join("\n"));
+        // The old text with its comments and strings blanked: a removed line
+        // inside a block comment is not code, which its own text cannot say.
+        let blanked_old = blank_noncode(&file.old_text(&text));
+        let blanked_old = split_lines(&blanked_old);
+        let code_of = |block: &crate::diff::Block, k: usize| -> String {
+            let was = &block.removed[k];
+            blanked_old
+                .get(block.old_lines.start + k)
+                .filter(|line| line.len() == was.len())
+                .map_or_else(|| was.clone(), |line| (*line).to_owned())
+        };
         // The changed lines and the removed text of each member; `None` is
         // the file outside any member.
-        let mut changed: BTreeMap<Option<usize>, (Vec<usize>, Vec<&str>)> = BTreeMap::new();
+        let mut changed: BTreeMap<Option<usize>, (Vec<usize>, Vec<String>)> = BTreeMap::new();
         let starts = crate::blast::changes::line_starts(&text);
         for block in &file.blocks {
             let paired = block.new_lines.len() == block.removed.len();
@@ -293,19 +313,26 @@ pub fn judge(
                     let line = block.new_lines.start + k;
                     let now = lines.get(line).copied().unwrap_or_default();
                     let (from, to) = crate::blast::changes::differing(was, now);
-                    let slice = was.get(from..to).unwrap_or(was);
+                    let code = code_of(block, k);
+                    let slice = code.get(from..to).unwrap_or(&code).to_owned();
                     changed.entry(index_of(line)).or_default().1.push(slice);
                 }
             } else {
+                let code: Vec<String> = (0..block.removed.len())
+                    .map(|k| code_of(block, k))
+                    .collect();
                 changed
                     .entry(index_of(block.new_lines.start))
                     .or_default()
                     .1
-                    .extend(block.removed.iter().map(String::as_str));
+                    .push(code.join("\n"));
             }
         }
         for (index, (lines, removed)) in &changed {
-            let named = words.named(config, "removed", removed, &around);
+            let within = index.map_or_else(Within::default, |index| {
+                within_of(&own.members, &own.members.list[index])
+            });
+            let named = words.named(config, "removed", removed, &around, within);
             let Some(index) = index else {
                 let line = lines.first().copied().unwrap_or(0);
                 settle(
@@ -346,14 +373,78 @@ pub fn judge(
 struct Words<'a> {
     /// The types a sink's API hangs on, as own code has them.
     sinks: HashMap<&'a str, usize>,
-    /// Members of the cone by a name nothing outside it has.
-    cone: HashMap<&'a str, NodeId>,
+    /// The members of the project by name, each with whether the cone has
+    /// it. A name is the cone's for what a line runs when every member it
+    /// may mean is in the cone: `SendPurchase` is, `OnUpdate` is not.
+    named: HashMap<&'a str, Vec<Candidate>>,
+    /// The constructors of each type: the node, whether the cone has it,
+    /// how many arguments it takes, its key.
+    ctors: HashMap<&'a str, Vec<(Candidate, &'a str)>>,
+}
+
+/// A member a name may mean.
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    node: NodeId,
+    in_cone: bool,
+    /// A constructor, as against a method, a property, a field, an event.
+    ctor: bool,
+    /// How many arguments it takes; `None` where that is not one number (a
+    /// property, a default value, `params`).
+    arity: Option<usize>,
 }
 
 /// What a line named.
 enum Named<'a> {
     Sink(&'a str, usize),
     Member(NodeId),
+}
+
+/// The type a removed line was in, for what its `: base(…)` and `: this(…)`
+/// run.
+#[derive(Default, Clone, Copy)]
+struct Within<'a> {
+    /// The qualified name of the type.
+    container: Option<&'a str>,
+    /// The key of the member the lines were in.
+    key: Option<&'a str>,
+    /// The bases of the type as written.
+    bases: &'a [String],
+}
+
+/// How many arguments a method or constructor takes, from its key
+/// (`Game.Gate.Gate(string, int)`); `None` where a default value or `params`
+/// lets it take more than one number.
+fn arity_of(member: &Member) -> Option<usize> {
+    if !matches!(
+        member.kind,
+        DeclarationKind::Method | DeclarationKind::Constructor
+    ) {
+        return None;
+    }
+    let open = member.key.find('(')?;
+    let inside = &member.key[open + 1..member.key.len().checked_sub(1)?];
+    let after = member
+        .signature
+        .find('(')
+        .map_or("", |at| &member.signature[at..]);
+    if member.signature.contains("params") || after.contains('=') {
+        return None;
+    }
+    let (mut depth, mut commas) = (0i32, 0usize);
+    for c in inside.chars() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => commas += 1,
+            _ => {}
+        }
+    }
+    Some(if inside.trim().is_empty() {
+        0
+    } else {
+        commas + 1
+    })
 }
 
 impl<'a> Words<'a> {
@@ -363,49 +454,150 @@ impl<'a> Words<'a> {
             let word = hit.name.split('.').next().unwrap_or(&hit.name);
             sinks.entry(word).or_insert(hit.sink);
         }
-        // A name is the cone's when every member that has it is in the
-        // cone: `SendPurchase` is, `OnUpdate` is not.
-        let mut outside: HashSet<&str> = HashSet::new();
-        let mut inside: HashMap<&str, NodeId> = HashMap::new();
+        let mut named: HashMap<&str, Vec<Candidate>> = HashMap::new();
+        let mut ctors: HashMap<&str, Vec<(Candidate, &str)>> = HashMap::new();
         for node in 0..graph.len() as NodeId {
             let member = graph.member(node);
             if member.is_type() {
                 continue;
             }
-            let name = member.short_name();
-            match cone.entries.get(&node) {
-                Some(entry) if matches!(entry.role, Role::Path | Role::Helper) => {
-                    inside.entry(name).or_insert(node);
-                }
-                _ => {
-                    outside.insert(name);
-                }
+            let ctor = member.kind == DeclarationKind::Constructor;
+            let found = Candidate {
+                node,
+                in_cone: matches!(
+                    cone.entries.get(&node),
+                    Some(entry) if matches!(entry.role, Role::Path | Role::Helper)
+                ),
+                ctor,
+                arity: arity_of(member),
+            };
+            if ctor
+                && !member.modifiers.iter().any(|m| m == "static")
+                && let Some(container) = member.container.as_deref()
+            {
+                ctors
+                    .entry(container)
+                    .or_default()
+                    .push((found, member.key.as_str()));
+            }
+            // What is written with no name of its own (an operator, an
+            // indexer) is not looked for by one.
+            if matches!(
+                member.kind,
+                DeclarationKind::Constructor
+                    | DeclarationKind::Method
+                    | DeclarationKind::Property
+                    | DeclarationKind::Field
+                    | DeclarationKind::Event
+                    | DeclarationKind::EnumMember
+            ) {
+                named.entry(member.short_name()).or_default().push(found);
             }
         }
-        inside.retain(|name, _| !outside.contains(name) && name.len() > 3);
+        named.retain(|name, _| name.len() > 3);
         Self {
             sinks,
-            cone: inside,
+            named,
+            ctors,
         }
+    }
+
+    /// The member of the cone a use of `name` runs, when every member it may
+    /// be — of its kind, taking that many arguments — is in the cone: with
+    /// another type's `Launch()` outside it, which one a call runs is not
+    /// known, and nothing is said.
+    fn resolve(&self, name: &str, ctor: bool, args: Option<usize>) -> Option<NodeId> {
+        let mut found = None;
+        for candidate in self.named.get(name)? {
+            if candidate.ctor != ctor
+                || args.is_some_and(|n| candidate.arity.is_some_and(|a| a != n))
+            {
+                continue;
+            }
+            if !candidate.in_cone {
+                return None;
+            }
+            found.get_or_insert(candidate.node);
+        }
+        found
+    }
+
+    /// The constructors a `: base(…)` or `: this(…)` of `args` arguments in
+    /// `within` may run, when every one it may run is the cone's.
+    fn chained(&self, base: bool, args: Option<usize>, within: Within<'_>) -> Vec<NodeId> {
+        let mut types: Vec<&str> = Vec::new();
+        if base {
+            for written in within.bases {
+                let short = written
+                    .split('<')
+                    .next()
+                    .unwrap_or(written)
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(written)
+                    .trim();
+                types.extend(
+                    self.ctors
+                        .keys()
+                        .copied()
+                        .filter(|name| name.rsplit('.').next() == Some(short)),
+                );
+            }
+        } else {
+            types.extend(within.container);
+        }
+        let mut found = Vec::new();
+        for container in types {
+            let Some(all) = self.ctors.get(container) else {
+                continue;
+            };
+            let mut mine = Vec::new();
+            for &(candidate, key) in all {
+                if (!base && within.key == Some(key))
+                    || args.is_some_and(|n| candidate.arity.is_some_and(|a| a != n))
+                {
+                    continue;
+                }
+                if !candidate.in_cone {
+                    mine.clear();
+                    break;
+                }
+                mine.push(candidate.node);
+            }
+            found.extend(mine);
+        }
+        found
     }
 
     /// What `lines` name, as steps of a chain (`step` says how the lines
     /// are known: `removed`, `named`), with the sinks they lead to. A
     /// sink's type counts only where `around` — the file — mentions one of
-    /// the sink's namespaces: `Token` is many things.
+    /// the sink's namespaces: `Token` is many things. A member counts where
+    /// the text runs it ([`uses`]): not as a type (`o is Gate`), not in a
+    /// string or a comment.
     fn named(
         &self,
         config: &Config,
         step: &'static str,
-        lines: &[&str],
+        lines: &[String],
         around: &str,
+        within: Within<'_>,
     ) -> Vec<(&'static str, Named<'a>)> {
         let mut found: Vec<(&'static str, Named<'a>)> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
+        let mut seen_nodes: HashSet<NodeId> = HashSet::new();
         for line in lines {
-            let code = line.split("//").next().unwrap_or(line);
-            for word in words(code) {
-                if let Some((&name, &sink)) = self.sinks.get_key_value(word) {
+            let code = blank_noncode(line);
+            for word in uses(&code) {
+                if word.chained {
+                    for node in self.chained(word.word == "base", word.args, within) {
+                        if seen_nodes.insert(node) {
+                            found.push((step, Named::Member(node)));
+                        }
+                    }
+                    continue;
+                }
+                if let Some((&name, &sink)) = self.sinks.get_key_value(word.word) {
                     let namespaces = &config.sinks[sink].namespaces;
                     let meant = namespaces.is_empty()
                         || namespaces
@@ -414,14 +606,41 @@ impl<'a> Words<'a> {
                     if meant && seen.insert(name) {
                         found.push((step, Named::Sink(name, sink)));
                     }
-                } else if let Some((&name, &node)) = self.cone.get_key_value(word)
-                    && seen.insert(name)
+                    continue;
+                }
+                let mut hit = None;
+                if word.expr {
+                    hit = self.resolve(word.word, false, word.args);
+                }
+                if hit.is_none() && word.constructs {
+                    hit = self.resolve(word.word, true, word.args);
+                }
+                if hit.is_none() && word.attribute {
+                    hit = self
+                        .resolve(&format!("{}Attribute", word.word), true, word.args)
+                        .or_else(|| self.resolve(word.word, true, word.args));
+                }
+                if let Some(node) = hit
+                    && seen_nodes.insert(node)
                 {
                     found.push((step, Named::Member(node)));
                 }
             }
         }
         found
+    }
+}
+
+/// The type of a member and its bases.
+fn within_of<'a>(members: &'a Members, member: &'a Member) -> Within<'a> {
+    let container = member.container.as_deref();
+    let bases = container
+        .and_then(|c| members.list.iter().find(|m| m.is_type() && m.name == c))
+        .map_or(&[][..], |ty| ty.bases.as_slice());
+    Within {
+        container,
+        key: Some(&member.key),
+        bases,
     }
 }
 
@@ -665,6 +884,7 @@ pub fn judge_revision(
 ) -> Judged {
     let mut judged = Judged::default();
     let words = Words::new(graph, cone);
+    let nothing = Members { list: Vec::new() };
     let mut same: Vec<FileDiff> = Vec::new();
     for file in files {
         if !file.path.ends_with(".cs") {
@@ -719,8 +939,11 @@ pub fn judge_revision(
                     .and_then(|member| graph.node_of(own, member))
             });
             let verdict = node.and_then(|node| verdict(graph, cone, config, node, evidence));
-            let mut named = words.named(config, "removed", &removed, &around);
-            named.extend(words.named(config, "named", &added, &around));
+            let within = within_of(own.map_or(&nothing, |own| &own.members), &change.member);
+            let removed_text = [removed.join("\n")];
+            let added_text = [added.join("\n")];
+            let mut named = words.named(config, "removed", &removed_text, &around, within);
+            named.extend(words.named(config, "named", &added_text, &around, within));
             // A member does not name itself by being changed.
             named.retain(|(_, what)| !matches!(what, Named::Member(other) if Some(*other) == node));
             settle(
