@@ -490,14 +490,15 @@ impl BodyBinder<'_> {
         match receiver.ty.clone() {
             Type::Array { element, .. } => {
                 // A `dynamic` index is converted to an `int` when it is used,
-                // and a bare `default` is the `int` zero.
+                // as an array index, and a bare `default` is the `int` zero.
                 let int = self.special(SpecialType::Int32);
                 let indices = indices
                     .into_iter()
                     .map(|index| {
-                        if matches!(index.ty, Type::Dynamic)
-                            || (index.ty.is_error()
-                                && matches!(index.kind, BoundExpressionKind::Default(_)))
+                        if matches!(index.ty, Type::Dynamic) {
+                            Self::dynamic_array_index(index, &int)
+                        } else if index.ty.is_error()
+                            && matches!(index.kind, BoundExpressionKind::Default(_))
                         {
                             self.convert(index, &int)
                         } else {

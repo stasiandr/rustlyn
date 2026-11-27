@@ -12,6 +12,7 @@
 mod async_iterator;
 mod async_machine;
 mod codegen;
+mod delegate_cache;
 mod dynamic;
 mod emitter;
 mod expression_trees;

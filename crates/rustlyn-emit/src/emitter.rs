@@ -592,6 +592,16 @@ pub(crate) struct Emitter<'a> {
     /// Each type's own nullable context, once worked out.
     pub(crate) nullable_type_contexts: HashMap<SymbolId, Option<u8>>,
     pub(crate) pending_singletons: Vec<crate::singleton::PendingSingleton>,
+    /// Every `<>O`, the class of the delegates made from static method
+    /// groups, by its `TypeDef` token.
+    pub(crate) delegate_cache_classes: HashMap<Token, crate::delegate_cache::CacheClass>,
+    /// The field each such delegate is kept in, by what it is a delegate of.
+    pub(crate) delegate_cache_fields:
+        HashMap<crate::delegate_cache::CacheKey, crate::delegate_cache::CacheField>,
+    /// How a body names the field of a generic `<>O`, by whether the body is
+    /// in a class the language made: through the class's construction over
+    /// the parameters the body has.
+    pub(crate) delegate_cache_references: HashMap<(Token, bool), Token>,
     /// The `Field` token of each field it defines, and of the backing field of
     /// each automatic property.
     pub(crate) fields: HashMap<SymbolId, Token>,
@@ -1271,6 +1281,9 @@ impl<'a> Emitter<'a> {
             machine_type_names: HashMap::new(),
             nullable_type_contexts: HashMap::new(),
             pending_singletons: Vec::new(),
+            delegate_cache_classes: HashMap::new(),
+            delegate_cache_fields: HashMap::new(),
+            delegate_cache_references: HashMap::new(),
             fields: HashMap::new(),
             volatile_fields: std::collections::HashSet::new(),
             getters: HashMap::new(),
@@ -2143,6 +2156,9 @@ impl Emitter<'_> {
             )? {
                 plans.push(plan);
             }
+            // And the delegates made from static method groups, which are
+            // kept in the fields of a `<>O` beside it.
+            plans.extend(self.plan_delegate_caches(symbol, &mut next_type, &mut next_field)?);
         }
 
         // The delegate types the bodies needed synthesized (§10.7.3 of C#
@@ -8968,6 +8984,10 @@ impl Emitter<'_> {
                 self.write_singleton_type(plan, singleton.enclosing, type_offsets)?;
                 continue;
             }
+            if let Some(class) = self.delegate_cache_classes.get(&plan.token).cloned() {
+                self.write_delegate_cache_type(plan, &class, type_offsets)?;
+                continue;
+            }
             if let Some(owner) = plan.display {
                 // `<>c__DisplayClass0_1`: the member's number, and the class's
                 // among the member's — its own first, then the nested ones
@@ -13777,7 +13797,7 @@ impl Emitter<'_> {
     /// Every member of these types that has a body of its own for the plan
     /// and the bodies to ask for: the members, and the accessors of their
     /// properties and events.
-    fn owners_of_bodies(&self, types: &[SymbolId]) -> Vec<SymbolId> {
+    pub(crate) fn owners_of_bodies(&self, types: &[SymbolId]) -> Vec<SymbolId> {
         let symbols = self.compilation.symbols();
         let mut owners = Vec::new();
         for &ty in types {

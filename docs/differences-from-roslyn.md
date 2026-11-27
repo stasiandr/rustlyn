@@ -134,6 +134,13 @@ implements the behaviour.
   `unmanaged` (CS8377) and the nullable-specific CS0312 and CS0313 are not reported. A
   generic method with one candidate is reported where it is called; with several, a
   candidate whose inferred type arguments break its constraints is not a candidate.
+* A delegate made by converting a static method group is kept in a field of the type's
+  `<>O` class, as Roslyn (C# 11) keeps it, with the same conditions: not for `new D(M)`,
+  a method closed over a receiver or a local function that is not `static`, and not in a
+  static constructor or the initializer of a static field. The class is planned from the
+  conversions the bodies of the type make, so a `static` local function that is generic
+  is made anew each time, and so is a method group converted in a class the compiler made
+  over a generic method when that class does not declare the type's parameters first.
 * The metadata Rustlyn writes differs from Roslyn's, in ways reflection could tell, in
   these: a `scoped` or `params` span parameter has no `[ScopedRef]`; a `[ComImport]`
   class's constructor has an IL body and not the runtime-implemented flags; a

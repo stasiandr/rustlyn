@@ -2200,11 +2200,7 @@ impl BodyBinder<'_> {
     ) -> Option<BoundExpression> {
         if matches!(
             operator,
-            BinaryOperator::Equality
-                | BinaryOperator::Inequality
-                | BinaryOperator::LogicalAnd
-                | BinaryOperator::LogicalOr
-                | BinaryOperator::Coalesce
+            BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr | BinaryOperator::Coalesce
         ) || matches!(left.ty, Type::Null)
             || matches!(right.ty, Type::Null)
         {
@@ -2233,6 +2229,8 @@ impl BodyBinder<'_> {
         let mut steps = Vec::new();
         let mut values = Vec::new();
         let mut present: Option<BoundExpression> = None;
+        // Whether each side has a value, for the sides that might not.
+        let mut presence: Vec<BoundExpression> = Vec::new();
         for (side, base) in [(left, &left_base), (right, &right_base)] {
             let local = self.declare_synthetic_local("side", side.ty.clone());
             let read =
@@ -2258,6 +2256,7 @@ impl BodyBinder<'_> {
                     boolean.clone(),
                     span,
                 );
+                presence.push(has.clone());
                 present = Some(match present {
                     None => has,
                     Some(before) => BoundExpression::new(
@@ -2277,6 +2276,66 @@ impl BodyBinder<'_> {
         }
         let [left_value, right_value]: [BoundExpression; 2] = values.try_into().ok()?;
         let call = self.user_defined_operator(operator, &left_value, &right_value, span)?;
+        // `==` and `!=` have a lifted form of their own (§12.4.8): two
+        // empty sides are equal, one empty side is unequal, and only where
+        // both hold something is the operator asked. It has to give `bool`.
+        if matches!(
+            operator,
+            BinaryOperator::Equality | BinaryOperator::Inequality
+        ) {
+            // Roslyn lifts it only where both parameters are one type:
+            // `Money? == 5` has no lifted `==(Money, int)`.
+            let same_parameters = matches!(
+                &call.kind,
+                BoundExpressionKind::Call { arguments, .. }
+                    if matches!(&arguments[..], [first, second] if first.ty == second.ty)
+            );
+            if !self.binder.is_boolean(&call.ty) || !same_parameters {
+                return None;
+            }
+            let equal = operator == BinaryOperator::Equality;
+            let literal = |value: bool| {
+                BoundExpression::new(
+                    BoundExpressionKind::Literal(ConstantValue::Boolean(value)),
+                    boolean.clone(),
+                    span,
+                )
+            };
+            let choose = |condition: BoundExpression, yes: BoundExpression, no: BoundExpression| {
+                BoundExpression::new(
+                    BoundExpressionKind::Conditional {
+                        condition: Box::new(condition),
+                        consequence: Box::new(yes),
+                        alternative: Box::new(no),
+                    },
+                    boolean.clone(),
+                    span,
+                )
+            };
+            let chosen = match &presence[..] {
+                [only] => choose(only.clone(), call, literal(!equal)),
+                [first, second] => {
+                    let same = BoundExpression::new(
+                        BoundExpressionKind::Binary {
+                            operator: BinaryOperator::Equality,
+                            left: Box::new(first.clone()),
+                            right: Box::new(second.clone()),
+                        },
+                        boolean.clone(),
+                        span,
+                    );
+                    let both = choose(first.clone(), call, literal(equal));
+                    choose(same, both, literal(!equal))
+                }
+                _ => return None,
+            };
+            steps.push(chosen);
+            return Some(BoundExpression::new(
+                BoundExpressionKind::Sequence(steps),
+                boolean,
+                span,
+            ));
+        }
         let comparison = matches!(
             operator,
             BinaryOperator::LessThan

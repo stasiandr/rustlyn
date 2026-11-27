@@ -414,6 +414,7 @@ impl BodyBinder<'_> {
                 receiver,
                 virtual_dispatch,
                 type_arguments,
+                written_new: false,
             },
             target.clone(),
             span,

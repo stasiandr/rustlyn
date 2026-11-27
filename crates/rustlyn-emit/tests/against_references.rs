@@ -26726,3 +26726,1575 @@ B7 UInt32 9
 ",
     );
 }
+
+/// An explicit conversion from `object`, an interface, `ValueType` or `Enum` to `T?` is an
+/// unboxing: `unbox.any Nullable<T>` gives the empty one for a null, the value for a boxed `T`,
+/// and throws for anything else. It was bound as the wrap of a value into a `T?`, which read the
+/// reference as a number: `(int?)obj` printed an address, and `(int?)null` was `0`.
+#[test]
+fn an_explicit_conversion_from_a_reference_to_a_nullable_unboxes_it() {
+    check(
+        "nullable_from_object",
+        r#"using System;
+class P {
+  static void Main() {
+    object boxed = 5, nboxed = null, bl = 5L, bs = "s";
+    Console.WriteLine((int?)boxed);
+    Console.WriteLine((int?)nboxed);
+    Console.WriteLine((int?)boxed + 1);
+    int? x = (int?)boxed; Console.WriteLine(x);
+    try { Console.WriteLine((long?)boxed); } catch (InvalidCastException) { Console.WriteLine("ICE"); }
+    try { Console.WriteLine((int?)bs); } catch (InvalidCastException) { Console.WriteLine("ICE"); }
+    Console.WriteLine((long?)bl);
+    var d = (DayOfWeek?)(object)DayOfWeek.Friday; Console.WriteLine(d);
+    IComparable ic = 7; Console.WriteLine((int?)ic);
+    ValueType vt = 8; Console.WriteLine((int?)vt);
+    Console.WriteLine(Gen<int?>(boxed) + " " + Gen<int?>(null));
+    Console.WriteLine(Id((int?)boxed));
+  }
+  static T Gen<T>(object o) => (T)o;
+  static int? Id(int? x) => x;
+}
+"#,
+        r#"5
+
+6
+5
+ICE
+ICE
+5
+Friday
+7
+8
+5 
+5
+"#,
+    );
+}
+
+/// `as T?`, `is T?`, a cast of a struct, an enum or a type parameter, and a `dynamic` converted
+/// to a `T?`, beside the plain cast of an `object`.
+#[test]
+fn every_way_of_reaching_a_nullable_from_an_object_gives_the_nullable_roslyn_does() {
+    check(
+        "nullable_from_object_forms",
+        r#"using System;
+struct S { public int A; public override string ToString() => "S" + A; }
+enum E { X, Y }
+interface I {}
+struct SI : I { public int V; }
+class P {
+  static T? G<T>(object o) where T : struct => (T?)o;
+  static int? FromT<T>(T t) => (int?)(object)t;
+  static T? Wrap<T>(T t) where T : struct => t;
+  static T? Wrap2<T>(T t) where T : struct { T? r = t; return r; }
+  static void Main() {
+    object o = 5, n = null, s = new S { A = 3 }, e = E.Y, str = "x";
+    Console.WriteLine(o as int?);
+    Console.WriteLine(n as int?);
+    Console.WriteLine(str as int?);
+    Console.WriteLine((o as long?).HasValue);
+    { bool bb = o is int?; var q = (o is int?) ? 1 : 2; Console.WriteLine(bb + " " + q); }
+    { bool bb = n is int?; Console.WriteLine(bb); }
+    { bool bb = str is int?; Console.WriteLine(bb); }
+    Console.WriteLine((S?)s);
+    Console.WriteLine((S?)n);
+    Console.WriteLine((E?)e);
+    Console.WriteLine((E?)(object)null);
+    try { Console.WriteLine((E?)o); } catch (InvalidCastException) { Console.WriteLine("ICE1"); }
+    Console.WriteLine((int?)(object)null);
+    Console.WriteLine(G<int>(o));
+    Console.WriteLine(G<S>(s));
+    Console.WriteLine(G<int>(null).HasValue);
+    try { Console.WriteLine(G<long>(o)); } catch (InvalidCastException) { Console.WriteLine("ICE2"); }
+    Console.WriteLine(FromT(7));
+    Console.WriteLine(Wrap(5)); Console.WriteLine(Wrap(new S { A = 2 })); Console.WriteLine(Wrap2(DayOfWeek.Monday));
+    dynamic d = 5; int? di = d; Console.WriteLine(di);
+    dynamic dn = null; int? dni = dn; Console.WriteLine(dni.HasValue);
+    Console.WriteLine((int?)d);
+    try { long? dl = (long?)d; Console.WriteLine(dl); } catch (Exception ex) { Console.WriteLine(ex.GetType().Name); }
+    dynamic ds = "q"; try { int? q = ds; } catch (Exception ex) { Console.WriteLine(ex.GetType().Name); }
+    I i = new SI { V = 4 }; Console.WriteLine(((SI?)i).Value.V);
+    Enum en = E.X; Console.WriteLine((E?)en);
+    ValueType vt = 3L; Console.WriteLine((long?)vt);
+    IComparable<int> ci = 9; Console.WriteLine((int?)ci);
+    int? sw = o switch { int v => v, _ => null }; Console.WriteLine(sw);
+    object oo = (int?)8; Console.WriteLine(oo.GetType().Name + (int?)oo);
+    int? b = (int?)o ?? 1; Console.WriteLine(b);
+    Console.WriteLine((int?)n ?? -1);
+  }
+}
+"#,
+        r#"5
+
+
+False
+True 1
+False
+False
+S3
+
+Y
+
+ICE1
+
+5
+S3
+False
+ICE2
+7
+5
+S2
+Monday
+5
+False
+5
+5
+RuntimeBinderException
+4
+X
+3
+9
+5
+Int328
+5
+-1
+"#,
+    );
+}
+
+/// What an expression reads ahead of an `await` in it is its value then, whatever the `await`
+/// goes on to change: a field, a static, an element or a field of a struct in an array, a
+/// property, a `double` or a `long`, and the operands of calls, tuples, initializers,
+/// interpolations and indexers. A field or an element of a value type was kept as the place it
+/// is, which a call on a struct needs and nothing else does, so it was read after the `await`:
+/// `count + await Mod()` printed 12 where Roslyn prints 2.
+#[test]
+fn an_operand_read_before_an_await_is_its_value_from_before_it() {
+    check(
+        "await_reads_before",
+        r#"using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+struct S { public int X; public long L; public string Name; public void Inc() { X += 100; } public int Get() => X; }
+class C { public int F; public double D; public S St; public int P { get; set; } public int[] A = new int[3]; public static int SF; public static long SL; public static S SS; }
+class P {
+  int count = 1; double d = 1.5; long lg = 7; string str = "a"; S st; int[] arr = { 1, 2, 3 }; S[] sarr = new S[2]; static int sc = 1; static S ss;
+  int Prop { get; set; } = 1;
+  C obj = new C();
+  async Task<int> Mod() { await Task.Yield(); count += 10; d += 10; lg += 10; str += "z"; st.X += 10; arr[0] += 10; sarr[0].X += 10; sc += 10; ss.X += 10; Prop += 10; obj.F += 10; obj.D += 10; obj.St.X += 10; C.SF += 10; C.SL += 10; C.SS.X += 10; return 1; }
+  static async Task<int> Id(int v) { await Task.Yield(); return v; }
+  static async Task<T> Id2<T>(T v) { await Task.Yield(); return v; }
+  static string J(params object[] xs) => string.Join(",", xs);
+  async Task Run() {
+    Console.WriteLine("field " + (count + await Mod())); count = 1;
+    d = 1.5; Console.WriteLine("double " + (d + await Mod())); d = 1.5;
+    Console.WriteLine("long " + (lg + await Mod())); lg = 7;
+    Console.WriteLine("str " + (str + await Id2("q") + await Mod())); str = "a";
+    Console.WriteLine("arr " + (arr[0] + await Mod())); arr[0] = 1;
+    Console.WriteLine("arrlen " + (arr.Length + arr[0] + await Mod())); arr[0] = 1;
+    Console.WriteLine("sarr " + (sarr[0].X + await Mod())); sarr[0].X = 0;
+    Console.WriteLine("stfield " + (st.X + await Mod())); st.X = 0;
+    Console.WriteLine("static " + (sc + await Mod())); sc = 1;
+    Console.WriteLine("sstatic " + (ss.X + await Mod())); ss.X = 0;
+    Console.WriteLine("prop " + (Prop + await Mod())); Prop = 1;
+    Console.WriteLine("objf " + (obj.F + await Mod())); obj.F = 0;
+    Console.WriteLine("objd " + (obj.D + await Mod())); obj.D = 0;
+    Console.WriteLine("objst " + (obj.St.X + await Mod())); obj.St.X = 0;
+    Console.WriteLine("C.SF " + (C.SF + await Mod())); C.SF = 0;
+    Console.WriteLine("C.SL " + (C.SL + await Mod())); C.SL = 0;
+    Console.WriteLine("C.SS " + (C.SS.X + await Mod())); C.SS.X = 0;
+    Console.WriteLine("args " + J(count, await Mod(), count)); count = 1;
+    Console.WriteLine("args2 " + J(d, st.X, arr[0], sc, lg, await Mod(), d, st.X, arr[0], sc, lg)); d = 1.5; st.X = 0; arr[0] = 1; sc = 1; lg = 7;
+    Console.WriteLine("tuple " + (count, await Mod(), count)); count = 1;
+    Console.WriteLine("math " + Math.Max(count, await Mod())); count = 1;
+    Console.WriteLine("cond " + (count > 0 ? count : await Mod()));
+    Console.WriteLine("cond2 " + (await Id(1) > 0 ? count : await Mod() )); count = 1;
+    Console.WriteLine("and " + (count == 1 && await Mod() == 1 ? count : -1)); count = 1;
+    Console.WriteLine("coalesce " + (str ?? await Id2("x")));
+    object o = null; Console.WriteLine("coalesce2 " + (o ?? (object)count + await Id2("x") + await Mod())); count = 1;
+    Console.WriteLine("interp " + $"{count}-{await Mod()}-{count}"); count = 1;
+    Console.WriteLine("interp2 " + $"{arr[0]}-{await Mod()}-{arr[0]:D3}"); arr[0] = 1;
+    var arr2 = new[] { count, await Mod(), count }; Console.WriteLine("newarr " + J(arr2[0], arr2[1], arr2[2])); count = 1;
+    var arr3 = new int[] { arr[0], await Mod() }; Console.WriteLine("newarr2 " + J(arr3[0], arr3[1])); arr[0] = 1;
+    var li = new List<int> { count, await Mod(), count }; Console.WriteLine("coll " + J(li[0], li[1], li[2])); count = 1;
+    var oi = new C { F = count, D = await Mod() }; Console.WriteLine("objinit " + oi.F + " " + oi.D); count = 1;
+    var oi2 = new C { F = await Mod(), D = count }; Console.WriteLine("objinit2 " + oi2.F + " " + oi2.D); count = 1;
+    int i = 0; int[] a = new int[4]; a[i] = await Id(5); Console.WriteLine("idx1 " + J(a[0], a[1]));
+    i = 0; a = new int[4]; a[i++] = await Id(7); Console.WriteLine("idx2 " + J(a[0], a[1], i));
+    i = 0; a = new int[4]; a[await Id(2)] = i + 1; Console.WriteLine("idx3 " + J(a[0], a[2]));
+    i = 0; a = new[] { 10, 20, 30, 40 }; a[i++] += await Id(1); Console.WriteLine("idx4 " + J(a[0], a[1], i));
+    i = 0; a = new[] { 10, 20, 30, 40 }; a[i] += await Id(i = 3); Console.WriteLine("idx5 " + J(a[0], a[3], i));
+    i = 0; a = new[] { 10, 20, 30, 40 }; a[i] = await Id(i = 3); Console.WriteLine("idx6 " + J(a[0], a[3], i));
+    i = 1; a = new[] { 10, 20, 30, 40 }; var r = a[i] + await Id(a[i] = 99); Console.WriteLine("idx7 " + r);
+    i = 1; a = new[] { 10, 20, 30, 40 }; r = a[i++] + await Id(i); Console.WriteLine("idx8 " + r + " " + i);
+    sarr[1].X = 1; sarr[1].Inc(); Console.WriteLine("inc0 " + sarr[1].X); sarr[1].X = 1;
+    sarr[1].Inc(); sarr[1].X += await Id(1000); Console.WriteLine("inc1 " + sarr[1].X);
+    Console.WriteLine("recv " + (st.Get() + await Mod())); st.X = 0;
+    Console.WriteLine("recv2 " + (sarr[0].Get() + await Mod())); sarr[0].X = 0;
+    st.X = 1; await Task.Yield(); st.Inc(); Console.WriteLine("recv3 " + st.X); st.X = 0;
+    Console.WriteLine("nested " + (count + await Id(count + await Mod()) + count)); count = 1;
+    Console.WriteLine("nested2 " + (count + await Id2(d + await Mod()))); count = 1; d = 1.5;
+    int x = 5; Console.WriteLine("plain " + (x + await Id(x++)) + " " + x);
+    x = 5; Console.WriteLine("plain2 " + (x * await Id(x = 2)) + " " + x);
+    x = 5; Console.WriteLine("plain3 " + J(x, await Id(x = 2), x));
+    x = 5; Console.WriteLine("plain4 " + J(x, await Id(x += 1), x));
+    x = 5; int y = 6; Console.WriteLine("plain5 " + J(x + y, await Id(y = 0)));
+    x = 5; Console.WriteLine("plain6 " + (x < await Id(x = 9)) + " " + (x == await Id(x = 5)));
+    x = 5; string sx = "s"; Console.WriteLine("plain7 " + (sx + await Id2(sx = "t")));
+    x = 5; Console.WriteLine("plain8 " + (-x + await Id(x = 2)));
+    x = 5; Console.WriteLine("plain9 " + ((long)x + await Id(x = 2)));
+    x = 5; Console.WriteLine("plain10 " + (x + (await Id(x = 2)) * x));
+    x = 5; Console.WriteLine("plain11 " + (x + await Id(await Id(x = 3))));
+    x = 5; Console.WriteLine("plain12 " + (x++ + await Id(x)));
+    x = 5; Console.WriteLine("plain13 " + (++x + await Id(x)));
+    x = 5; Console.WriteLine("plain14 " + (x + await Id(x++) + x));
+  }
+  static async Task Main() { await new P().Run(); }
+}
+"#,
+        r#"field 2
+double 2.5
+long 28
+str azzzq1
+arr 42
+arrlen 5
+sarr 61
+stfield 71
+static 82
+sstatic 91
+prop 102
+objf 111
+objd 121
+objst 131
+C.SF 141
+C.SL 151
+C.SS 161
+args 161,1,171
+args2 161.5,100,121,91,157,1,171.5,110,131,101,167
+tuple (11, 1, 21)
+math 1
+cond 1
+cond2 1
+and 11
+coalesce azzzzzzzzzzzzzzzzzz
+coalesce2 1x1
+interp 1-1-11
+interp2 51-1-061
+newarr 11,1,21
+newarr2 11,1
+coll 11,1,21
+objinit 1 1
+objinit2 1 11
+idx1 5,0
+idx2 7,0,1
+idx3 0,1
+idx4 11,20,1
+idx5 13,40,3
+idx6 3,40,3
+idx7 119
+idx8 22 2
+inc0 101
+inc1 1101
+recv 111
+recv2 241
+recv3 101
+nested 74
+nested2 143.5
+plain 10 6
+plain2 10 2
+plain3 5,2,2
+plain4 5,6,6
+plain5 11,0
+plain6 True False
+plain7 st
+plain8 -3
+plain9 7
+plain10 9
+plain11 8
+plain12 11
+plain13 12
+plain14 16
+"#,
+    );
+}
+
+/// A local read ahead of an `await` is read ahead of it even where an operand after it writes the
+/// variable: `x + await F(x++)` reads `x` first, and `y = y + await F(y = 10)` adds what `y`
+/// held. Such a local was taken for one nothing could change, and read after the `await`.
+#[test]
+fn a_local_a_later_operand_writes_is_read_before_the_await() {
+    check(
+        "await_reads_before_writes",
+        r#"using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+struct S { public int X; public long L; public void Inc() { X += 100; } public int Get() => X; }
+class Box<T> { public T V; }
+class P {
+  int count = 1; S st; S[] sarr = new S[2]; int[] arr = { 1, 2, 3 };
+  async Task<int> Mod() { await Task.Yield(); count += 10; st.X += 10; arr[0] += 10; sarr[0].X += 10; return 1; }
+  static async Task<int> Id(int v) { await Task.Yield(); return v; }
+  static string J(params object[] xs) => string.Join(",", xs);
+  static int Ref(ref int a, int b) => a * 100 + b;
+  static int In(in S s, int b) => s.X * 100 + b;
+  static void Out(out int a, int b) { a = b; }
+  static T Gen<T>(T t, int b) => t;
+  async Task<T> GenAsync<T>(T value, Box<T> box) {
+    var r = J(value, await Id(1), box.V);
+    box.V = default;
+    return value;
+  }
+  async Task Run() {
+    // ref/in/out arguments
+    count = 1; Console.WriteLine("ref " + Ref(ref count, await Mod()));
+    count = 1; Console.WriteLine("ref2 " + Ref(ref arr[0], await Mod())); arr[0] = 1;
+    st.X = 1; Console.WriteLine("in " + In(in st, await Mod())); st.X = 0;
+    st.X = 1; Console.WriteLine("in2 " + In(st, await Mod())); st.X = 0;
+    int o; Out(out o, await Id(4)); Console.WriteLine("out " + o);
+    // deconstruction / tuples
+    int a = 1, b = 2; (a, b) = (b, await Id(a + 10)); Console.WriteLine("dec " + a + b);
+    a = 1; b = 2; (a, b) = (await Id(5), a); Console.WriteLine("dec2 " + a + b);
+    var t = (count, await Mod()); Console.WriteLine("tup " + t);
+    count = 1; var t2 = (A: count, B: await Mod(), C: arr[0]); Console.WriteLine("tup2 " + t2);
+    // string concat chains
+    string s1 = "a", s2 = "b"; Console.WriteLine("cat " + (s1 + s2 + await Id(1) + s1));
+    s1 = "a"; Console.WriteLine("cat2 " + (s1 + await Id(1) + (s1 = "z") + s1));
+    // patterns / is / as
+    object ob = count; Console.WriteLine("is " + ((ob is int n ? n : -1) + await Mod()));
+    Console.WriteLine("switch " + (count switch { 1 => await Mod(), _ => count }));
+    count = 1; Console.WriteLine("switch2 " + (await Id(1) switch { 1 => count + await Mod(), _ => 0 }));
+    // binary operator mixes
+    count = 1; Console.WriteLine("mix " + (count * 2 + count + await Mod() * count - count));
+    count = 1; Console.WriteLine("mix2 " + ((count, arr[0]) == (1, 1) ? await Mod() : 0));
+    count = 1; Console.WriteLine("shift " + (count << await Mod()));
+    count = 1; Console.WriteLine("cmp " + (count == await Mod()) + (count != await Mod()));
+    count = 1; bool bb = count == 1 && count + await Mod() > 1; Console.WriteLine("logic " + bb);
+    count = 1; bool b3 = await Mod() == 1 || count == 11; Console.WriteLine("logic2 " + b3);
+    // nested calls
+    count = 1; Console.WriteLine("nest " + J(Id(count).Result, await Mod()));
+    count = 1; Console.WriteLine("gen " + Gen(count, await Mod()));
+    count = 1; Console.WriteLine("gen2 " + Gen(arr[0], await Mod())); arr[0] = 1;
+    // generic receivers
+    var bx = new Box<int> { V = 3 }; Console.WriteLine("generic " + await GenAsync(7, bx));
+    // property with side effects
+    count = 1; Console.WriteLine("lambda " + new Func<int>(() => count)() + (count + await Mod()));
+    // assignment targets
+    int[] aa = { 0, 0, 0 }; int k = 0; aa[k] = k + await Id(1); Console.WriteLine("assign " + J(aa[0], aa[1]));
+    k = 0; aa = new int[3]; aa[k] = await Id(k = 2); Console.WriteLine("assign2 " + J(aa[0], aa[2], k));
+    k = 0; aa = new int[3]; aa[k++] = await Id(k); Console.WriteLine("assign3 " + J(aa[0], aa[1], k));
+    k = 0; aa = new int[3]; aa[await Id(1)] = k++; Console.WriteLine("assign4 " + J(aa[0], aa[1], k));
+    var sa = new S[2]; k = 0; sa[k].X = await Id(k = 1); Console.WriteLine("sfield " + J(sa[0].X, sa[1].X, k));
+    sa = new S[2]; k = 0; sa[k++].X += await Id(5); Console.WriteLine("sfield2 " + J(sa[0].X, sa[1].X, k));
+    var c = new Box<int>(); var c2 = c; c.V = await Id(3); c = null; Console.WriteLine("objassign " + c2.V);
+    c = c2; c.V = c.V + await Id(1); Console.WriteLine("objassign2 " + c.V);
+    c.V += await Id(c.V = 100); Console.WriteLine("objassign3 " + c.V);
+    c.V = 1; c.V = c.V + await Id(c.V = 100); Console.WriteLine("objassign4 " + c.V);
+    // locals read after assigning in the same expression
+    int m = 1; m = m + await Id(m + 1) + m; Console.WriteLine("self " + m);
+    m = 1; m += m + await Id(m + 1); Console.WriteLine("self2 " + m);
+    m = 1; m = (m = 5) + await Id(m); Console.WriteLine("self3 " + m);
+    m = 1; var q = (m, m = 7, await Id(m)); Console.WriteLine("self4 " + q);
+  }
+  static async Task Main() { await new P().Run(); }
+}
+"#,
+        r#"ref 1101
+ref2 2101
+in 1101
+in2 1101
+out 4
+dec 211
+dec2 51
+tup (31, 1)
+tup2 (1, 1, 41)
+cat ab1a
+cat2 a1zz
+is 12
+switch 21
+switch2 2
+mix 3
+mix2 0
+shift 2
+cmp TrueTrue
+logic True
+logic2 True
+nest 1,1
+gen 1
+gen2 141
+generic 7
+lambda 12
+assign 1,0
+assign2 2,0,2
+assign3 1,0,1
+assign4 0,0,1
+sfield 1,0,1
+sfield2 5,0,1
+objassign 3
+objassign2 4
+objassign3 104
+objassign4 101
+self 4
+self2 4
+self3 10
+self4 (1, 7, 7)
+"#,
+    );
+}
+
+/// `z += await F(z = 10)` reads `z` before the `await` and adds to what it was.
+#[test]
+fn a_compound_assignment_reads_its_local_before_an_await_that_writes_it() {
+    check(
+        "await_compound_writes",
+        r#"using System;
+using System.Threading.Tasks;
+class P {
+  static async Task<int> Aw(int v) { await Task.Yield(); return v; }
+  static async Task Main() {
+    int z = 5; z += await Aw(z = 10); Console.WriteLine(z);
+    int y = 5; y = y + await Aw(y = 10); Console.WriteLine(y);
+    int w = 5; w *= await Aw(w++); Console.WriteLine(w);
+    int u = 5; u -= await Aw((u = 1) + 1); Console.WriteLine(u);
+    long l = 5; l += await Aw((int)(l = 10)); Console.WriteLine(l);
+  }
+}
+"#,
+        r#"15
+15
+25
+3
+15
+"#,
+    );
+}
+
+/// `string a = "x", b = "y";` is two declarations in a block that is no scope: the machine let
+/// the strings go where the block ended, and `a + b` read nothing after an `await`.
+#[test]
+fn the_locals_of_one_declaration_statement_survive_it_in_a_machine() {
+    check(
+        "await_declaration_group",
+        r#"using System;
+using System.Threading.Tasks;
+class P {
+  static async Task<int> Id(int v) { await Task.Yield(); return v; }
+  static async Task Main() {
+    string s1 = "a", s2 = "b";
+    Console.WriteLine(s1 + s2);
+    int x = 1, y = 2;
+    Console.WriteLine(x + y);
+    await Task.Yield();
+    Console.WriteLine(s1 + s2);
+    string t1 = "a", t2 = "b";
+    await Task.Yield();
+    Console.WriteLine(t1 + t2);
+    string u1 = "a", u2 = "b";
+    Console.WriteLine(u1 + u2 + await Id(1));
+    string v1 = "a"; string v2 = "b";
+    Console.WriteLine(v1 + v2 + await Id(1));
+    Console.WriteLine(v1 + v2 + await Id(1) + v1);
+  }
+}
+"#,
+        r#"ab
+3
+ab
+ab
+ab1
+ab1
+ab1a
+"#,
+    );
+}
+
+/// The size of an array and an index into one that are `dynamic` are converted at run time as
+/// array indices: an `int`, and any integral value that fits, where a conversion to `int` would
+/// refuse a `long`; a `string` or a `double` is refused. A size was converted as a number, so
+/// `new int[n]` for a `dynamic` `n` threw an `OverflowException`.
+#[test]
+fn a_dynamic_array_size_and_index_are_converted_as_array_indices() {
+    check(
+        "dynamic_array_index",
+        r#"using System;
+using System.Collections.Generic;
+class P {
+  static void T(string name, Action a) {
+    try { a(); } catch (Exception e) { Console.WriteLine(name + " " + e.GetType().Name); }
+  }
+  static void Main() {
+    dynamic n = 3, l = 3L, s = "s", u = 3u, b = (byte)2, nul = null, dbl = 2.0;
+    int[] arr = { 10, 20, 30, 40 };
+    int[,] m = new int[4, 4];
+    Console.WriteLine(new int[n].Length);
+    Console.WriteLine(new int[n, 2].Length);
+    Console.WriteLine(new int[2, n].GetLength(1));
+    Console.WriteLine(new long[n].Length);
+    Console.WriteLine(new string[b].Length);
+    Console.WriteLine(new int[n][].Length);
+    T("len-long", () => Console.WriteLine(new int[l].Length));
+    T("len-uint", () => Console.WriteLine(new int[u].Length));
+    T("len-str", () => Console.WriteLine(new int[s].Length));
+    T("len-null", () => Console.WriteLine(new int[nul].Length));
+    T("len-dbl", () => Console.WriteLine(new int[dbl].Length));
+    Console.WriteLine(arr[n]);
+    Console.WriteLine(arr[b]);
+    arr[n] = 99; Console.WriteLine(arr[3]);
+    arr[n] += 1; Console.WriteLine(arr[3]);
+    arr[n]++; Console.WriteLine(arr[3]);
+    Console.WriteLine(m[n, 1]);
+    m[n, n] = 5; Console.WriteLine(m[3, 3]);
+    T("idx-long", () => Console.WriteLine(arr[l]));
+    T("idx-str", () => Console.WriteLine(arr[s]));
+    T("idx-uint", () => Console.WriteLine(arr[u]));
+    T("idx-null", () => Console.WriteLine(arr[nul]));
+    Console.WriteLine(arr[n].GetType().Name);
+    var x = arr[n]; Console.WriteLine(x.GetType().Name);
+    var y = new int[n]; Console.WriteLine(y.GetType().Name);
+    List<int> li = new List<int> { 5, 6, 7, 8 };
+    Console.WriteLine(li[n]);
+    string str = "hello"; Console.WriteLine(str[n]);
+  }
+}
+"#,
+        r#"3
+6
+3
+3
+2
+3
+3
+3
+len-str RuntimeBinderException
+len-null RuntimeBinderException
+len-dbl RuntimeBinderException
+40
+30
+99
+100
+101
+0
+5
+101
+idx-str RuntimeBinderException
+101
+idx-null RuntimeBinderException
+Int32
+Int32
+Int32[]
+8
+l
+"#,
+    );
+}
+
+/// The element of a walk over a `dynamic` collection goes to the loop's variable by the cast the
+/// runtime binder makes: `foreach (long x in dy)` over `int`s converts each, and an `op_Explicit`
+/// of the variable's type is called. It was an unboxing, which refuses an `int` as a `long`.
+#[test]
+fn the_variable_of_a_foreach_over_a_dynamic_collection_is_converted_as_a_dynamic_cast() {
+    check(
+        "dynamic_foreach",
+        r#"using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+class Money { public decimal V; public Money(decimal v) { V = v; } public static explicit operator Money(int i) => new Money(i * 2); public override string ToString() => "M" + V; }
+class P {
+  static void T(string name, Action a) {
+    try { a(); } catch (Exception e) { Console.WriteLine(name + " " + e.GetType().Name); }
+  }
+  static IEnumerable<object> Objs() { yield return 1; yield return 2L; }
+  static async Task Main() {
+    dynamic dy = new[] { 1, 2 };
+    dynamic dl = new List<dynamic> { 1, 2.5, "a" };
+    foreach (long x in dy) Console.Write(x + " "); Console.WriteLine();
+    foreach (double x in dy) Console.Write(x + " "); Console.WriteLine();
+    foreach (int? x in dy) Console.Write(x + " "); Console.WriteLine();
+    foreach (long? x in dy) Console.Write(x + " "); Console.WriteLine();
+    foreach (Money x in dy) Console.Write(x + " "); Console.WriteLine();
+    foreach (object x in dy) Console.Write(x + " "); Console.WriteLine();
+    foreach (dynamic x in dy) Console.Write(x + 1 + " "); Console.WriteLine();
+    foreach (var x in dy) Console.Write(x + 1 + " "); Console.WriteLine();
+    T("s", () => { foreach (string x in dy) Console.Write(x); });
+    T("l-from-double", () => { foreach (int x in dl) Console.Write(x + " "); });
+    foreach (double x in new dynamic[] { 1, 2.5f, (byte)3 }) Console.Write(x + " "); Console.WriteLine();
+    foreach (char c in new dynamic[] { 65, 'b' }) Console.Write(c); Console.WriteLine();
+    T("objs", () => { foreach (long x in Objs()) Console.Write(x + " "); });
+  }
+}
+"#,
+        r#"1 2 
+1 2 
+1 2 
+1 2 
+M2 M4 
+1 2 
+2 3 
+2 3 
+s RuntimeBinderException
+1 2 l-from-double RuntimeBinderException
+1 2.5 3 
+Ab
+objs InvalidCastException
+"#,
+    );
+}
+
+/// `new C(d) { X = 3 }` with a `dynamic` argument chooses the constructor at run time, and
+/// applies the initializer to what it made. The initializer made the call static, so the first
+/// constructor was the one called.
+#[test]
+fn an_object_creation_with_a_dynamic_argument_and_an_initializer_binds_its_constructor_at_run_time()
+{
+    check(
+        "dynamic_creation_initializer",
+        r#"using System;
+using System.Collections.Generic;
+class Pt {
+  public int X; public string Tag; public List<int> L = new List<int>(); public Pt Inner;
+  public Pt(int x) { X = x; Tag = "int"; }
+  public Pt(string s) { X = s.Length; Tag = "str"; }
+  public Pt(int a, string b) { X = a; Tag = b; }
+  public int Y { get; set; }
+  public override string ToString() => "Pt" + X + Tag + Y + string.Join(",", L) + (Inner != null ? "[" + Inner + "]" : "");
+}
+struct SV { public int A; public string B; public SV(int a) { A = a; B = "i"; } public SV(string s) { A = s.Length; B = "s"; } public override string ToString() => "SV" + A + B; }
+class Coll : List<int> { public Coll(int n) { Add(n); } public Coll(string s) { Add(s.Length); Add(100); } }
+class P {
+  static int n;
+  static int Next() => ++n;
+  static void Main() {
+    dynamic s = "hello", i = 7;
+    Console.WriteLine(new Pt(s) { X = 3 });
+    Console.WriteLine(new Pt(i) { Tag = "t", Y = 4 });
+    Console.WriteLine(new Pt(i, "b") { X = Next(), L = { 1, 2 } });
+    Console.WriteLine(new Pt(s) { Inner = new Pt(i) { Y = 9 }, Y = 1 });
+    Console.WriteLine(new Pt(s) { Inner = new Pt(s) { X = 2 } });
+    Console.WriteLine(new SV(s) { A = 5 });
+    Console.WriteLine(new SV(i) { B = "z" });
+    Console.WriteLine(new Coll(i) { 5, 6 }.Count);
+    Console.WriteLine(string.Join(",", new Coll(s) { 5, 6 }));
+    var p = new Pt(s) { }; Console.WriteLine(p);
+    Pt q = new Pt(i) { X = 1 }; Console.WriteLine(q.GetType().Name + q.X);
+    var arr = new[] { new Pt(s) { X = 1 }, new Pt(i) { X = 2 } }; Console.WriteLine(arr.Length + " " + arr[1]);
+    Func<dynamic, Pt> f = d => new Pt(d) { Y = 8 }; Console.WriteLine(f("ab") + " " + f(3));
+    var lst = new List<int>(i) { 1, 2 }; Console.WriteLine(lst.Count + " " + lst.Capacity);
+    dynamic dd = 1.5; try { Console.WriteLine(new Pt(dd) { X = 2 }); } catch (Exception e) { Console.WriteLine(e.GetType().Name); }
+    dynamic d2 = new Pt(s) { X = 3 };
+    Console.WriteLine(d2.X);
+  }
+}
+"#,
+        r#"Pt3str0
+Pt7t4
+Pt1b01,2
+Pt5str1[Pt7int9]
+Pt5str0[Pt2str0]
+SV5s
+SV7z
+3
+5,100,5,6
+Pt5str0
+Pt1
+2 Pt2int0
+Pt2str8 Pt3int8
+2 7
+RuntimeBinderException
+3
+"#,
+    );
+}
+
+/// `==` and `!=` lifted over a struct's own: equal where both are empty, unequal where one is,
+/// asked of the struct where both are there, and with a non-nullable operand converted first — a
+/// number converted by the struct's implicit conversion. These were refused ("cannot compare two
+/// values") beside anything but another of the same struct.
+#[test]
+fn a_lifted_user_defined_equality_converts_the_operand_it_needs() {
+    check(
+        "lifted_equality_a",
+        r#"using System;
+struct Money {
+  public decimal V; public Money(decimal v) { V = v; }
+  public static bool operator ==(Money a, Money b) { Console.Write("[eq]"); return a.V == b.V; }
+  public static bool operator !=(Money a, Money b) { Console.Write("[ne]"); return a.V != b.V; }
+  public static implicit operator Money(decimal d) => new Money(d);
+  public override string ToString() => "$" + V;
+  public override bool Equals(object o) => o is Money m && m.V == V;
+  public override int GetHashCode() => V.GetHashCode();
+}
+class P {
+  static void Main() {
+    Money m = new Money(5); Money? mm = m, mn = null; decimal? dn = null; decimal d = 5; decimal? dd = 5;
+    Console.WriteLine(mm == m);
+    Console.WriteLine(m == mm);
+    Console.WriteLine(mm == mn);
+    Console.WriteLine(mn == mn);
+    Console.WriteLine(mm != mn);
+    Console.WriteLine(mn != mn);
+    Console.WriteLine(mm != m);
+    Console.WriteLine(mm == null);
+    Console.WriteLine(null != mm);
+    Console.WriteLine(mm == mm);
+    Console.WriteLine(mm == 5m);
+    Console.WriteLine(mm != 5m);
+    Console.WriteLine(mm != d);
+    Console.WriteLine(5m == mm);
+    Console.WriteLine(mn == 5m);
+    Console.WriteLine(mn != 5m);
+    Console.WriteLine(mm == dd);
+    Console.WriteLine(mm == dn);
+    Console.WriteLine(mn == dn);
+    Console.WriteLine(dn != mn);
+    Console.WriteLine(dd == mm);
+    Console.WriteLine(m == dd);
+    Console.WriteLine(dn == m);
+    Console.WriteLine(d == mm);
+    int calls = 0;
+    Money? Get() { calls++; return mm; }
+    Console.WriteLine(Get() == Get() ? calls : -calls);
+    if (mm == m) Console.WriteLine("if");
+    bool b = mm != mn; Console.WriteLine(b);
+    var t = mm == m && mm != mn; Console.WriteLine(t);
+  }
+}
+"#,
+        r#"[eq]True
+[eq]True
+False
+True
+True
+False
+[ne]False
+False
+True
+[eq]True
+[eq]True
+[ne]False
+[ne]False
+[eq]True
+False
+True
+[eq]True
+False
+True
+False
+[eq]True
+[eq]True
+False
+[eq]True
+[eq]2
+[eq]if
+True
+[eq]True
+"#,
+    );
+}
+
+/// The lifted equality and orderings of operators an extension block declares, of a generic
+/// struct's, and the operators taking two different types, which have no lifted form for `==` but
+/// have one for `<`.
+#[test]
+fn a_lifted_equality_of_an_extension_block_and_of_generic_structs() {
+    check(
+        "lifted_equality_b",
+        r#"using System;
+struct V { public int X; public V(int x) { X = x; } public override string ToString() => "V" + X; }
+struct W { public int X; public W(int x) { X = x; } public static implicit operator W(int i) => new W(i); public static implicit operator int(W w) => w.X; }
+struct G<T> { public T Val; public G(T v) { Val = v; }
+  public static bool operator ==(G<T> a, G<T> b) { Console.Write("(Geq)"); return Equals(a.Val, b.Val); }
+  public static bool operator !=(G<T> a, G<T> b) { Console.Write("(Gne)"); return !Equals(a.Val, b.Val); }
+  public static bool operator <(G<T> a, G<T> b) => false;
+  public static bool operator >(G<T> a, G<T> b) => true;
+  public override bool Equals(object o) => false; public override int GetHashCode() => 0; }
+struct Mixed { public int X; public Mixed(int x) { X = x; }
+  public static bool operator ==(Mixed a, int b) { Console.Write("(M==int)"); return a.X == b; }
+  public static bool operator !=(Mixed a, int b) { Console.Write("(M!=int)"); return a.X != b; }
+  public static bool operator ==(int a, Mixed b) { Console.Write("(int==M)"); return a == b.X; }
+  public static bool operator !=(int a, Mixed b) { Console.Write("(int!=M)"); return a != b.X; }
+  public override bool Equals(object o) => false; public override int GetHashCode() => 0; }
+static class E {
+  extension(V) {
+    public static bool operator ==(V a, V b) { Console.Write("(V==V)"); return a.X == b.X; }
+    public static bool operator !=(V a, V b) { Console.Write("(V!=V)"); return a.X != b.X; }
+    public static bool operator <(V a, V b) { Console.Write("(V<V)"); return a.X < b.X; }
+    public static bool operator >(V a, V b) { Console.Write("(V>V)"); return a.X > b.X; }
+    public static bool operator ==(V a, int b) { Console.Write("(V==int)"); return a.X == b; }
+    public static bool operator !=(V a, int b) { Console.Write("(V!=int)"); return a.X != b; }
+  }
+}
+class P {
+  static void Main() {
+    V v = new V(2); V? nv = new V(2), nn = null; int i = 2; int? ni = 2, nin = null;
+    Console.WriteLine(nv == v); Console.WriteLine(v == nv); Console.WriteLine(nv != v);
+    Console.WriteLine(nv == nv); Console.WriteLine(nv == nn); Console.WriteLine(nn == nn); Console.WriteLine(nn != nn); Console.WriteLine(nv != nn);
+    Console.WriteLine(nv < v); Console.WriteLine(nn < v); Console.WriteLine(nv > nn); Console.WriteLine(nv > nv);
+    G<int>? g = new G<int>(1), gn = null; G<int> g1 = new G<int>(1);
+    Console.WriteLine(g == g1); Console.WriteLine(g != gn); Console.WriteLine(g == g); Console.WriteLine(gn == gn); Console.WriteLine(g > g1); Console.WriteLine(gn > g1); Console.WriteLine(g < g);
+    Mixed m = new Mixed(3); Mixed? nm = m, nmn = null;
+    int c = 0; V? Make() { c++; return nv; }
+    Console.WriteLine((Make() == Make()) + " " + c);
+    Console.WriteLine(nv == v ? "y" : "n");
+    if (nn != v) Console.WriteLine("ne-null");
+    bool bb = nv != nv; Console.WriteLine(bb);
+    Console.WriteLine(nv == null); Console.WriteLine(nn == null); Console.WriteLine(null != nv);
+  }
+}
+"#,
+        r#"(V==V)True
+(V==V)True
+(V!=V)False
+(V==V)True
+False
+True
+False
+True
+(V<V)False
+False
+False
+(V>V)False
+(Geq)True
+True
+(Geq)True
+True
+True
+False
+False
+(V==V)True 2
+(V==V)y
+ne-null
+(V!=V)False
+False
+True
+True
+"#,
+    );
+}
+
+/// `==` of an extension block's, with a `V?` and a `V`.
+#[test]
+fn an_extension_equality_lifts_over_a_nullable() {
+    check(
+        "lifted_equality_extension",
+        r#"using System;
+struct V { public int X; }
+static class E {
+  extension(V) {
+    public static bool operator ==(V a, V b) => a.X == b.X;
+    public static bool operator !=(V a, V b) => a.X != b.X;
+  }
+}
+class P {
+  static void Main() {
+    V b = new V { X = 2 }; V? na = new V { X = 2 };
+    Console.WriteLine(na == b);
+    Console.WriteLine(na != null);
+  }
+}
+"#,
+        r#"True
+True
+"#,
+    );
+}
+
+/// `-`, `+`, `~` and `!` on an `S?` whose `S` converts to a number or to `bool`: the operand
+/// converts through the lifted conversion and the operator is the lifted one, null for a null. It
+/// was taken as the `S?` itself, which read nothing from it (a `NullReferenceException`) or was
+/// refused.
+#[test]
+fn a_unary_operator_on_a_nullable_goes_through_the_conversion_of_its_struct() {
+    check(
+        "unary_through_conversions",
+        r#"using System;
+struct L { public long V; public static implicit operator long(L m) => m.V; }
+struct U { public uint V; public static implicit operator uint(U m) => m.V; }
+struct D { public double V; public static implicit operator double(D m) => m.V; }
+struct M { public decimal V; public static implicit operator decimal(M m) => m.V; }
+struct B { public byte V; public static implicit operator byte(B m) => m.V; }
+struct Both { public int V; public static implicit operator int(Both m) => m.V; public static implicit operator bool(Both m) => m.V != 0; }
+struct Direct { public int V; public static implicit operator bool?(Direct m) => m.V > 0 ? true : (bool?)null; }
+struct Ex { public int V; public static explicit operator int(Ex m) => m.V; }
+class P {
+  static string S(object o) => o == null ? "null" : o.GetType().Name + ":" + o;
+  static T Id<T>(T t) => t;
+  static void Main() {
+    L? l = new L { V = 5 }; L? ln = null;
+    Console.WriteLine(S(-l) + " " + S(+l) + " " + S(~l) + " " + S(-ln) + " " + S(~ln));
+    U? u = new U { V = 5 }; U? un = null;
+    Console.WriteLine(S(-u) + " " + S(+u) + " " + S(~u) + " " + S(-un));
+    D? d = new D { V = 2.5 }; D? dn = null;
+    Console.WriteLine(S(-d) + " " + S(+d) + " " + S(-dn));
+    M? m = new M { V = 1.5m }; M? mn = null;
+    Console.WriteLine(S(-m) + " " + S(+m) + " " + S(-mn));
+    B? b = new B { V = 7 }; B? bn = null;
+    Console.WriteLine(S(-b) + " " + S(+b) + " " + S(~b) + " " + S(-bn));
+    Both? bo = new Both { V = 3 }; Both? bon = null;
+    Console.WriteLine(S(-bo) + " " + S(~bo) + " " + S(!bo) + " " + S(!bon) + " " + S(-bon));
+    Console.WriteLine(S(bo & true) + " " + S(bo | false) + " " + S(bon & true) + " " + S(bo ^ true) + " " + S(true & bo));
+    Direct? dr = new Direct { V = 1 }; Direct? drz = new Direct { V = 0 }; Direct? drn = null;
+    Console.WriteLine(S(!dr) + " " + S(!drz) + " " + S(!drn));
+    var x = !bo; Console.WriteLine(x.GetType().Name + " " + x);
+    var y = -bo; Console.WriteLine(y.GetType().Name + " " + y);
+    int? sum = -bo + 1; Console.WriteLine(sum);
+    int? sn = -bon + 1; Console.WriteLine(sn.HasValue);
+    bool? t = !bo; if (t == false) Console.WriteLine("f");
+    Ex? ex = new Ex { V = 1 };
+    Console.WriteLine(S((int?)ex));
+    Console.WriteLine(S(-(int?)ex));
+    Console.WriteLine(S(Id(-bo)));
+    Both? ch = bo; Console.WriteLine(S(-ch));
+    Func<Both?, int?> f = q => -q; Console.WriteLine(S(f(bo)) + S(f(bon)));
+    Func<Both?, bool?> g = q => !q; Console.WriteLine(S(g(bo)) + S(g(bon)));
+  }
+}
+"#,
+        r#"Int64:-5 Int64:5 Int64:-6 null null
+Int64:-5 UInt32:5 UInt32:4294967290 null
+Double:-2.5 Double:2.5 null
+Decimal:-1.5 Decimal:1.5 null
+Int32:-7 Int32:7 Int32:-8 null
+Int32:-3 Int32:-4 Boolean:False null null
+Boolean:True Boolean:True null Boolean:False Boolean:True
+Boolean:False null null
+Boolean False
+Int32 -3
+-2
+False
+f
+Int32:1
+Int32:-1
+Int32:-3
+Int32:-3
+Int32:-3null
+Boolean:Falsenull
+"#,
+    );
+}
+
+/// `!` on a struct that converts to `bool` is a `bool`, and on one that converts to a `bool?` a
+/// `bool?`; beside the `bool` conversion the `bool?` one is not asked.
+#[test]
+fn the_not_operator_takes_the_conversion_to_bool_before_the_one_to_a_nullable_bool() {
+    check(
+        "unary_through_conversions_bool",
+        r#"using System;
+struct Both { public int V; public static implicit operator int(Both m) => m.V; public static implicit operator bool(Both m) => m.V != 0; }
+struct Direct { public int V; public static implicit operator bool?(Direct m) => m.V > 0 ? true : (bool?)null; }
+struct Dual { public int V; public static implicit operator bool(Dual m) => m.V != 0; public static implicit operator bool?(Dual m) => m.V > 5 ? true : (bool?)null; }
+class P {
+  static void Main() {
+    Both b = new Both { V = 2 }; Direct d = new Direct { V = 1 }; Dual du = new Dual { V = 3 }; 
+    var a = !b; Console.WriteLine(a.GetType().Name + a);
+    var c = !d; Console.WriteLine(c.GetType().Name + c);
+    var e = !du; Console.WriteLine(e.GetType().Name + e);
+    var g = -b; Console.WriteLine(g.GetType().Name + g);
+    if (!b) Console.WriteLine("x"); else Console.WriteLine("y");
+    Console.WriteLine(!b ? 1 : 2);
+  }
+}
+"#,
+        r#"BooleanFalse
+BooleanFalse
+BooleanFalse
+Int32-2
+y
+2
+"#,
+    );
+}
+
+/// `!` and `&` on an `S?` whose `S` has `implicit operator bool`.
+#[test]
+fn the_not_operator_lifts_a_conversion_to_bool_over_a_nullable() {
+    check(
+        "unary_not_lifted",
+        r#"using System;
+struct Other { public int V; public static implicit operator bool(Other m) => m.V != 0; }
+class P {
+  static void Main() {
+    Other o = new Other { V = 3 }; Other? on = o; Other? nn = null;
+    Console.WriteLine(!on);
+    Console.WriteLine(!nn);
+    Console.WriteLine(!o);
+    Console.WriteLine(on & true);
+    Console.WriteLine(on | false);
+    Console.WriteLine(nn & true);
+  }
+}
+"#,
+        r#"False
+
+False
+True
+True
+
+"#,
+    );
+}
+
+/// `-`, `~` and `+` on an `S?` whose `S` converts to `int`.
+#[test]
+fn a_unary_operator_lifts_a_conversion_to_int_over_a_nullable() {
+    check(
+        "unary_lifted_int",
+        r#"using System;
+struct MyInt { public int V; public static implicit operator int(MyInt m) => m.V; }
+struct Other { public int V; public static implicit operator int(Other m) => m.V; public static implicit operator bool(Other m) => m.V != 0; }
+class P {
+  static void Main() {
+    MyInt m = new MyInt { V = 7 }; MyInt? mm = m; MyInt? mn = null;
+    Console.WriteLine(-m);
+    Console.WriteLine(-mm);
+    Console.WriteLine(~mm);
+    Console.WriteLine(+mm);
+    Console.WriteLine(-mn);
+    Console.WriteLine((-mn).HasValue);
+    Console.WriteLine(mm + 1);
+    Console.WriteLine(mm * mm);
+    Console.WriteLine(mn * mm);
+    Other o = new Other { V = 3 }; Other? on = o;
+    Console.WriteLine(-on);
+  }
+}
+"#,
+        r#"-7
+-7
+-8
+7
+
+False
+8
+49
+
+-3
+"#,
+    );
+}
+
+/// A delegate made by converting a static method group is kept in a field of a class nested in
+/// the type, `<>O`, and made again only while that is null: two conversions of one method to one
+/// delegate type are the same object. Not so for `new D(M)`, a method closed over a receiver, a
+/// local function that is not `static`, or inside the static constructor and the initializers of
+/// static fields. The fields are named `<n>__Method`, a generic type's class declares its
+/// parameters, and a delegate type that names a method's parameters is kept in a class of the
+/// method.
+#[test]
+fn a_delegate_made_from_a_static_method_group_is_cached_in_a_class_of_the_type() {
+    check(
+        "delegate_cache_1",
+        r#"using System;
+using System.Linq;
+using System.Reflection;
+using System.Threading.Tasks;
+using System.Collections.Generic;
+static class Ext { public static string Hello(this string s, int n) => s + n; public static int Twice(this int x, int y) => x * y; }
+class Other { public static string Str(int x) => "s"; public static int SM(int x) => x * 2; public int IM(int x) => x; }
+class G<T> {
+  public static T Id(T t) => t;
+  public static Func<T, T> Get() => Id;
+  public static Func<int, int> GetInt() => Other.SM;
+  public Func<int, int> GetInt2() => Other.SM;
+}
+struct SS { public static Func<int, int> Get() => Other.SM; }
+class P {
+  static int SM(int x) => x + 1;
+  static T Gen<T>(T t) => t;
+  int Inst(int x) => x;
+  static P() { Sc = Other.SM; Sc2 = Other.SM; }
+  static Func<int, int> Sc, Sc2;
+  static Func<int, int> Fld = Other.SM;
+  Func<int, int> Fld2 = Other.SM;
+  static Func<int, int> A() => Other.SM;
+  static Func<int, int> B() => Other.SM;
+  static Func<int, int> C() => SM;
+  static Func<int, int> D() => SM;
+  static Func<int, int> E() { return P.SM; }
+  static Func<int, int> GenM<T>() => Other.SM;
+  static Func<T, T> GenM2<T>() => Gen<T>;
+  static Func<int, int> GenM3() => Gen;
+  static Func<string, string> GenM4() => Gen<string>;
+  static Func<string, string> GenM5() => Gen<string>;
+  static Func<int, int> Loc() { static int L(int x) => x; return L; }
+  static Func<int, int> Loc2() { int L(int x) => x; return L; }
+  static Func<int, int> Loc3() { static int L(int x) => x; return L; }
+  static Func<string, int, string> Ex1() => Ext.Hello;
+  static Func<string, int, string> Ex2() => Ext.Hello;
+  static Func<int, string> Ex3() => "q".Hello;
+  static Func<int, string> Ex4() { string k = "z"; return k.Hello; }
+  static Func<int, string> Ex5() { string k = "z"; return k.Hello; }
+  Func<int, int> Inst1() => Inst;
+  Func<int, int> Inst2() => Inst;
+  static Func<int, int> Lam() => x => x;
+  static Func<int, int> Via() { Func<int, int> f = Math.Abs; return f; }
+  static Func<int, int> Via2() { Func<int, int> f = Math.Abs; return f; }
+  static Func<long, long> Via3() => Math.Abs;
+  static Delegate Dl() => (Func<int, int>)Other.SM;
+  static Delegate Dl2() => new Func<int, int>(Other.SM);
+  static Delegate Dl3() => new Func<int, int>(Other.SM);
+  static Action<int> Act() => Console.WriteLine;
+  static Func<int, int> Same1() => Other.SM;
+  static Func<int, int> InLam() { Func<Func<int,int>> f = () => Other.SM; return f(); }
+  static Func<int, int> InLam2() { Func<Func<int,int>> f = () => Other.SM; return f(); }
+  static async Task<Func<int, int>> Asy() { await Task.Yield(); return Other.SM; }
+  static IEnumerable<Func<int, int>> Iter() { yield return Other.SM; yield return Other.SM; }
+  static Func<int, int> CapLam(int y) { Func<Func<int,int>> f = () => { y++; return Other.SM; }; return f(); }
+  static System.Linq.Expressions.Expression<Func<int>> Tree() => () => Other.SM(1);
+  static Func<int, int> Cond(bool b) => b ? Other.SM : SM;
+  static Func<int, int> Cond2(bool b) => b ? Other.SM : SM;
+  static Func<int, int> Ret(int x) { Func<int, int> d = x > 0 ? Other.SM : null; return d; }
+  static Func<int, int> Cast() => (Func<int, int>)SM;
+  static Func<int, int> Arg() => Id2(SM);
+  static Func<int, int> Id2(Func<int, int> f) => f;
+  static Func<int, int> Arg2() => Id2(SM);
+  static Func<int, int> Obj() { return new Func<int,int>(SM); }
+  delegate int MyD(int x);
+  static MyD MyDel() => SM;
+  static MyD MyDel2() => SM;
+  static Func<int, long> Cov() => null;
+  static Func<int, object> Cov2() => Other.Str;
+  static Func<int, object> Cov3() => Other.Str;
+  static Func<object, object> Gen5() => Gen<object>;
+
+  static void Same(string name, Func<object> a, Func<object> b) { Console.WriteLine(name + " " + ReferenceEquals(a(), b())); }
+  static void Main() {
+    Same("A-B", () => A(), () => B());
+    Same("A-A", () => A(), () => A());
+    Same("C-D", () => C(), () => D());
+    Same("C-E", () => C(), () => E());
+    Same("C-Cond", () => C(), () => Cond(false));
+    Same("A-Cond", () => A(), () => Cond(true));
+    Same("Cond-Cond2", () => Cond(true), () => Cond2(true));
+    Same("A-GenM", () => A(), () => GenM<int>());
+    Same("GenM-GenM string", () => GenM<int>(), () => GenM<string>());
+    Same("GenM2-GenM2", () => GenM2<int>(), () => GenM2<int>());
+    Same("GenM2-GenM2 s", () => GenM2<int>(), () => GenM2<string>());
+    Same("GenM3-GenM3", () => GenM3(), () => GenM3());
+    Same("GenM4-GenM5", () => GenM4(), () => GenM5());
+    Same("Loc-Loc", () => Loc(), () => Loc());
+    Same("Loc2-Loc2", () => Loc2(), () => Loc2());
+    Same("Ex1-Ex2", () => Ex1(), () => Ex2());
+    Same("Ex1-Ex1", () => Ex1(), () => Ex1());
+    Same("Ex3", () => Ex3(), () => Ex3());
+    Same("Ex4", () => Ex4(), () => Ex4());
+    Same("Inst1", () => new P().Inst1(), () => new P().Inst1());
+    Same("Lam", () => Lam(), () => Lam());
+    Same("Via-Via2", () => Via(), () => Via2());
+    Same("Via-Via3", () => Via(), () => Via3());
+    Same("Dl-A", () => Dl(), () => A());
+    Same("Dl-Dl2", () => Dl(), () => Dl2());
+    Same("Dl2-Dl3", () => Dl2(), () => Dl3());
+    Same("Act", () => Act(), () => Act());
+    Same("Same1-A", () => Same1(), () => A());
+    Same("InLam-InLam2", () => InLam(), () => InLam2());
+    Same("InLam-A", () => InLam(), () => A());
+    Same("Asy", () => Asy().Result, () => Asy().Result);
+    Same("Asy-A", () => Asy().Result, () => A());
+    Same("Iter", () => Iter().First(), () => Iter().Last());
+    Same("Iter-A", () => Iter().First(), () => A());
+    Same("CapLam-A", () => CapLam(1), () => A());
+    Same("Ret-A", () => Ret(1), () => A());
+    Same("Cast-C", () => Cast(), () => C());
+    Same("Arg-Arg2", () => Arg(), () => Arg2());
+    Same("Arg-C", () => Arg(), () => C());
+    Same("Obj-C", () => Obj(), () => C());
+    Same("MyDel", () => MyDel(), () => MyDel2());
+    Same("Cov-C", () => Cov(), () => Cov());
+    Same("Cov2-Cov3", () => Cov2(), () => Cov3());
+    Same("Cov2-A", () => Cov2(), () => A());
+    Same("Gen5", () => Gen5(), () => Gen5());
+    Same("G<int>.Get", () => G<int>.Get(), () => G<int>.Get());
+    Same("G<int>-G<string>", () => G<int>.Get(), () => (object)G<string>.Get());
+    Same("G.GetInt", () => G<int>.GetInt(), () => G<int>.GetInt());
+    Same("G.GetInt-G<string>.GetInt", () => G<int>.GetInt(), () => G<string>.GetInt());
+    Same("G.GetInt-A", () => G<int>.GetInt(), () => A());
+    Same("G.GetInt2", () => new G<int>().GetInt2(), () => new G<int>().GetInt2());
+    Same("SS-A", () => SS.Get(), () => A());
+    Same("Sc-Sc2", () => Sc, () => Sc2);
+    Same("Sc-A", () => Sc, () => A());
+    Same("Fld-A", () => Fld, () => A());
+    Same("Fld2-A", () => new P().Fld2, () => A());
+    Same("Fld-Fld2", () => Fld, () => new P().Fld2);
+    Same("Fld2", () => new P().Fld2, () => new P().Fld2);
+
+    Console.WriteLine("---- nested types");
+    foreach (var t in typeof(P).Assembly.GetTypes().OrderBy(t => t.FullName)) {
+      if (!t.IsNested || !t.Name.StartsWith("<>O")) continue;
+      Console.WriteLine(t.FullName + " generic=" + t.IsGenericTypeDefinition + (t.IsGenericTypeDefinition ? "<" + string.Join(",", t.GetGenericArguments().Select(a => a.Name)) + ">" : "") + " vis=" + (t.IsNestedPublic ? "public" : t.IsNestedPrivate ? "private" : t.IsNestedAssembly ? "internal" : "other") + " sealed=" + t.IsSealed + " abstract=" + t.IsAbstract + " attrs=" + string.Join("|", t.GetCustomAttributesData().Select(a => a.AttributeType.Name)));
+      foreach (var f in t.GetFields(BindingFlags.Static | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly).OrderBy(f => f.Name))
+        Console.WriteLine("   field " + f.Name + " : " + f.FieldType + " " + f.Attributes + " " + string.Join("|", f.GetCustomAttributesData().Select(a => a.AttributeType.Name)));
+    }
+  }
+}
+"#,
+        r#"A-B True
+A-A True
+C-D True
+C-E True
+C-Cond True
+A-Cond True
+Cond-Cond2 True
+A-GenM True
+GenM-GenM string True
+GenM2-GenM2 True
+GenM2-GenM2 s False
+GenM3-GenM3 True
+GenM4-GenM5 True
+Loc-Loc True
+Loc2-Loc2 False
+Ex1-Ex2 True
+Ex1-Ex1 True
+Ex3 False
+Ex4 False
+Inst1 False
+Lam True
+Via-Via2 True
+Via-Via3 False
+Dl-A True
+Dl-Dl2 False
+Dl2-Dl3 False
+Act True
+Same1-A True
+InLam-InLam2 True
+InLam-A True
+Asy True
+Asy-A True
+Iter True
+Iter-A True
+CapLam-A True
+Ret-A True
+Cast-C True
+Arg-Arg2 True
+Arg-C True
+Obj-C False
+MyDel True
+Cov-C True
+Cov2-Cov3 True
+Cov2-A False
+Gen5 True
+G<int>.Get True
+G<int>-G<string> False
+G.GetInt True
+G.GetInt-G<string>.GetInt False
+G.GetInt-A False
+G.GetInt2 True
+SS-A False
+Sc-Sc2 False
+Sc-A False
+Fld-A False
+Fld2-A True
+Fld-Fld2 False
+Fld2 True
+---- nested types
+G`1+<>O generic=True<T> vis=private sealed=True abstract=True attrs=CompilerGeneratedAttribute
+   field <0>__Id : System.Func`2[T,T] Public, Static 
+   field <1>__SM : System.Func`2[System.Int32,System.Int32] Public, Static 
+P+<>O generic=False vis=private sealed=True abstract=True attrs=CompilerGeneratedAttribute
+   field <0>__SM : System.Func`2[System.Int32,System.Int32] Public, Static 
+   field <1>__SM : System.Func`2[System.Int32,System.Int32] Public, Static 
+   field <10>__SM : P+MyD Public, Static 
+   field <11>__Str : System.Func`2[System.Int32,System.Object] Public, Static 
+   field <12>__Gen : System.Func`2[System.Object,System.Object] Public, Static 
+   field <2>__Gen : System.Func`2[System.Int32,System.Int32] Public, Static 
+   field <3>__Gen : System.Func`2[System.String,System.String] Public, Static 
+   field <4>__L : System.Func`2[System.Int32,System.Int32] Public, Static 
+   field <5>__L : System.Func`2[System.Int32,System.Int32] Public, Static 
+   field <6>__Hello : System.Func`3[System.String,System.Int32,System.String] Public, Static 
+   field <7>__Abs : System.Func`2[System.Int32,System.Int32] Public, Static 
+   field <8>__Abs : System.Func`2[System.Int64,System.Int64] Public, Static 
+   field <9>__WriteLine : System.Action`1[System.Int32] Public, Static 
+SS+<>O generic=False vis=private sealed=True abstract=True attrs=CompilerGeneratedAttribute
+   field <0>__SM : System.Func`2[System.Int32,System.Int32] Public, Static 
+"#,
+    );
+}
+
+/// The same for the places a method group is converted: field initializers, constructors,
+/// property bodies and initializers, interfaces, generic types and methods, `var`, `Delegate`,
+/// `ref` and custom delegates, arguments and collections.
+#[test]
+fn the_cache_of_method_group_delegates_follows_where_they_are_converted() {
+    check(
+        "delegate_cache_2",
+        r#"using System;
+using System.Linq;
+using System.Reflection;
+using System.Collections.Generic;
+interface IFace { static int SM(int x) => x; static Func<int, int> Get() => SM; static Func<int, int> Get2() => SM; Func<int, int> Dflt() => SM; }
+class Impl : IFace { }
+struct Cs { public static Func<int, int> A, B; public static Func<int,int> C() => Other.SM; static Cs() { A = x => 1; } }
+class Other { public static int SM(int x) => x * 2; public static int SM2(int x) => x * 2; public static T Id<T>(T t) => t; public static void R(ref int x) { } public static int Bd(int x) => x; }
+delegate void RefD(ref int x);
+delegate int Bd(int x);
+class Q {
+  public static Func<int, int> A, B, C, D, E, F;
+  static Q() {
+    A = Other.SM;
+    Func<Func<int, int>> lam = () => Other.SM;
+    B = lam();
+    static Func<int, int> loc() => Other.SM;
+    C = loc();
+    D = lam();
+  }
+  public static Func<int, int> Get() => Other.SM;
+  public Func<int, int> I1 = Other.SM;
+  public Func<int, int> I2 = Other.SM;
+  public Q() { E = Other.SM; }
+  public Q(int x) { F = Other.SM; }
+  public Func<int, int> Prop1 => Other.SM;
+  public Func<int, int> Prop2 { get; } = Other.SM;
+  public static Func<int, int> S3 { get; } = Other.SM;
+  public static event Func<int, int> Ev = Other.SM;
+  public static Func<int, int> Evg() => Ev;
+}
+class Gc<T> {
+  public static Func<T, T> A() => Other.Id;
+  public static Func<T, T> B() => Other.Id<T>;
+  public static Func<int, int> C() => Other.Id;
+  public static Func<U, U> M<U>() => Other.Id;
+  public static Func<int, int> N<U>() => Other.Id;
+  public static Func<T, U> Z<U>(Func<T,U> f) => f;
+  public static Func<T, T> Fi() { Func<T, T> f = Other.Id; return f; }
+}
+class P {
+  static int SM(int x) => x;
+  static Func<int, int> Natural() { var f = SM; return f; }
+  static Func<int, int> Natural2() { var f = SM; return f; }
+  static Delegate AsDelegate() { Delegate d = SM; return d; }
+  static Delegate AsDelegate2() { Delegate d = SM; return d; }
+  static object AsObj() { object d = (Func<int,int>)SM; return d; }
+  static RefD Refd() => Other.R;
+  static RefD Refd2() => Other.R;
+  static Bd Bd1() => Other.Bd;
+  static Bd Bd2() => Other.Bd;
+  static Func<int, int> Opt() => null;
+  static int OptM(int x, int y = 3) => x;
+  static Func<int, int> Opt2() => OptM2;
+  static int OptM2(int x) => x;
+  static Func<int, int> Chk() { checked { return SM; } }
+    static Func<int, int> AssignedTwice() { Func<int, int> a = SM, b = SM; return a == b ? a : null; }
+  static Func<int, int> InTernary(bool c) => c ? SM : SM;
+  static Func<int, int> Coalesce(Func<int, int> x) => x ?? SM;
+  static Func<int, int> Coalesce2(Func<int, int> x) => x ?? SM;
+  static Func<int, int>[] Arr() => new Func<int, int>[] { SM, SM };
+  static List<Func<int, int>> Lst() => new List<Func<int, int>> { SM, SM };
+  static Func<int, int> Switch(int i) => i switch { 0 => SM, _ => SM };
+    static Func<int, int> Param(Func<int,int> f = null) => f;
+  static Func<int, int> Param2() => Param(SM);
+  static Func<int, int> Param3() => Param(f: SM);
+  static void Main() {
+    void Same(string name, Func<object> a, Func<object> b) { Console.WriteLine(name + " " + ReferenceEquals(a(), b())); }
+    Same("Q.A-Q.B", () => Q.A, () => Q.B);
+    Same("Q.B-Q.D", () => Q.B, () => Q.D);
+    Same("Q.B-Get", () => Q.B, () => Q.Get());
+    Same("Q.C-Get", () => Q.C, () => Q.Get());
+    Same("Q.A-Get", () => Q.A, () => Q.Get());
+    Same("I1-I2", () => new Q().I1, () => new Q().I2);
+    Same("I1-Get", () => new Q().I1, () => Q.Get());
+    Same("E-Get", () => { new Q(); return Q.A; }, () => Q.Get());
+    Same("Prop1-Get", () => new Q().Prop1, () => Q.Get());
+    Same("Prop2-Get", () => new Q().Prop2, () => Q.Get());
+    Same("S3-Get", () => Q.S3, () => Q.Get());
+    Same("Ev-Get", () => Q.Evg(), () => Q.Get());
+    Same("Cs.A-C", () => Cs.A, () => Cs.C());
+    Same("Natural-Natural2", () => Natural(), () => Natural2());
+    Same("AsDelegate", () => AsDelegate(), () => AsDelegate2());
+    Same("AsDelegate-Natural", () => AsDelegate(), () => Natural());
+    Same("AsObj-Natural", () => AsObj(), () => Natural());
+    Same("Refd", () => Refd(), () => Refd2());
+    Same("Bd", () => Bd1(), () => Bd2());
+    Same("Opt", () => Opt(), () => Opt());
+    Same("Chk-Natural", () => Chk(), () => Natural());
+    Same("InTernary", () => InTernary(true), () => InTernary(false));
+    Same("Coalesce", () => Coalesce(null), () => Coalesce2(null));
+    Same("Coalesce-Natural", () => Coalesce(null), () => Natural());
+    Same("Arr", () => Arr()[0], () => Arr()[1]);
+    Same("Arr-Natural", () => Arr()[0], () => Natural());
+    Same("Lst-Natural", () => Lst()[0], () => Natural());
+    Same("Switch-Natural", () => Switch(0), () => Natural());
+    Same("Param2-Natural", () => Param2(), () => Natural());
+    Same("Param3-Natural", () => Param3(), () => Natural());
+    Same("Gc.A", () => Gc<int>.A(), () => Gc<int>.B());
+    Same("Gc.A-C", () => Gc<int>.A(), () => Gc<int>.C());
+    Same("Gc.A-Gc<str>", () => Gc<int>.A(), () => Gc<int>.A());
+    Same("Gc.M", () => Gc<int>.M<int>(), () => Gc<int>.M<int>());
+    Same("Gc.M2", () => Gc<int>.M<int>(), () => Gc<string>.M<int>());
+    Same("Gc.N", () => Gc<int>.N<int>(), () => Gc<int>.N<string>());
+    Same("Gc.Fi", () => Gc<int>.Fi(), () => Gc<int>.Fi());
+    Same("IFace.Get", () => IFace.Get(), () => IFace.Get2());
+    Same("IFace.Dflt", () => ((IFace)new Impl()).Dflt(), () => ((IFace)new Impl()).Dflt());
+    Same("IFace.Dflt-Get", () => ((IFace)new Impl()).Dflt(), () => IFace.Get());
+    Console.WriteLine("---- nested types");
+    foreach (var t in typeof(P).Assembly.GetTypes().OrderBy(t => t.FullName)) {
+      if (!t.IsNested || !t.Name.Contains(">O")) continue;
+      Console.WriteLine(t.FullName + " generic=" + t.IsGenericTypeDefinition + (t.IsGenericTypeDefinition ? "<" + string.Join(",", t.GetGenericArguments().Select(a => a.Name)) + ">" : "") + " decl=" + t.DeclaringType);
+      foreach (var f in t.GetFields(BindingFlags.Static | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly).OrderBy(f => f.Name))
+        Console.WriteLine("   field " + f.Name + " : " + f.FieldType);
+    }
+  }
+}
+"#,
+        r#"Q.A-Q.B False
+Q.B-Q.D False
+Q.B-Get False
+Q.C-Get False
+Q.A-Get False
+I1-I2 True
+I1-Get True
+E-Get False
+Prop1-Get True
+Prop2-Get True
+S3-Get False
+Ev-Get False
+Cs.A-C False
+Natural-Natural2 True
+AsDelegate True
+AsDelegate-Natural True
+AsObj-Natural True
+Refd True
+Bd True
+Opt True
+Chk-Natural True
+InTernary True
+Coalesce True
+Coalesce-Natural True
+Arr True
+Arr-Natural True
+Lst-Natural True
+Switch-Natural True
+Param2-Natural True
+Param3-Natural True
+Gc.A True
+Gc.A-C False
+Gc.A-Gc<str> True
+Gc.M True
+Gc.M2 False
+Gc.N True
+Gc.Fi True
+IFace.Get True
+IFace.Dflt True
+IFace.Dflt-Get True
+---- nested types
+Cs+<>O generic=False decl=Cs
+   field <0>__SM : System.Func`2[System.Int32,System.Int32]
+Gc`1+<>O generic=True<T> decl=Gc`1[T]
+   field <0>__Id : System.Func`2[T,T]
+   field <1>__Id : System.Func`2[System.Int32,System.Int32]
+Gc`1+<M>O__3_0`1 generic=True<T,U> decl=Gc`1[T]
+   field <0>__Id : System.Func`2[U,U]
+IFace+<>O generic=False decl=IFace
+   field <0>__SM : System.Func`2[System.Int32,System.Int32]
+P+<>O generic=False decl=P
+   field <0>__SM : System.Func`2[System.Int32,System.Int32]
+   field <1>__R : RefD
+   field <2>__Bd : Bd
+   field <3>__OptM2 : System.Func`2[System.Int32,System.Int32]
+Q+<>O generic=False decl=Q
+   field <0>__SM : System.Func`2[System.Int32,System.Int32]
+"#,
+    );
+}
+
+/// Delegates beside events, multicast and closures: a static method group is one object where it
+/// is converted twice, and a lambda that captures is a new one each time.
+#[test]
+fn a_static_method_group_delegate_is_the_same_object_each_time() {
+    check(
+        "delegate_cache_3",
+        r#"using System;
+using System.Collections.Generic;
+using System.Linq;
+class Animal { } class Dog : Animal { }
+static class Ext { public static string Hello(this string s, int n) => s + n; public static int Twice<T>(this T t, int x) => x * 2; public static void Ping(this Dog d) => Console.Write("ping "); }
+class Ev { 
+  public event EventHandler Plain; public event Action<int> Custom { add { Console.Write("[add]"); c += value; } remove { Console.Write("[remove]"); c -= value; } } Action<int> c; public void Fire(int x) { Plain?.Invoke(this, EventArgs.Empty); c?.Invoke(x); }
+  public static event Action SE; public static void FireS() => SE?.Invoke(); public static void SubS(Action a) => SE += a; public static void UnS(Action a) => SE -= a;
+  public int PlainCount => Plain?.GetInvocationList().Length ?? 0;
+}
+interface IEv { event Action E; } class ImplEv : IEv { public event Action E; public void Go() => E?.Invoke(); }
+class ExplEv : IEv { Action e; event Action IEv.E { add => e += value; remove => e -= value; } public void Go() => e?.Invoke(); }
+struct SEv { public event Action E; public void Go() => E?.Invoke(); }
+class Inst { public int V; public int M(int x) => x + V; public static int SM(int x) => x * 2; public void Void() => Console.Write("void" + V + " "); }
+class P {
+  static int Cnt; static int Next() => ++Cnt;
+  static void Main() {
+    Action a = () => Console.Write("a "); Action b = () => Console.Write("b "); Action ab = a + b; ab(); Console.WriteLine(ab.GetInvocationList().Length);
+    ab -= a; ab(); Console.WriteLine(ab.GetInvocationList().Length); ab -= b; Console.WriteLine(ab == null); Action both = a + b + a; both -= a; both(); Console.WriteLine(); both = a + b + a + b; both -= (a + b); both(); Console.WriteLine(both.GetInvocationList().Length); 
+    Action n = null; n += a; n += null; n -= null; Console.WriteLine(n.GetInvocationList().Length); Action nn = null; nn -= a; Console.WriteLine(nn == null); Action c = a; c += c; c(); Console.WriteLine(c.GetInvocationList().Length);
+    Func<int> f1 = () => 1; Func<int> f2 = () => 2; Func<int> f = f1 + f2; Console.WriteLine(f()); f -= f2; Console.WriteLine(f());
+    var m1 = new Inst { V = 1 }; var m2 = new Inst { V = 2 }; Func<int, int> d1 = m1.M, d2 = m1.M; Console.WriteLine(d1 == d2); Console.WriteLine(d1.Equals(d2)); Console.WriteLine(ReferenceEquals(d1, d2)); Func<int, int> d3 = m2.M; Console.WriteLine(d1 == d3); Func<int, int> s1 = Inst.SM, s2 = Inst.SM; Console.WriteLine((s1 == s2) + " " + ReferenceEquals(s1, s2));
+    Func<int, int> l1 = x => x, l2 = x => x; Console.WriteLine(l1 == l2); Func<int> st1 = StaticLam(), st2 = StaticLam(); Console.WriteLine(ReferenceEquals(st1, st2)); Console.WriteLine(ReferenceEquals(MG(), MG()) + " " + ReferenceEquals(Lam(), Lam())); Console.WriteLine(ReferenceEquals(CapLam(1), CapLam(1)));
+    Func<int, string> ext2 = "q".Hello; Console.WriteLine(ext2(4)); Action ping = new Dog().Ping; ping(); Console.WriteLine();
+    Func<Dog> fd = () => new Dog(); Func<Animal> fa = fd; Console.WriteLine(fa() is Dog); Action<Animal> aa = x => Console.Write("aa "); Action<Dog> ad = aa; ad(new Dog()); Console.WriteLine(); Func<Animal, Dog> fad = x => new Dog(); Func<Dog, Animal> fda = fad; Console.WriteLine(fda(new Dog()).GetType().Name);
+    EventHandler eh = (s, e) => Console.Write("eh "); Action<object, EventArgs> act = eh.Invoke; act(null, null); Console.WriteLine();
+    var ev = new Ev(); ev.Plain += (s, e) => Console.Write("p1 "); EventHandler h2 = (s, e) => Console.Write("p2 "); ev.Plain += h2; ev.Plain += h2; ev.Fire(0); Console.WriteLine(ev.PlainCount); ev.Plain -= h2; Console.WriteLine(ev.PlainCount); ev.Plain -= h2; ev.Plain -= h2; Console.WriteLine(ev.PlainCount);
+    Action<int> ca = x => Console.Write("c" + x + " "); ev.Custom += ca; ev.Custom += ca; ev.Fire(5); ev.Custom -= ca; ev.Fire(6); Console.WriteLine(); Ev.SubS(a); Ev.SubS(b); Ev.FireS(); Ev.UnS(a); Ev.FireS(); Console.WriteLine();
+    var ie = new ImplEv(); IEv iev = ie; iev.E += () => Console.Write("impl "); ie.Go(); var ee = new ExplEv(); IEv ie2 = ee; ie2.E += () => Console.Write("expl "); ee.Go(); Console.WriteLine();
+    var se = new SEv(); se.E += () => Console.Write("struct-ev "); se.Go(); SEv se2 = se; se2.Go(); Console.WriteLine();
+    Action<int> multi = null; multi += x => Console.Write("m1:" + x + " "); multi += x => Console.Write("m2:" + x + " "); multi(Next()); Console.WriteLine(Cnt);
+    Func<int, int> ret = x => x; ret += x => x * 10; Console.WriteLine(ret(3));
+    Action thrower = () => Console.Write("t1 "); thrower += () => throw new Exception("t2"); thrower += () => Console.Write("t3 "); try { thrower(); } catch (Exception e) { Console.WriteLine(e.Message); }
+    Delegate dd = a; dd = Delegate.Combine(dd, b); ((Action)dd)(); Console.WriteLine(); Delegate.Remove(dd, a); MulticastDelegate md = ab ?? a; Console.WriteLine(md.GetInvocationList().Length);
+    Console.WriteLine(((Action)a).Method.Name.Contains("b__") + " " + (a.Target != null) + " " + ((Func<int,int>)m1.M).Target.Equals(m1) + " " + ((Func<int, int>)Inst.SM).Target); 
+    var dels = new List<Func<int>>(); for (int i = 0; i < 3; i++) dels.Add(() => i); Console.WriteLine(string.Join(",", dels.Select(x => x()))); var dels2 = new List<Func<int>>(); foreach (var i in new[] { 1, 2, 3 }) dels2.Add(() => i); Console.WriteLine(string.Join(",", dels2.Select(x => x())));
+    Func<int, Func<int, int>> curry = x => y => x + y; Console.WriteLine(curry(1)(2)); Func<int, int> fib = null; fib = x => x < 2 ? x : fib(x - 1) + fib(x - 2); Console.WriteLine(fib(10));
+    Comparison<string> cmp = string.Compare; Console.WriteLine(cmp("a", "b")); Predicate<int> pr = int.IsEvenInteger; Console.WriteLine(pr(4)); Func<string, int> parse = int.Parse; Console.WriteLine(parse("12")); Converter<int, string> cv = Convert.ToString; Console.WriteLine(cv(5)); Func<object, string> ts = Convert.ToString; Console.WriteLine(ts(6));
+    Func<int, int, int> max = Math.Max; Console.WriteLine(max(1, 2)); Func<double, double> abs = Math.Abs; Console.WriteLine(abs(-1.5)); Func<List<int>> mk = () => new(); Func<int[]> mka = () => new int[2]; Console.WriteLine(mk().Count + mka().Length); 
+  }
+  static Func<int> StaticLam() => () => 42; static Func<int, int> MG() => Inst.SM; static Func<int> Lam() => () => 1; static Func<int> CapLam(int x) => () => x;
+}
+"#,
+        r#"a b 2
+b 1
+True
+a b 
+a b 2
+1
+True
+a a 2
+2
+1
+True
+True
+False
+False
+True True
+False
+True
+True True
+False
+q4
+ping 
+True
+aa 
+Dog
+eh 
+p1 p2 p2 3
+2
+1
+[add][add]p1 c5 c5 [remove]p1 c6 
+a b b 
+impl expl 
+struct-ev struct-ev 
+m1:1 m2:1 1
+30
+t1 t2
+a b 
+1
+True True True 
+3,3,3
+1,2,3
+3
+55
+-1
+True
+12
+5
+6
+2
+1.5
+2
+"#,
+    );
+}

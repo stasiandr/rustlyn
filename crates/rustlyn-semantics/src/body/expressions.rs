@@ -300,10 +300,13 @@ impl BodyBinder<'_> {
         operand: BoundExpression,
     ) -> BoundExpression {
         let symbols = self.binder.compilation().symbols();
+        // On an `S?` the conversions are `S`'s, lifted: an `S?` goes to the
+        // `int?` the conversion from `S` to `int` makes (§12.4.8).
+        let lifted = self.binder.nullable_underlying(&operand.ty);
+        let source = lifted.clone().unwrap_or_else(|| operand.ty.clone());
         let converts = !operand.ty.is_error()
-            && self.binder.special_of(&operand.ty).is_none()
-            && self.binder.nullable_underlying(&operand.ty).is_none()
-            && operand.ty.symbol().is_some_and(|symbol| {
+            && self.binder.special_of(&source).is_none()
+            && source.symbol().is_some_and(|symbol| {
                 symbols.get(symbol).type_kind() != Some(crate::TypeKind::Enum)
             });
         if !converts {
@@ -335,7 +338,11 @@ impl BodyBinder<'_> {
         };
         for special in candidates {
             let target = self.special(*special);
-            if let Some(conversion) = self.user_defined_conversion(&operand.ty, &target) {
+            if let Some(conversion) = self.user_defined_conversion(&source, &target) {
+                if lifted.is_some() {
+                    let wrapped = self.nullable_of(target);
+                    return self.convert(operand, &wrapped);
+                }
                 return self.operator_call(conversion, operand, target);
             }
         }
@@ -1356,6 +1363,26 @@ impl BodyBinder<'_> {
                 }
                 if let Some(call) = self.user_defined_unary("op_LogicalNot", &operand, span) {
                     return call;
+                }
+                // On an `S?` whose `S` converts to `bool` the conversion is
+                // lifted, and what it gives is a `bool?`.
+                // A conversion that gives a `bool?` itself is the same for an
+                // `S` as for an `S?`.
+                let held = self.binder.nullable_underlying(&operand.ty);
+                let source = held.clone().unwrap_or_else(|| operand.ty.clone());
+                if !source.is_error()
+                    && !self.binder.is_boolean(&source)
+                    && source.symbol().is_some()
+                    && self.binder.special_of(&source).is_none()
+                {
+                    let boolean = self.special(SpecialType::Boolean);
+                    let wrapped = self.nullable_of(boolean.clone());
+                    let to_boolean = self.user_defined_conversion(&source, &boolean).is_some();
+                    let to_wrapped = self.user_defined_conversion(&source, &wrapped).is_some();
+                    if (held.is_some() && (to_wrapped || to_boolean)) || (!to_boolean && to_wrapped)
+                    {
+                        operand = self.convert(operand, &wrapped);
+                    }
                 }
                 let lifted = self
                     .binder

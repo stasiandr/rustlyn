@@ -1860,12 +1860,17 @@ impl BodyBinder<'_> {
                         receiver: Some(Box::new(argument)),
                         virtual_dispatch: false,
                         type_arguments: Vec::new(),
+                        written_new: true,
                     },
                     ty,
                     span,
                 );
             }
-            return self.convert(argument, &ty);
+            let mut converted = self.convert(argument, &ty);
+            if let BoundExpressionKind::DelegateCreation { written_new, .. } = &mut converted.kind {
+                *written_new = true;
+            }
+            return converted;
         }
 
         // The constructor is an overload like any other, looked up under the
@@ -1886,22 +1891,41 @@ impl BodyBinder<'_> {
             .unwrap_or_default();
         // A `dynamic` argument leaves the constructor to the runtime binder
         // too (§12.8.17.2).
-        let has_initializer = node.children().any(|child| {
+        // The initializer is applied to what the call site made, held in a
+        // variable of the class's own type: its members are found here, not
+        // at run time.
+        let initializer = node.children().find(|child| {
             matches!(
                 child.kind(),
                 SyntaxKind::ObjectInitializerExpression
                     | SyntaxKind::CollectionInitializerExpression
             )
         });
-        if !candidates.is_empty() && !has_initializer && Self::has_dynamic_argument(&arguments) {
-            return Self::dynamic_operation(
+        if !candidates.is_empty() && Self::has_dynamic_argument(&arguments) {
+            let created = Self::dynamic_operation(
                 DynamicOperation::InvokeConstructor,
                 None,
                 arguments,
                 names,
-                ty,
+                ty.clone(),
                 span,
             );
+            let Some(initializer) = initializer else {
+                return created;
+            };
+            let held = self.declare_synthetic_local("created", ty.clone());
+            let read = BoundExpression::new(BoundExpressionKind::Local(held), ty.clone(), span);
+            let mut steps = vec![BoundExpression::new(
+                BoundExpressionKind::Assignment {
+                    target: Box::new(read.clone()),
+                    value: Box::new(created),
+                },
+                ty.clone(),
+                span,
+            )];
+            steps.extend(self.bind_initializers_on(&initializer, &ty, Some(&read)));
+            steps.push(read);
+            return BoundExpression::new(BoundExpressionKind::Sequence(steps), ty, span);
         }
         let candidates = self.named_candidates(&candidates, &names);
         let mut arguments = self.reorder_named(&candidates, &names, arguments, &ty);
@@ -2159,6 +2183,12 @@ impl BodyBinder<'_> {
                         {
                             let int = self.special(SpecialType::Int32);
                             self.convert(bound, &int)
+                        } else if matches!(bound.ty, Type::Dynamic) {
+                            // A `dynamic` size is converted at run time, as
+                            // an array index: `new int[d]` takes a `long`
+                            // that fits.
+                            let int = self.special(SpecialType::Int32);
+                            Self::dynamic_array_index(bound, &int)
                         } else {
                             bound
                         }

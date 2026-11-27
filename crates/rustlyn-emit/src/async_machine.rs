@@ -2853,6 +2853,23 @@ impl Spiller<'_> {
         }
     }
 
+    /// [`pure`](Self::pure), and not a variable that an operand evaluated
+    /// after this one — `written`, up to the `await` — assigns: `x + await
+    /// F(x++)` reads `x` first, and the `await` leaves the read to run
+    /// after the increment.
+    fn pure_before(&self, expression: &BoundExpression, written: &HashSet<Written>) -> bool {
+        match &expression.kind {
+            BoundExpressionKind::Local(local) => {
+                !written.contains(&Written::Local(*local)) && self.pure(expression)
+            }
+            BoundExpressionKind::Parameter(parameter) => {
+                !written.contains(&Written::Parameter(*parameter)) && self.pure(expression)
+            }
+            BoundExpressionKind::Conversion { operand, .. } => self.pure_before(operand, written),
+            _ => self.pure(expression),
+        }
+    }
+
     /// Whether a place is a captured local or parameter.
     fn is_captured(&self, place: &BoundExpression) -> bool {
         match &place.kind {
@@ -4504,6 +4521,13 @@ impl Spiller<'_> {
             },
             _ => None,
         };
+        // `z += await F(z = 10)` reads `z` before the `await`; the value is
+        // rewritten below, so whether it writes the target is asked first.
+        let value_writes_target = matches!(
+            &expression.kind,
+            BoundExpressionKind::CompoundAssignment { target, value, .. }
+                if writes_variable(target, value)
+        );
         let mut children = children_mut(expression);
         let Some(last) = children.iter().rposition(|child| self.holds(child)) else {
             return Ok(());
@@ -4511,6 +4535,17 @@ impl Spiller<'_> {
         let mut value_starts = None;
         let mut kept: Option<(BoundExpression, BoundExpression)> = None;
         let count = children.len();
+        // What the operands after each one, up to the `await`, write: a read
+        // of such a variable is not the same read once they have run.
+        let written_after: Vec<HashSet<Written>> = {
+            let mut running = HashSet::new();
+            let mut sets = vec![HashSet::new(); last + 1];
+            for position in (0..=last).rev() {
+                sets[position].clone_from(&running);
+                collect_writes(&*children[position], &mut running);
+            }
+            sets
+        };
         // `item[^i]`: the length the index counts back from is read off the
         // receiver kept, not off the variable again. An assignment's value
         // comes after the indexer's arguments and is not one of them.
@@ -4582,8 +4617,12 @@ impl Spiller<'_> {
             // An element or field of a value type (or an element of a `T`
             // that may be one) is a place a call may be made on: what locates
             // it is kept instead of a copy of it, so the call still reaches
-            // it.
+            // it. Only the receiver of a call is a place; as an operand or an
+            // argument it is a value, and is read before the `await` like
+            // any other.
             if index < last
+                && index == 0
+                && has_receiver
                 && matches!(
                     child.kind,
                     BoundExpressionKind::ArrayAccess { .. } | BoundExpressionKind::Field { .. }
@@ -4596,7 +4635,7 @@ impl Spiller<'_> {
                     && self.either_kind(&child.ty))
             {
                 for part in children_mut(child) {
-                    if !self.pure(part) {
+                    if !self.pure_before(part, &written_after[index]) {
                         let span = part.span;
                         let ty = part.ty.clone();
                         let temp = self.temp(&ty, span);
@@ -4615,8 +4654,24 @@ impl Spiller<'_> {
                 }
                 continue;
             }
+            // A variable of a value type that a call is made on is the place
+            // the call reaches, whatever the arguments did to it meanwhile:
+            // `item.M(await F(ref item))` calls `M` on what `F` left there.
+            // A copy taken before the `await` would be another instance.
+            let receiver_place = index == 0
+                && has_receiver
+                && !child.ty.is_reference_type(self.symbols)
+                && matches!(
+                    child.kind,
+                    BoundExpressionKind::Local(_) | BoundExpressionKind::Parameter(_)
+                );
+            let plain = if receiver_place {
+                self.pure(child)
+            } else {
+                self.pure_before(child, &written_after[index])
+            };
             if index < last
-                && !self.pure(child)
+                && !plain
                 && !matches!(child.kind, BoundExpressionKind::RefArgument { .. })
             {
                 // A `ref struct` may not outlast the `await` (a field may
@@ -4659,7 +4714,8 @@ impl Spiller<'_> {
                     | BoundExpressionKind::IndexerAccess { .. }
                     | BoundExpressionKind::Field { .. }
                     | BoundExpressionKind::ArrayAccess { .. }
-            ) || self.is_captured(target))
+            ) || self.is_captured(target)
+                || value_writes_target)
             && !matches!(target.ty, Type::Dynamic)
             && !matches!(value.ty, Type::Dynamic)
         {
@@ -5079,6 +5135,51 @@ impl Spiller<'_> {
                 ));
             }
         }
+    }
+}
+
+/// A variable an expression writes.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Written {
+    Local(LocalId),
+    Parameter(SymbolId),
+}
+
+/// Every local and parameter an expression assigns, increments or passes by
+/// reference, however deep.
+fn collect_writes(expression: &BoundExpression, into: &mut HashSet<Written>) {
+    let variable = |place: &BoundExpression, into: &mut HashSet<Written>| match &place.kind {
+        BoundExpressionKind::Local(local) => {
+            into.insert(Written::Local(*local));
+        }
+        BoundExpressionKind::Parameter(parameter) => {
+            into.insert(Written::Parameter(*parameter));
+        }
+        _ => {}
+    };
+    match &expression.kind {
+        BoundExpressionKind::Assignment { target, .. }
+        | BoundExpressionKind::CompoundAssignment { target, .. }
+        | BoundExpressionKind::Increment { target, .. } => variable(target, into),
+        BoundExpressionKind::RefArgument { operand, .. } => variable(operand, into),
+        _ => {}
+    }
+    for child in children(expression) {
+        collect_writes(child, into);
+    }
+}
+
+/// Whether the value of an assignment writes the local or parameter it
+/// assigns to: `z += await F(z = 10)` reads `z` before the `await`.
+fn writes_variable(target: &BoundExpression, value: &BoundExpression) -> bool {
+    let mut written = HashSet::new();
+    collect_writes(value, &mut written);
+    match &target.kind {
+        BoundExpressionKind::Local(local) => written.contains(&Written::Local(*local)),
+        BoundExpressionKind::Parameter(parameter) => {
+            written.contains(&Written::Parameter(*parameter))
+        }
+        _ => false,
     }
 }
 

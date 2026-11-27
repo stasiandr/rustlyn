@@ -274,6 +274,10 @@ pub(crate) struct BodyEmitter<'a, 'b> {
     pub(crate) machine: Option<crate::async_machine::MachineRun>,
     /// Where the `try` around the whole of an `async` `MoveNext` begins.
     pub(crate) async_try_start: Option<Label>,
+    /// Whether the body runs in the class constructor — its own, or the
+    /// initializer of a static field — which makes each delegate it
+    /// converts once and keeps none.
+    in_static_constructor: bool,
 }
 
 /// What holds a captured variable's field: the display class the body has
@@ -535,6 +539,13 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             MethodSource::RecordConstructor(constructor) => Some(*constructor),
             _ => None,
         };
+        let in_static_constructor = matches!(method.source, MethodSource::StaticConstructor)
+            || owner.is_some_and(|owner| {
+                crate::delegate_cache::runs_in_static_constructor(
+                    emitter.compilation.symbols(),
+                    owner,
+                )
+            });
         let mut this = Self {
             emitter,
             body,
@@ -575,6 +586,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             async_run: None,
             machine: None,
             async_try_start: None,
+            in_static_constructor,
         };
         // The display class a closure's method is a member of, where it is
         // one: the member's, or that of the lambda it was written inside.
@@ -1701,7 +1713,16 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 for inner in statements {
                     self.emit_statement(inner)?;
                 }
-                self.clear_hoisted(statements)?;
+                // `string a = "x", b = "y";` is a block of two declarations
+                // that is no scope: what it declares is read after it, so a
+                // machine does not clear it where the block ends.
+                let declares_only = statements.len() > 1
+                    && statements.iter().all(|statement| {
+                        matches!(statement.kind, BoundStatementKind::LocalDeclaration { .. })
+                    });
+                if !declares_only {
+                    self.clear_hoisted(statements)?;
+                }
             }
             BoundStatementKind::Empty => {}
             BoundStatementKind::LocalDeclaration { local, initializer } => {
@@ -5252,6 +5273,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 receiver,
                 virtual_dispatch,
                 type_arguments,
+                written_new,
             } => {
                 self.emit_delegate_creation(
                     &expression.ty,
@@ -5259,6 +5281,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                     receiver.as_deref(),
                     *virtual_dispatch,
                     type_arguments,
+                    !*written_new,
                 )?;
             }
             BoundExpressionKind::Call {
@@ -6830,6 +6853,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         receiver: Option<&BoundExpression>,
         virtual_dispatch: bool,
         type_arguments: &[Type],
+        converted: bool,
     ) -> Result<(), EmitError> {
         // A local function that lives in the display class is an instance
         // method of it, whatever the source wrote: a delegate to it closes
@@ -6872,9 +6896,36 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                     self.stream.emit(Instruction::LoadFunction(target));
                 }
             }
+            // A static method converted to a delegate is made once and kept:
+            // `<0>__M ?? (<0>__M = new D(null, M))`.
             None => {
+                let cache = if converted && !self.in_static_constructor {
+                    self.emitter.delegate_cache_field(
+                        self.owner,
+                        method,
+                        type_arguments,
+                        delegate_type,
+                    )?
+                } else {
+                    None
+                };
+                let made = self.stream.label();
+                if let Some(cache) = cache {
+                    self.stream.emit(Instruction::LoadStaticField(cache));
+                    self.stream.emit(Instruction::Dup);
+                    self.stream.emit(Instruction::BranchIfTrue(made));
+                    self.stream.emit(Instruction::Pop);
+                }
                 self.stream.emit(Instruction::LoadNull);
                 self.stream.emit(Instruction::LoadFunction(target));
+                self.stream
+                    .call_effect(Instruction::NewObject(constructor), 2, 1);
+                if let Some(cache) = cache {
+                    self.stream.emit(Instruction::Dup);
+                    self.stream.emit(Instruction::StoreStaticField(cache));
+                    self.stream.mark(made);
+                }
+                return Ok(());
             }
         }
         self.stream

@@ -316,6 +316,10 @@ pub enum BoundExpressionKind {
         /// The method's own type arguments, where it is generic and the
         /// delegate said what they are: `Skip<T>` handed to a `Skipper<int>`.
         type_arguments: Vec<Type>,
+        /// Whether it was written `new D(M)` and not made by a conversion:
+        /// Roslyn keeps the delegate of a static method group converted
+        /// (`D d = M`) in a field, and makes this one anew each time.
+        written_new: bool,
     },
     Call {
         receiver: Option<Box<BoundExpression>>,
@@ -647,6 +651,11 @@ pub enum DynamicOperation {
     Unary(DynamicUnary),
     /// The receiver converted to the expression's type.
     Convert { explicit: bool },
+    /// The receiver converted to `int` as the size of an array or an index
+    /// into one: the runtime binder is told it is an array index, and then
+    /// takes any integral value that fits, a `long` or a `uint` as well as
+    /// an `int`.
+    ConvertArrayIndex,
 }
 
 /// The unary operations the runtime binder knows.

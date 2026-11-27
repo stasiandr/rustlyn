@@ -1430,6 +1430,15 @@ impl BodyBinder<'_> {
         ty: &Type,
     ) -> BoundExpression {
         let span = value.span;
+        // A `dynamic` value converts explicitly at run time, whatever it
+        // turns out to hold: `foreach (long n in dy)` over `int`s, and an
+        // `op_Explicit` between the types, are the runtime binder's.
+        if matches!(value.ty, Type::Dynamic)
+            && !matches!(ty, Type::Dynamic | Type::Error | Type::Void)
+            && self.binder.object_type().as_ref() != Some(ty)
+        {
+            return Self::dynamic_conversion(value, ty, true);
+        }
         // `(ReadOnlySpan<object>)strings` is the implicit span conversion,
         // written out, and `(CustomHandler)$"..."` the handler conversion.
         if let Some(spanned) = self.convert_span(&value, ty) {
@@ -2025,6 +2034,21 @@ impl BodyBinder<'_> {
         {
             // `3` into a `byte?` converts the number first and then wraps it:
             // one conversion in the source is two on the way out.
+            //
+            // From a reference (or a type parameter) it is an unboxing
+            // instead: `(int?)someObject` is `unbox.any Nullable<int>`,
+            // which gives the empty `int?` for a null and throws for
+            // anything but an `int`. Wrapping it read the reference as a
+            // number.
+            // A type parameter into its own nullable is the wrap, as any
+            // value is. So is a pointer: `(int?)(void*)p` converts the
+            // address to a number and wraps that.
+            if (from.is_reference_type(symbols) && !matches!(from, Type::Pointer(_) | Type::Null))
+                || (matches!(from, Type::TypeParameter(_))
+                    && self.binder.nullable_underlying(to).as_ref() != Some(from))
+            {
+                return Some(ConversionKind::Unboxing);
+            }
             return Some(ConversionKind::NullableWrap);
         }
         if self

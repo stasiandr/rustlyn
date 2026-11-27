@@ -33,6 +33,7 @@ mod binder_flags {
     pub(super) const INVOKE_SPECIAL_NAME: i32 = 4;
     pub(super) const BINARY_OPERATION_LOGICAL: i32 = 8;
     pub(super) const CONVERT_EXPLICIT: i32 = 16;
+    pub(super) const CONVERT_ARRAY_INDEX: i32 = 32;
     pub(super) const VALUE_FROM_COMPOUND_ASSIGNMENT: i32 = 128;
     pub(super) const RESULT_DISCARDED: i32 = 256;
 }
@@ -545,13 +546,25 @@ impl BodyEmitter<'_, '_> {
             .take(dynamic.arguments.len())
             .collect();
         let arguments: Vec<Operand<'_>> = dynamic.arguments.iter().map(Operand::Value).collect();
-        let receiver = dynamic
-            .receiver
-            .as_ref()
-            .map(|receiver| match receiver.kind {
-                BoundExpressionKind::TypeExpression(_) => Operand::TypeOf(receiver.ty.clone()),
-                _ => Operand::Value(receiver),
-            });
+        // A value already on the stack — the element a loop just read — sits
+        // where the call site has to go first, so it is put aside.
+        let on_stack = match dynamic.receiver.as_ref() {
+            Some(receiver) if matches!(receiver.kind, BoundExpressionKind::StackValue) => {
+                let held = self.temporary(&receiver.ty)?;
+                self.stream.emit(Instruction::StoreLocal(held));
+                Some(held)
+            }
+            _ => None,
+        };
+        let receiver = dynamic.receiver.as_ref().map(|receiver| {
+            if let Some(held) = on_stack {
+                Operand::Held(held, receiver.ty.clone())
+            } else if matches!(receiver.kind, BoundExpressionKind::TypeExpression(_)) {
+                Operand::TypeOf(receiver.ty.clone())
+            } else {
+                Operand::Value(receiver)
+            }
+        });
         let checked = if self.checked {
             binder_flags::CHECKED_CONTEXT
         } else {
@@ -672,6 +685,20 @@ impl BodyEmitter<'_, '_> {
                     },
                     None,
                     &[receiver.ok_or_else(|| EmitError::new("a unary operation with nothing"))?],
+                    &[None],
+                    None,
+                    ty,
+                )?;
+                Ok(true)
+            }
+            DynamicOperation::ConvertArrayIndex => {
+                self.emit_site(
+                    &SiteBinder::Convert {
+                        flags: checked | binder_flags::CONVERT_ARRAY_INDEX,
+                        target: ty,
+                    },
+                    None,
+                    &[receiver.ok_or_else(|| EmitError::new("a conversion of nothing"))?],
                     &[None],
                     None,
                     ty,

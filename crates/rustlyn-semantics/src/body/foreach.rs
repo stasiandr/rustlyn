@@ -394,7 +394,10 @@ impl BodyBinder<'_> {
         // The element reaches a variable of another type by the explicit
         // conversion a cast to it would be (§13.9.5), which the walk applies
         // to what it has read: bound here once, over the value on the stack,
-        // so that every way of walking converts the same way.
+        // so that every way of walking converts the same way. What a
+        // `dynamic` walk reads is `dynamic`, and the cast of that is the
+        // runtime binder's: `foreach (long n in dy)` over `int`s converts
+        // each one, where unboxing would throw.
         let conversion = match (&deconstructed, local, by_ref) {
             (None, Some(local), false)
                 if !through_operator
@@ -402,8 +405,7 @@ impl BodyBinder<'_> {
                     && !element.is_error()
                     && !walked_element.is_error()
                     && element != walked_element
-                    && !matches!(element, Type::Dynamic)
-                    && !matches!(walked_element, Type::Dynamic) =>
+                    && !matches!(element, Type::Dynamic) =>
             {
                 debug_assert!(self.body.locals[local.0 as usize].ty == element);
                 let read = BoundExpression::new(

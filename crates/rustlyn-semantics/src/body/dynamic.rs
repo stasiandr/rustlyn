@@ -68,6 +68,20 @@ impl BodyBinder<'_> {
         )
     }
 
+    /// `value` as the size of an array or an index into one, converted to
+    /// `int` by the runtime binder (Roslyn's `ConvertToArrayIndex`).
+    pub(super) fn dynamic_array_index(value: BoundExpression, int: &Type) -> BoundExpression {
+        let span = value.span;
+        Self::dynamic_operation(
+            DynamicOperation::ConvertArrayIndex,
+            Some(value),
+            Vec::new(),
+            Vec::new(),
+            int.clone(),
+            span,
+        )
+    }
+
     /// `receiver.name`, read.
     pub(super) fn dynamic_member(
         receiver: BoundExpression,
