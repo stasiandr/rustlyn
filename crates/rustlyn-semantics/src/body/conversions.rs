@@ -2176,7 +2176,11 @@ impl BodyBinder<'_> {
         // `implicit operator int(Conv)` widened.
         if wanted != *target
             && let Some(operator) = self.binder.implicit_operator(&source, target)
-            && self.member_type(operator, &source) == *target
+            && (self.member_type(operator, &source) == *target
+                || self
+                    .binder
+                    .nullable_underlying(&self.member_type(operator, &source))
+                    .is_some())
         {
             let result = target.clone();
             return self.lift_conversion(value, &result, |this, inner| {

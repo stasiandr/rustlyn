@@ -694,3 +694,96 @@ fn an_instance_operator_is_called_on_a_variable_and_a_static_one_where_there_is_
          }",
     );
 }
+
+// MARK: - local functions, conversions and queries that were reported as wrong
+
+#[test]
+fn a_generic_local_function_infers_its_type_parameter_from_a_lambda_argument() {
+    // `U Conv<U>(F<int, U> f)` called with `x => x + 1` is `Conv<int>`, as a method of that shape
+    // is: the call was resolved on the types of the arguments alone, which a lambda has none of.
+    clean(
+        r#"delegate R F<A, R>(A a);
+         delegate void G<A>(A a);
+         class Gen<T> {
+             public int Run(T seed) {
+                 U Conv<U>(F<T, U> f) => f(seed);
+                 return Conv(x => 5);
+             }
+         }
+         class P {
+             static int A() { U Conv<U>(F<int, U> f) => f(1); return Conv(x => x + 1); }
+             static string B() { var r = Conv(x => "s"); return r; static U Conv<U>(F<int, U> f) => f(7); }
+             static int C() {
+                 int Outer() {
+                     V Twice<V>(F<int, V> f, F<V, V> g) => g(f(0));
+                     return Twice(i => 3, v => v * 2);
+                 }
+                 return Outer();
+             }
+             static int D() {
+                 R Map<S, R>(S s, F<S, R> f) => f(s);
+                 void Do<X>(X x, G<X> a) { a(x); }
+                 Do(5, v => { });
+                 return Map(4, x => x + 1) + Map("ab", s => 1);
+             }
+         }"#,
+    );
+}
+
+#[test]
+fn a_user_defined_conversion_is_followed_by_a_lifted_standard_one() {
+    // §10.5.4: the second step of a user-defined implicit conversion is any standard implicit
+    // conversion, `int?` to `long?` and `double?` among them, and an `S?` is lifted over an
+    // operator that gives a nullable itself.
+    clean(
+        "class N1 { public static implicit operator int?(N1 n) { return 5; } }
+         class N2 { public static implicit operator int(N2 n) { return 6; } }
+         struct S1 { public static implicit operator int?(S1 n) { return 8; } }
+         struct S2 { public static implicit operator int(S2 n) { return 9; } }
+         class N3 { public static implicit operator int?(N3 n) { return 5; } public static implicit operator long(N3 n) { return 55; } }
+         class P {
+             static void Main() {
+                 long? a = new N1(); double? b = new N1(); long? c = new N2(); double? d = new N2();
+                 S1 s1 = default(S1); S1? n1 = s1; long? e = s1; long? f = n1; double? g = n1;
+                 S2? n2 = new S2(); long? h = n2; long? i = new N3();
+             }
+         }",
+    );
+}
+
+#[test]
+fn a_select_after_a_second_from_needs_only_select_many() {
+    // The `select` is the result selector of the `SelectMany` (§12.20.3), so a type that has no
+    // `Select` still has a query of two `from`s ending in one.
+    clean(
+        "delegate R F<A, R>(A a);
+         delegate R F2<A, B, R>(A a, B b);
+         class Box<T> {
+             public Box<V> SelectMany<U, V>(F<T, Box<U>> f, F2<T, U, V> r) { return null; }
+         }
+         class P {
+             static void M(Box<int> a, Box<string> b) {
+                 var q = from x in a from y in b select x + y;
+                 var r = from x in a from y in b from z in a select y + z;
+             }
+         }",
+    );
+}
+
+#[test]
+fn a_class_deriving_from_a_construction_of_itself_is_bound_and_ends() {
+    // `class A<T> : A<A<T>>` is circular (CS0146 in Roslyn); each base of it is a new type, and
+    // whatever walks them has to stop. A curiously recurring base is not circular.
+    let _ = errors(
+        "class A<T> : A<A<T>> { } class P { static void Main() { A<int> a = new A<int>(); } }",
+    );
+    let _ = errors("class A<T> : B<T> { } class B<T> : C<B<T>> { } class C<T> : A<C<T>> { }");
+    clean(
+        "class Base<T> { }
+         class L<T> : Base<L<L<T>>> { }
+         abstract class E<TSelf> where TSelf : E<TSelf> { public TSelf Me { get { return (TSelf)this; } } }
+         sealed class F : E<F> { }
+         class Outer<T> { public class B : Outer<B> { } }
+         class P { static void Main() { object o = new F().Me; } }",
+    );
+}

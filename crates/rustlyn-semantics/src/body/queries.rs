@@ -285,25 +285,41 @@ impl BodyBinder<'_> {
                         span: name_span,
                         ty: element,
                     };
+                    // A `select` right after the `from` is the result
+                    // selector itself, and no `Select` follows
+                    // (§12.20.3.4): `from x in a from y in b select x + y`
+                    // is one `SelectMany(x => b, (x, y) => x + y)`.
+                    let selected = clauses
+                        .peek()
+                        .filter(|next| next.kind() == SyntaxKind::SelectClause)
+                        .and_then(|next| next.children().find(|c| c.kind().is_expression()));
                     let widened = ranges.clone();
-                    let pairing = self.ranged_lambda(
-                        &ranges,
-                        Some(&added),
-                        clause.span(),
-                        None,
-                        |this, locals, extra| {
-                            let mut kept = widened.clone();
-                            kept.push(added.clone());
-                            let last = extra?;
-                            let value = BoundExpression::new(
-                                BoundExpressionKind::Local(last),
-                                added.ty.clone(),
-                                clause.span(),
-                            );
-                            let _ = this;
-                            Some(Self::query_tuple(&kept, locals, value, clause.span()))
-                        },
-                    )?;
+                    let pairing = match &selected {
+                        Some(selected) => self.ranged_lambda(
+                            &ranges,
+                            Some(&added),
+                            selected.span(),
+                            None,
+                            |this, _, _| Some(this.bind_expression(selected)),
+                        )?,
+                        None => self.ranged_lambda(
+                            &ranges,
+                            Some(&added),
+                            clause.span(),
+                            None,
+                            |_, locals, extra| {
+                                let mut kept = widened.clone();
+                                kept.push(added.clone());
+                                let last = extra?;
+                                let value = BoundExpression::new(
+                                    BoundExpressionKind::Local(last),
+                                    added.ty.clone(),
+                                    clause.span(),
+                                );
+                                Some(Self::query_tuple(&kept, locals, value, clause.span()))
+                            },
+                        )?,
+                    };
                     current = self.query_call(
                         current,
                         "SelectMany",
@@ -311,6 +327,11 @@ impl BodyBinder<'_> {
                         Vec::new(),
                         &clause,
                     )?;
+                    if selected.is_some() {
+                        clauses.next();
+                        // A continuation may still follow the `select`.
+                        continue;
+                    }
                     ranges = self.ranges_of(&current.ty, &ranges, Some((name, name_span)))?;
                 }
                 // `group e by k` is a `GroupBy`; what follows an `into` sees

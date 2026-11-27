@@ -459,8 +459,9 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             _ => Statements::Body,
         };
 
-        let mut locals = Vec::new();
-        let mut local_types = Vec::new();
+        let mut locals = Vec::with_capacity(body.locals.len());
+        let mut local_types = Vec::with_capacity(body.locals.len());
+        let mut signatures: HashMap<Type, SigType> = HashMap::new();
         let by_ref_locals: Vec<bool> = body.locals.iter().map(|local| local.by_ref).collect();
         for local in &body.locals {
             // The locals of a body are one table, shared with the lambdas and
@@ -473,16 +474,23 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             // state machine over a generic method declares that method's.
             let mut nameable = method.type_parameters.clone();
             nameable.extend(emitter.display_generics.iter().copied());
+            // A method of a closure declares the whole table, and a body with
+            // thousands of closures has thousands of locals of a few types:
+            // each type is written as a signature once.
             let signature =
                 if foreign_parameter(emitter.compilation.symbols(), &local.ty, &nameable) {
                     SigType::Primitive(ElementType::Object)
+                } else if let Some(written) = signatures.get(&local.ty) {
+                    written.clone()
                 } else {
-                    emitter.sig_type(&local.ty).map_err(|error| {
+                    let written = emitter.sig_type(&local.ty).map_err(|error| {
                         EmitError::new(format!(
                             "in `{}`: the local `{}` cannot be emitted: {error}",
                             method.name, local.name
                         ))
-                    })?
+                    })?;
+                    signatures.insert(local.ty.clone(), written.clone());
+                    written
                 };
             // A `ref` local's slot holds an address, and its signature has to
             // say so: `T&`, not `T`.

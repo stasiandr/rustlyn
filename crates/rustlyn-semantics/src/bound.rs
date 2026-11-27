@@ -1128,6 +1128,11 @@ pub struct BoundBody {
     /// is bound here — which is the only way an enclosing local can be in
     /// scope inside it.
     pub local_functions: Vec<BoundLocalFunction>,
+    /// The number each lambda and local function has in the names of what
+    /// it is lowered to (Roslyn's closure ordinal): first the lambdas by
+    /// index, then the local functions. A backend works it out once, from
+    /// where each was written, the first time it names one.
+    pub closure_ordinals: std::sync::OnceLock<Vec<usize>>,
     /// The element type, where the body is an iterator.
     ///
     /// A body with a `yield` in it is not the method the source wrote: it is
@@ -1183,6 +1188,10 @@ pub struct BoundLocalFunction {
     pub calls: Vec<SymbolId>,
     /// Whether the body reads `this`.
     pub captures_this: bool,
+    /// Where it was written, the whole statement: kept here because looking
+    /// the declaration up again walks the tree, once for every closure of
+    /// a body that has thousands.
+    pub span: TextSpan,
 }
 
 /// A lambda, bound.

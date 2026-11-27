@@ -702,6 +702,7 @@ impl BodyBinder<'_> {
                 captured_parameters: frame.captured_parameters,
                 captures_this: frame.captures_this,
                 calls: frame.calls,
+                span: node.span(),
             });
         }
     }

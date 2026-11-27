@@ -5676,9 +5676,7 @@ impl Emitter<'_> {
 
     /// Where a local function was written.
     fn function_span(&self, function: &rustlyn_semantics::BoundLocalFunction) -> Option<TextSpan> {
-        self.compilation
-            .declaration_node(function.symbol)
-            .map(|node| node.span())
+        Some(function.span)
     }
 
     /// A local function inside a generic local function names that one's
@@ -5713,11 +5711,32 @@ impl Emitter<'_> {
     /// The number Roslyn gives each lambda and local function of a body:
     /// those written directly in a scope first, in order, then those inside
     /// each of them (`VisitNestedFunctions` over its scope tree).
+    ///
+    /// Worked out for the whole body on the first ask and kept with it: a
+    /// method with thousands of lambdas asks this for each of them, and
+    /// each ask used to order them all again.
     pub(crate) fn closure_ordinal(
         &self,
         body: &rustlyn_semantics::BoundBody,
         closure: Closure,
     ) -> usize {
+        let ordinals = body
+            .closure_ordinals
+            .get_or_init(|| self.closure_ordinals(body));
+        let at = match closure {
+            Closure::Lambda(index) => (index < body.lambdas.len()).then_some(index),
+            Closure::Function(index) => {
+                (index < body.local_functions.len()).then_some(body.lambdas.len() + index)
+            }
+            Closure::Scope(_) => None,
+        };
+        at.and_then(|at| ordinals.get(at).copied())
+            .unwrap_or(ordinals.len())
+    }
+
+    /// The ordinal of every closure of a body: its lambdas by index, then
+    /// its local functions.
+    fn closure_ordinals(&self, body: &rustlyn_semantics::BoundBody) -> Vec<usize> {
         let closures: Vec<(Closure, TextSpan)> = (0..body.lambdas.len())
             .map(Closure::Lambda)
             .chain((0..body.local_functions.len()).map(Closure::Function))
@@ -5730,8 +5749,7 @@ impl Emitter<'_> {
                 .min_by_key(|(_, outer)| outer.length())
                 .map(|(_, outer)| *outer)
         };
-        // Each closure's parent once, and the closures by parent: a method
-        // with hundreds of lambdas asked this for each of them.
+        // Each closure's parent once, and the closures by parent.
         let mut by_parent: HashMap<Option<TextSpan>, Vec<(Closure, TextSpan)>> = HashMap::new();
         for &(closure, span) in &closures {
             by_parent
@@ -5749,10 +5767,15 @@ impl Emitter<'_> {
             // Depth first, in order: the stack takes them reversed.
             pending.extend(children.iter().rev().map(|(_, span)| Some(*span)));
         }
-        order
-            .iter()
-            .position(|it| *it == closure)
-            .unwrap_or(order.len())
+        let mut ordinals = vec![order.len(); body.lambdas.len() + body.local_functions.len()];
+        for (at, closure) in order.iter().enumerate() {
+            match closure {
+                Closure::Lambda(index) => ordinals[*index] = at,
+                Closure::Function(index) => ordinals[body.lambdas.len() + index] = at,
+                Closure::Scope(_) => {}
+            }
+        }
+        ordinals
     }
 
     /// How a member is named in the names of what its body is lowered to:
@@ -10497,9 +10520,15 @@ impl Emitter<'_> {
         let symbols = self.compilation.symbols();
         let mut found = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        let mut pending = vec![Type::named(symbol)];
+        // Each type waits with the definitions on the way down to it. A
+        // type whose base is, by definition, one of those is circular
+        // (Roslyn's `BaseTypeAnalysis`, CS0146): `class A<T> : A<A<T>>`
+        // makes a new type of every base it expands, so the walk stops at
+        // the definition that came back, where a `class L<T> :
+        // Base<L<L<T>>>` — whose bases are `Base`'s — goes on as it is.
+        let mut pending = vec![(Type::named(symbol), vec![symbol])];
         let mut visited = std::collections::HashSet::new();
-        while let Some(current) = pending.pop() {
+        while let Some((current, path)) = pending.pop() {
             let Some(current_symbol) = current.symbol() else {
                 continue;
             };
@@ -10517,12 +10546,17 @@ impl Emitter<'_> {
                 let Some(declared) = base.symbol() else {
                     continue;
                 };
+                if path.contains(&declared) {
+                    continue;
+                }
                 if symbols.get(declared).type_kind() == Some(TypeKind::Interface)
                     && seen.insert(base.clone())
                 {
                     found.push(base.clone());
                 }
-                pending.push(base);
+                let mut below = path.clone();
+                below.push(declared);
+                pending.push((base, below));
             }
         }
         found

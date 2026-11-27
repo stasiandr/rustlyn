@@ -25508,3 +25508,581 @@ dmn==dmz => Boolean False
 "#,
     );
 }
+
+/// A generic local function called with a lambda has its type parameter inferred from what the
+/// lambda returns, as a method does: `U Conv<U>(Func<int, U> f)` given `x => x + 1` is
+/// `Conv<int>`. The call used to be resolved on the types of the arguments alone, which a lambda
+/// has none of, and the body "did not bind". Covers a local function in a generic class and a
+/// generic method, a static one, a nested one, an iterator, a named argument and a lambda that
+/// writes a captured variable.
+#[test]
+fn a_generic_local_function_infers_its_type_parameter_from_a_lambda() {
+    check(
+        "local_function_infers_from_lambda",
+        r##"using System;
+using System.Collections.Generic;
+using System.Linq;
+class G<T> {
+  public string Run(T seed) {
+    U Conv<U>(Func<T, U> f) => f(seed);
+    var a = Conv(x => x.ToString());
+    var b = Conv(x => x.ToString().Length);
+    return a + b;
+  }
+}
+static class P {
+  static int A() { U Conv<U>(Func<int, U> f) => f(1); return Conv(x => x + 1); }
+  static string B() { var r = Conv(x => x.ToString()); return r; static U Conv<U>(Func<int, U> f) => f(7); }
+  static int C() {
+    int Outer() {
+      V Twice<V>(Func<V> f, Func<V, V> g) => g(f());
+      return Twice(() => 3, v => v * 2);
+    }
+    return Outer();
+  }
+  static string D() {
+    T2 Id<T2>(T2 t) => t;
+    R Map<S, R>(S s, Func<S, R> f) => f(s);
+    return Map(Id(5), x => "n" + x) + Map("ab", s => s.Length);
+  }
+  static IEnumerable<int> E() {
+    IEnumerable<R> Sel<R>(Func<int, R> f) { for (int i = 0; i < 3; i++) yield return f(i); }
+    return Sel(i => i * 10);
+  }
+  static int F() {
+    R Run<R>(Func<R> f) => f();
+    return Run<int>(() => 4) + Run(f: () => 6);
+  }
+  static int H() {
+    void Do<X>(X x, Action<X> a) => a(x);
+    int s = 0;
+    Do(5, v => s += v);
+    Do("abc", v => s += v.Length);
+    return s;
+  }
+  static string I() {
+    A2 Pick<A2>(A2 a, A2 b, Func<A2, A2, A2> f) => f(a, b);
+    return Pick(1, 2, (x, y) => x + y).ToString() + Pick("a", "b", (x, y) => x + y);
+  }
+  static int J() {
+    int Count<TT>(IEnumerable<TT> xs, Func<TT, bool> p) { int n = 0; foreach (var x in xs) if (p(x)) n++; return n; }
+    return Count(new[] { 1, 2, 3, 4 }, x => x % 2 == 0);
+  }
+  static void Main() {
+    Console.WriteLine(new G<int>().Run(42));
+    Console.WriteLine(A()); Console.WriteLine(B()); Console.WriteLine(C()); Console.WriteLine(D());
+    Console.WriteLine(string.Join(",", E())); Console.WriteLine(F()); Console.WriteLine(H());
+    Console.WriteLine(I()); Console.WriteLine(J());
+  }
+}
+"##,
+        r##"422
+2
+7
+6
+n52
+0,10,20
+10
+8
+3ab
+2
+"##,
+    );
+}
+
+/// §10.5.4: a standard implicit conversion may follow the operator, and it may lift over
+/// nullable: `implicit operator int?(N)` reaches a `long?` and a `double?`, and an `S?` reaches
+/// them through the operator lifted. Each of these was CS0029 (or CS0266).
+#[test]
+fn a_user_defined_conversion_reaches_a_nullable_by_a_standard_one_after_it() {
+    check(
+        "user_defined_conversion_then_lifted_widening",
+        r##"using System;
+class A1 { public static implicit operator int?(A1 n) => 5; }
+class A2 { public static explicit operator int?(A2 n) => 6; public static explicit operator long(A2 n) => 66; }
+class A3 { public static implicit operator A3(int? n) => new A3(); public override string ToString() => "A3"; }
+class A4 { public static implicit operator byte?(A4 n) => 4; }
+struct S1 { public static implicit operator int?(S1 n) => 8; }
+struct S2 { public static implicit operator S2(int? n) => default; public static implicit operator int?(S2 s) => 9; public static explicit operator short?(S2 s) => 10; }
+class P {
+  static void Show(long? x) => Console.WriteLine("L " + x);
+  static void Show2(double? x) => Console.WriteLine("D " + x);
+  static void Main() {
+    var a1 = new A1();
+    long? a = a1; double? b = a1; decimal? c = a1; float? d = a1;
+    Console.WriteLine(a + " " + b + " " + c + " " + d);
+    Show(a1); Show2(a1);
+    var a2 = new A2();
+    long? e = (long?)a2; double? f = (double?)a2; int? g = (int?)a2; long h = (long)a2;
+    Console.WriteLine(e + " " + f + " " + g + " " + h);
+    A3 x = 5; A3 y = (int?)null; int i = 3; A3 z = i; Console.WriteLine(x + " " + y + " " + z);
+    A3 w = (byte)5; A3 w2 = (short)7; Console.WriteLine(w + " " + w2);
+    var a4 = new A4(); int? m = a4; long? n = a4; ulong? o = a4; Console.WriteLine(m + " " + n + " " + o);
+    S1 s1 = default; long? p = s1; S1? s1n = s1; long? q = s1n; double? r = s1n; Console.WriteLine(p + " " + q + " " + r);
+    S2 s2 = 4; S2? s2n = s2; long? t = s2; long? u = s2n; long? v = (long?)(short?)s2n; Console.WriteLine(t + " " + u + " " + v);
+    S2 sw = (short?)3; Console.WriteLine(sw is S2);
+    long? cond = true ? a1 : null; Console.WriteLine(cond);
+    
+    var arr = new long?[] { a1, null }; Console.WriteLine(arr[0] + " " + arr[1]);
+    
+    // lifted over a nullable struct operand
+    S1? none = null; long? nn = none; Console.WriteLine(nn.HasValue);
+  }
+}
+"##,
+        r##"5 5 5 5
+L 5
+D 5
+66 66 6 66
+A3 A3 A3
+A3 A3
+4 4 4
+8 8 8
+9 9 10
+True
+5
+5 
+False
+"##,
+    );
+}
+
+/// With two operators from one type, a `long?` takes the one giving `long` (the target's
+/// underlying type) over the one giving an `int?`, and a `double?` the one whose result the
+/// other widens to; the first one found was taken before.
+#[test]
+fn the_operator_giving_the_target_or_what_it_widens_to_is_the_chosen_conversion() {
+    check(
+        "user_defined_conversion_most_specific_target",
+        r##"using System;
+class A1 { public static implicit operator int?(A1 n) => 5; }
+class A5 { public static implicit operator int?(A5 n) => 5; public static implicit operator long(A5 n) => 55; }
+class A6 { public static implicit operator int?(A6 n) => 5; public static implicit operator long?(A6 n) => 56; }
+class A7 { public static implicit operator int(A7 n) => 7; public static implicit operator long(A7 n) => 77; }
+class P {
+  static void Main() {
+    var a1 = new A1();
+    long? cond = true ? a1 : null; Console.WriteLine(cond);
+    long? c2 = a1 ?? null;
+    var arr = new long?[] { a1, null }; Console.WriteLine(arr[0] + " " + arr[1]);
+    long? a = new A5(); double? b = new A5(); Console.WriteLine(a + " " + b);
+    long? c = new A6(); double? d = new A6(); Console.WriteLine(c + " " + d);
+    long? e = new A7(); double? f = new A7(); Console.WriteLine(e + " " + f);
+    A1 nul = null; long? g = nul; Console.WriteLine(g.HasValue);
+  }
+}
+"##,
+        r##"5
+5 
+55 55
+56 56
+77 77
+True
+"##,
+    );
+}
+
+/// §12.20.3: `from x in a from y in b select x + y` is one `SelectMany(x => b, (x, y) => x + y)`
+/// and no `Select` follows it, so a type with only `SelectMany` is enough. It was a `SelectMany`
+/// and then a `Select`, which such a type does not have.
+#[test]
+fn a_select_after_a_second_from_is_the_result_selector_of_its_select_many() {
+    check(
+        "query_select_after_second_from",
+        r##"using System;
+class Box<T> { public T V; public Box<V2> SelectMany<U, V2>(Func<T, Box<U>> f, Func<T, U, V2> r) { Console.Write("[SelectMany]"); var u = f(V); return new Box<V2> { V = r(V, u.V) }; } public override string ToString() => "Box(" + V + ")"; }
+class P { static void Main() {
+  var b2 = from x in new Box<int> { V = 3 } from y in new Box<string> { V = "s" } select x + y; Console.WriteLine(b2);
+}}
+"##,
+        r##"[SelectMany]Box(3s)
+"##,
+    );
+}
+
+/// The calls a query makes, logged by a type of its own: the `select x` that is left out, the
+/// `select` that is folded into the `SelectMany` or `Join` before it, `let`, `group ... by`,
+/// `join ... into` and continuations.
+#[test]
+fn every_shape_of_query_makes_the_calls_roslyn_makes() {
+    check(
+        "query_call_sequences",
+        r##"using System;
+class Q<T> {
+  public T V; public string Log = "";
+  Q<U> N<U>(U v, string s) => new Q<U> { V = v, Log = Log + s };
+  public Q<T> Where(Func<T, bool> f) => new Q<T> { V = V, Log = Log + "W" };
+  public Q<T> OrderBy<K>(Func<T, K> f) => new Q<T> { V = V, Log = Log + "O" };
+  public Q<T> OrderByDescending<K>(Func<T, K> f) => new Q<T> { V = V, Log = Log + "Od" };
+  public Q<T> ThenBy<K>(Func<T, K> f) => new Q<T> { V = V, Log = Log + "T" };
+  public Q<T> ThenByDescending<K>(Func<T, K> f) => new Q<T> { V = V, Log = Log + "Td" };
+  public Q<R> Select<R>(Func<T, R> f) => N(f(V), "S");
+  public Q<R> SelectMany<U, R>(Func<T, Q<U>> f, Func<T, U, R> r) => N(r(V, f(V).V), "M");
+  public Q<R> Join<I, K, R>(Q<I> inner, Func<T, K> ok, Func<I, K> ik, Func<T, I, R> r) => N(r(V, inner.V), "J");
+  public Q<R> GroupJoin<I, K, R>(Q<I> inner, Func<T, K> ok, Func<I, K> ik, Func<T, Q<I>, R> r) => N(r(V, inner), "GJ");
+  public Q<Q<T>> GroupBy<K>(Func<T, K> k) => new Q<Q<T>> { V = this, Log = Log + "G1" };
+  public Q<G> GroupBy<K, G>(Func<T, K> k, Func<T, G> e) => N(e(V), "G2");
+  public Q<T> Cast<X>() => N(V, "C");
+}
+class P { static void Main() {
+  var a = new Q<int> { V = 1 }; var b = new Q<int> { V = 2 }; var c = new Q<int> { V = 3 };
+  void L(string s) => Console.WriteLine(s);
+  L((from x in a from y in b select x + y into z select z + 1).Log);
+  L((from x in a from y in b select x + y into z where z > 0 select z).Log);
+  L((from x in a from y in b select y into z select z).Log);
+  L((from x in a from y in b where y > 0 select x).Log);
+  L((from x in a where x > 0 from y in b select x * y).Log);
+  L((from x in a where x > 0 from y in b where y > 0 select x * y).Log);
+  L((from x in a from y in b orderby x select x + y).Log);
+  L((from x in a from y in b from z in c select z).Log);
+  L((from x in a from y in b let t = x select t + y).Log);
+  L((from x in a from y in b join z in c on x equals z select x + z).Log);
+  L((from x in a join y in b on x equals y select x + y into z select z).Log);
+  L((from x in a join y in b on x equals y from z in c select x + z).Log);
+  L((from x in a join y in b on x equals y where y > 0 select x + y).Log);
+  L((from x in a join y in b on x equals y select y).Log);
+  L((from x in a select x into y select y).Log);
+  L((from x in a where x > 0 select x into y where y > 0 select y + 1).Log);
+  L((from x in a orderby x select x into y orderby y descending select y).Log);
+  L((from int x in a from int y in b select x + y).Log);
+  L((from x in a from int y in b select x + y).Log);
+  L((from x in a let y = x select y + 1).Log);
+  L((from x in a let y = x let z = y select z).Log);
+  L((from x in a where x > 0 let y = x orderby y select y).Log);
+  L((from x in a group x by x).Log);
+  L((from x in a group x + 1 by x).Log);
+  L((from x in a where x > 0 group x by x).Log);
+  L((from x in a from y in b group x + y by x).Log);
+  L((from x in a group x by x into g select g).Log);
+  L((from x in a group x by x into g where true select g).Log);
+  L((from x in a join y in b on x equals y into g from w in c select g).Log);
+  L((from x in a join y in b on x equals y into g select g).Log);
+  L((from x in a join y in b on x equals y into g where true select g).Log);
+  L((from x in a select x + 1).Log);
+  L((from x in a where x > 0 select x + 1).Log);
+  L((from x in a orderby x, x descending select x + 1).Log);
+  L((from x in a where (from y in b from z in c select y + z).Log == "M" select x).Log);
+}}
+"##,
+        r##"MS
+MW
+MS
+MWS
+WM
+WMWS
+MOS
+MM
+MSS
+MJ
+JS
+JM
+JWS
+J
+SS
+WWS
+OOd
+CM
+M
+SS
+SSS
+WSOS
+G1
+G2
+WG1
+MG2
+G1S
+G1W
+GJM
+GJ
+GJWS
+S
+WS
+OTdS
+W
+"##,
+    );
+}
+
+/// `Expression.Condition` takes two branches of one type: a `null` branch is the constant `null`
+/// of the conditional's type and a branch of another type is converted to it, as Roslyn writes
+/// the tree (building it threw `ArgumentException`). `&` and `|` on two `bool?` are the lifted
+/// `And` and `Or`; the binder writes the three-valued choice out, which a tree cannot hold.
+#[test]
+fn a_conditional_in_an_expression_tree_has_branches_of_its_own_type() {
+    check(
+        "expression_tree_conditional_and_lifted_logic",
+        r##"using System;
+using System.Linq.Expressions;
+using System.Text;
+class C { public string Name; public object O; public int? N; }
+class D : C { }
+interface IA { }
+class AA : IA { }
+class BB : IA { }
+static class Dump {
+  public static string Of(Expression e) { var sb = new StringBuilder(); W(e, sb); return sb.ToString(); }
+  static void W(Expression e, StringBuilder sb) {
+    if (e == null) { sb.Append("<null>"); return; }
+    sb.Append(e.NodeType).Append(':').Append(e.Type.Name).Append('(');
+    switch (e) {
+      case BinaryExpression b: W(b.Left, sb); sb.Append(','); W(b.Right, sb); if (b.Method != null) sb.Append(",m=" + b.Method.Name); if (b.IsLifted) sb.Append(",lifted"); break;
+      case UnaryExpression u: W(u.Operand, sb); break;
+      case ConditionalExpression c: W(c.Test, sb); sb.Append(','); W(c.IfTrue, sb); sb.Append(','); W(c.IfFalse, sb); break;
+      case ConstantExpression k: sb.Append(k.Value == null ? "null" : k.Value.GetType().IsClass && k.Value.GetType().Name.StartsWith("<>") ? "closure" : k.Value.ToString()); break;
+      case MemberExpression m: W(m.Expression, sb); sb.Append('.').Append(m.Member.Name); break;
+      case MethodCallExpression mc: W(mc.Object, sb); sb.Append('.').Append(mc.Method.Name); break;
+      case ParameterExpression p: sb.Append(p.Name); break;
+      case LambdaExpression l: W(l.Body, sb); break;
+      default: sb.Append("?"); break;
+    }
+    sb.Append(')');
+  }
+}
+class P {
+  static void Show<T>(Expression<T> e) { Console.WriteLine(Dump.Of(e)); }
+  static void Main() {
+    bool b = true; string s = null; C c = null; int? n = null; D d = new D(); AA a = new AA(); BB bb = new BB();
+    Show<Func<string>>(() => b ? "a" : null);
+    Show<Func<string>>(() => b ? null : "a");
+    Show<Func<C, string>>(x => x == null ? null : x.Name);
+    Show<Func<int?>>(() => b ? 1 : null);
+    Show<Func<object>>(() => b ? "a" : (object)1);
+    Show<Func<C>>(() => b ? d : c);
+    Show<Func<C>>(() => b ? null : c);
+    Show<Func<object>>(() => b ? (object)s : null);
+    Show<Func<IA>>(() => b ? a : bb);
+    Show<Func<C, object>>(x => x.O == null ? x.Name : x.O);
+    Show<Func<C, int?>>(x => x.N == null ? null : x.N);
+    Show<Func<bool?, bool?, bool?>>((x, y) => x & y);
+    Show<Func<bool?, bool?, bool?>>((x, y) => x | y);
+    Show<Func<bool?, bool, bool?>>((x, y) => x & y);
+    Show<Func<bool, bool?, bool?>>((x, y) => x | y);
+    Show<Func<bool?, bool?>>(x => x & null);
+    Show<Func<bool?, bool?, bool?>>((x, y) => x & y | !x);
+    Show<Func<bool, bool, bool>>((x, y) => x & y);
+    Expression<Func<string>> e1 = () => b ? "a" : null;
+    Expression<Func<string>> e2 = () => b ? null : "a";
+    Expression<Func<C, string>> e3 = x => x == null ? null : x.Name;
+    Expression<Func<object>> e4 = () => b ? "a" : (object)1;
+    Console.WriteLine(e1.Compile()() + "|" + e2.Compile()() + "|" + e3.Compile()(null) + "|" + e3.Compile()(new C { Name = "nm" }) + "|" + e4.Compile()());
+    Expression<Func<bool?, bool?, bool?>> and = (x, y) => x & y;
+    Expression<Func<bool?, bool?, bool?>> or = (x, y) => x | y;
+    var and2 = and.Compile(); var or2 = or.Compile();
+    bool?[] vs = { null, false, true };
+    foreach (var x in vs) foreach (var y in vs) Console.Write((and2(x, y) + "/" + or2(x, y) + " ").Replace("True", "T").Replace("False", "F"));
+    Console.WriteLine();
+  }
+}
+"##,
+        r##"Lambda:Func`1(Conditional:String(MemberAccess:Boolean(Constant:<>c__DisplayClass1_0(closure).b),Constant:String(a),Constant:String(null)))
+Lambda:Func`1(Conditional:String(MemberAccess:Boolean(Constant:<>c__DisplayClass1_0(closure).b),Constant:String(null),Constant:String(a)))
+Lambda:Func`2(Conditional:String(Equal:Boolean(Parameter:C(x),Constant:Object(null)),Constant:String(null),MemberAccess:String(Parameter:C(x).Name)))
+Lambda:Func`1(Conditional:Nullable`1(MemberAccess:Boolean(Constant:<>c__DisplayClass1_0(closure).b),Convert:Nullable`1(Constant:Int32(1)),Constant:Nullable`1(null)))
+Lambda:Func`1(Conditional:Object(MemberAccess:Boolean(Constant:<>c__DisplayClass1_0(closure).b),Convert:Object(Constant:String(a)),Convert:Object(Constant:Int32(1))))
+Lambda:Func`1(Conditional:C(MemberAccess:Boolean(Constant:<>c__DisplayClass1_0(closure).b),Convert:C(MemberAccess:D(Constant:<>c__DisplayClass1_0(closure).d)),MemberAccess:C(Constant:<>c__DisplayClass1_0(closure).c)))
+Lambda:Func`1(Conditional:C(MemberAccess:Boolean(Constant:<>c__DisplayClass1_0(closure).b),Constant:C(null),MemberAccess:C(Constant:<>c__DisplayClass1_0(closure).c)))
+Lambda:Func`1(Conditional:Object(MemberAccess:Boolean(Constant:<>c__DisplayClass1_0(closure).b),Convert:Object(MemberAccess:String(Constant:<>c__DisplayClass1_0(closure).s)),Constant:Object(null)))
+Lambda:Func`1(Conditional:IA(MemberAccess:Boolean(Constant:<>c__DisplayClass1_0(closure).b),Convert:IA(MemberAccess:AA(Constant:<>c__DisplayClass1_0(closure).a)),Convert:IA(MemberAccess:BB(Constant:<>c__DisplayClass1_0(closure).bb))))
+Lambda:Func`2(Conditional:Object(Equal:Boolean(MemberAccess:Object(Parameter:C(x).O),Constant:Object(null)),Convert:Object(MemberAccess:String(Parameter:C(x).Name)),MemberAccess:Object(Parameter:C(x).O)))
+Lambda:Func`2(Conditional:Nullable`1(Equal:Boolean(MemberAccess:Nullable`1(Parameter:C(x).N),Constant:Nullable`1(null),lifted),Constant:Nullable`1(null),MemberAccess:Nullable`1(Parameter:C(x).N)))
+Lambda:Func`3(And:Nullable`1(Parameter:Nullable`1(x),Parameter:Nullable`1(y),lifted))
+Lambda:Func`3(Or:Nullable`1(Parameter:Nullable`1(x),Parameter:Nullable`1(y),lifted))
+Lambda:Func`3(And:Nullable`1(Parameter:Nullable`1(x),Convert:Nullable`1(Parameter:Boolean(y)),lifted))
+Lambda:Func`3(Or:Nullable`1(Convert:Nullable`1(Parameter:Boolean(x)),Parameter:Nullable`1(y),lifted))
+Lambda:Func`2(And:Nullable`1(Parameter:Nullable`1(x),Constant:Nullable`1(null),lifted))
+Lambda:Func`3(Or:Nullable`1(And:Nullable`1(Parameter:Nullable`1(x),Parameter:Nullable`1(y),lifted),Not:Nullable`1(Parameter:Nullable`1(x)),lifted))
+Lambda:Func`3(And:Boolean(Parameter:Boolean(x),Parameter:Boolean(y)))
+a|||nm|a
+/ F/ /T F/ F/F F/T /T F/T T/T 
+"##,
+    );
+}
+
+/// Walking what a type derives from stops where a definition comes back (`class A<T> :
+/// A<A<T>>`, which Roslyn reports as circular), and not for a base whose own bases are another
+/// type's: `class E<TSelf> where TSelf : E<TSelf>`, `class G<T> : List<G<T>>` and a nested class
+/// deriving from the construction of its container are as legal as they were.
+#[test]
+fn a_curiously_recurring_generic_base_is_not_a_circular_one() {
+    check(
+        "recursive_generic_bases_that_are_legal",
+        r##"using System;
+using System.Collections.Generic;
+class Base<T> { public string N => typeof(T).Name; }
+class L<T> : Base<L<L<T>>> { }
+class Node<T> : IEquatable<Node<T>> where T : IComparable<T> { public bool Equals(Node<T> o) => true; }
+abstract class E<TSelf> where TSelf : E<TSelf> { public TSelf Me => (TSelf)this; }
+sealed class F : E<F> { }
+class G<T> : List<G<T>> { }
+class A<T> { public class B : A<B> { } }
+class P {
+  static void Main() {
+    Console.WriteLine(new Node<int>().Equals(null));
+    Console.WriteLine(new F().Me is F);
+    var g = new G<int>(); g.Add(new G<int>()); Console.WriteLine(g.Count);
+    Console.WriteLine(new A<int>.B() is A<A<int>.B>);
+  }
+}
+"##,
+        r##"True
+True
+1
+True
+"##,
+    );
+}
+
+/// `params` on a collection other than an array (C# 13) is written as `[ParamCollection]` and
+/// has to be read back as one from the assembly that declares it: a call in expanded form on
+/// `void Sp(params ReadOnlySpan<int> xs)` of another assembly was CS1501, while the same source
+/// compiled together worked. (`[ParamArray]` was read; this attribute was not.)
+#[test]
+fn a_params_collection_of_a_referenced_assembly_takes_its_arguments_expanded() {
+    check_with_library(
+        "params_collection_of_a_library",
+        r#"using System;
+using System.Collections.Generic;
+public class Bag : IEnumerable<string> {
+  public List<string> Items = new();
+  public void Add(string s) => Items.Add(s);
+  public IEnumerator<string> GetEnumerator() => Items.GetEnumerator();
+  System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => Items.GetEnumerator();
+}
+public class L {
+  public static int Sp(params ReadOnlySpan<int> a) => a.Length;
+  public static int Sp2(params Span<int> a) => a.Length;
+  public static int Li(params List<int> a) => a.Count;
+  public static int En(params IEnumerable<int> a) { int n = 0; foreach (var x in a) n += x; return n; }
+  public static int Il(params IList<int> a) => a.Count;
+  public static int Ro(params IReadOnlyList<int> a) => a.Count;
+  public static string Bg(params Bag b) => string.Join("+", b.Items);
+  public static int Ar(params int[] a) => a.Length;
+  public static string Mix(string head, params ReadOnlySpan<string> rest) => head + rest.Length;
+  public int Inst(params ICollection<int> a) => a.Count;
+  public L(params ReadOnlySpan<int> a) { Count = a.Length; }
+  public int Count;
+  public int this[params ReadOnlySpan<int> idx] => idx.Length;
+}
+"#,
+        r#"using System;
+class P { static void Main() {
+  Console.WriteLine(L.Sp(1, 2, 3)); Console.WriteLine(L.Sp()); Console.WriteLine(L.Sp(new[] { 1, 2 }));
+  Console.WriteLine(L.Sp2(1, 2, 3, 4));
+  Console.WriteLine(L.Li(1, 2)); Console.WriteLine(L.En(1, 2, 3)); Console.WriteLine(L.Il(5, 6, 7)); Console.WriteLine(L.Ro(5, 6));
+  Console.WriteLine(L.Bg("a", "b", "c")); Console.WriteLine(L.Ar(1, 2, 3));
+  Console.WriteLine(L.Mix("h", "x", "y"));
+  var l = new L(1, 2, 3); Console.WriteLine(l.Count + " " + l.Inst(1, 2) + " " + l[1, 2, 3, 4]);
+  Console.WriteLine(L.Sp(1, 2, 3, 4, 5, 6, 7, 8, 9, 10));
+}}
+"#,
+        "3
+0
+2
+4
+2
+6
+3
+2
+a+b+c
+3
+h2
+3 2 4
+10
+",
+    );
+}
+
+/// `class A<T> : A<A<T>>` is circular, which Roslyn reports as CS0146: every base of it is a
+/// type of its own, and walking the interfaces they inherit never reached the end, and took all
+/// the memory with it. Emitting it has to finish, whatever it makes of the program.
+#[test]
+fn a_class_deriving_from_a_construction_of_itself_is_emitted_in_bounded_time() {
+    let Some(bytes) = references() else {
+        println!("note: skipped; no .NET shared framework was found");
+        return;
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || {
+            for source in [
+                "class A<T> : A<A<T>> { } class P { static void Main() { } }",
+                "interface I<T> { } class A<T> : A<A<T>>, I<T> { } class D : A<int> { } class P { static void Main() { object o = new D(); } }",
+                "class A<T> : B<T> { } class B<T> : C<B<T>> { } class C<T> : A<C<T>> { } class P { static void Main() { } }",
+            ] {
+                let images: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
+                let compilation = Compilation::create_with_references(
+                    vec![parse(SourceText::new("Program.cs", source))],
+                    &images,
+                );
+                let _ = rustlyn_emit::emit(&compilation, "Circular");
+            }
+            let _ = sender.send(());
+        })
+        .expect("a thread");
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("emitting a circular base type did not finish");
+}
+
+/// The lambdas and local functions of one method are named, and so numbered, as Roslyn
+/// numbers them, which means ordering them by where they were written: that was done again for
+/// each of them, and finding each local function's declaration walked the tree, so a method of
+/// a thousand took seconds and one of two thousand took half a minute. A body four times as
+/// long takes about four times as long; a method of lambdas and of local functions is each
+/// timed against one a quarter its size, the best of three, and given three times the ratio a
+/// linear cost has.
+#[test]
+fn the_lambdas_and_local_functions_of_one_method_are_emitted_in_time_proportional_to_them() {
+    let Some(bytes) = references() else {
+        println!("note: skipped; no .NET shared framework was found");
+        return;
+    };
+    let lambdas = |count: usize| {
+        let mut source =
+            String::from("using System;\nclass P {\n  static void Main() {\n    int cap = 3;\n");
+        for index in 0..count {
+            source.push_str(&format!("    Func<int> f{index} = () => {index} + cap;\n"));
+        }
+        source.push_str("    int s = 0;\n");
+        for index in (0..count).step_by(50) {
+            source.push_str(&format!("    s += f{index}();\n"));
+        }
+        source.push_str("    Console.WriteLine(s);\n  }\n}\n");
+        source
+    };
+    let functions = |count: usize| {
+        let mut source =
+            String::from("using System;\nclass P {\n  static void Main() { int a = 1;\n");
+        for index in 0..count {
+            source.push_str(&format!("    int L{index}(int x) => x + {index} + a;\n"));
+        }
+        source.push_str("    int s = 0;\n");
+        for index in (0..count).step_by(50) {
+            source.push_str(&format!("    s += L{index}(1);\n"));
+        }
+        source.push_str("    Console.WriteLine(s);\n  }\n}\n");
+        source
+    };
+    let time = |source: &str| {
+        (0..3)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let compilation = compiled("Timing", source, &bytes);
+                rustlyn_emit::emit(&compilation, "Timing").expect("emitted");
+                started.elapsed()
+            })
+            .min()
+            .expect("three runs")
+    };
+    for (what, make) in [
+        ("lambdas", &lambdas as &dyn Fn(usize) -> String),
+        ("local functions", &functions),
+    ] {
+        let (small, large) = (time(&make(300)), time(&make(1200)));
+        assert!(
+            large < small * 12,
+            "{what}: 300 took {small:?} and 1200 took {large:?}, which is more than linear"
+        );
+    }
+}

@@ -1688,12 +1688,24 @@ impl<'a> Loader<'a> {
             // row exists to carry it only where one was written.
             let row =
                 source.and_then(|method| self.parameter_row(index, method, position as u32 + 1));
-            // Only on a one-dimensional array does it make a `params`: C#
-            // reads one on anything else as not there.
-            let is_params = matches!(resolved, Type::Array { rank: 1, .. })
-                && row.is_some_and(|row| {
+            // Only on a one-dimensional array does `[ParamArray]` make a
+            // `params`: C# reads one on anything else as not there. Any
+            // other collection is a `params` by `[ParamCollection]` (C# 13),
+            // which an array never carries.
+            let is_params = row.is_some_and(|row| {
+                if matches!(resolved, Type::Array { rank: 1, .. }) {
                     self.has_attribute(index, table::PARAM, row, "System.ParamArrayAttribute")
-                });
+                } else {
+                    !resolved.is_error()
+                        && !matches!(resolved, Type::Array { .. })
+                        && self.has_attribute(
+                            index,
+                            table::PARAM,
+                            row,
+                            "System.Runtime.CompilerServices.ParamCollectionAttribute",
+                        )
+                }
+            });
             // `in` is what C# writes as `[IsReadOnly]` on a `ref`, with or
             // without the `In` flag and modifier.
             let ref_kind = if ref_kind == RefKind::Ref

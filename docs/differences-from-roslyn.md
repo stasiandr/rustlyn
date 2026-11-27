@@ -113,6 +113,10 @@ implements the behaviour.
   that cover the input's type; a property or positional pattern is looked into only
   where each part cannot fail. Anything else leaves the `else` reachable, which can be a
   CS0165 where Roslyn proves the pattern exhaustive.
+* A circular base type (`class A<T> : A<A<T>>`, `class A : B { } class B : A { }`) is not
+  reported (CS0146, CS0529); what walks the bases of such a type stops where a definition
+  comes back, as Roslyn's `BaseTypeAnalysis` finds the circularity, and the program is
+  emitted as written. `class L<T> : Base<L<L<T>>>`, whose bases are `Base`'s, is no cycle.
 
 ## Interpreter
 

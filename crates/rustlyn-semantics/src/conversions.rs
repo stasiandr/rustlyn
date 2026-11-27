@@ -406,7 +406,10 @@ impl Binder<'_> {
                 (self.nullable_underlying(to).is_some()
                     || to.is_reference_type(self.compilation().symbols()))
                     && inner.symbol().is_some()
-                    && self.implicit_operator(&inner, &wanted).is_some()
+                    && (self.implicit_operator(&inner, &wanted).is_some()
+                        // An operator giving an `int?` is lifted too: `S?`
+                        // reaches a `long?` through `operator int?(S)`.
+                        || (wanted != *to && self.implicit_operator(&inner, to).is_some()))
             })
     }
 
@@ -649,7 +652,14 @@ impl Binder<'_> {
         if self.first_class_spans() && self.implicit_span_conversion(gives, target) {
             return true;
         }
-        match (self.special_of(gives), self.special_of(target)) {
+        // An operator giving an `int?` reaches a `long?` by the lifted
+        // widening (§10.5.4): the second step is any standard implicit
+        // conversion, and a nullable one is among them.
+        let gives = match (&inner, self.nullable_underlying(gives)) {
+            (Some(_), Some(given)) => given,
+            _ => gives.clone(),
+        };
+        match (self.special_of(&gives), self.special_of(target)) {
             (Some(given), Some(wanted)) if given.is_numeric() && wanted.is_numeric() => {
                 explicit || implicit_numeric(given, wanted)
             }
@@ -677,6 +687,8 @@ impl Binder<'_> {
         explicit: bool,
     ) -> Option<SymbolId> {
         let symbols = self.compilation().symbols();
+        let inner_target = self.nullable_underlying(to);
+        let mut found: Vec<(SymbolId, Type)> = Vec::new();
         for (side, owner_type) in [from, to].into_iter().enumerate() {
             // `Nullable<T>` declares an `op_Implicit` from `T`, but `int` into
             // an `int?` is not a user-defined conversion: the language lifts
@@ -806,6 +818,7 @@ impl Binder<'_> {
                             && self.inherits_from(derived, base, 0)
                     };
                     let gives_to = gives == *to
+                        || inner_target.as_ref() == Some(&gives)
                         || self.inherits_from(&gives, to, 0)
                         || (loose && self.standard_after(&gives, to, explicit))
                         || (loose && tuples(&gives, to))
@@ -845,12 +858,42 @@ impl Binder<'_> {
                         || down(from, &takes))
                         && gives_to
                     {
-                        return Some(candidate);
+                        found.push((candidate, gives));
                     }
                 }
             }
         }
-        None
+        self.most_specific_target(found, to)
+    }
+
+    /// Which of the operators that apply is the one (§10.5.4): the one
+    /// giving the target itself — or, for a `T?`, the `T` under it — and
+    /// else, for an implicit conversion, the one whose result every other
+    /// result reaches by a standard conversion. With `operator int?(C)` and
+    /// `operator long(C)` beside each other, a `long?` is the second and a
+    /// `double?` is whichever result the other widens to. Where nothing
+    /// stands out, the first one found stays.
+    fn most_specific_target(&self, found: Vec<(SymbolId, Type)>, to: &Type) -> Option<SymbolId> {
+        let inner = self.nullable_underlying(to);
+        if let Some((operator, _)) = found
+            .iter()
+            .find(|(_, gives)| gives == to || inner.as_ref() == Some(gives))
+        {
+            return Some(*operator);
+        }
+        if found.len() > 1
+            && let Some((operator, _)) = found.iter().find(|(_, gives)| {
+                let bare = |ty: &Type| self.nullable_underlying(ty).unwrap_or_else(|| ty.clone());
+                found.iter().all(|(_, other)| {
+                    other == gives
+                        || self.standard_after(&bare(other), &bare(gives), false)
+                            && !self.standard_after(&bare(gives), &bare(other), false)
+                })
+            })
+        {
+            return Some(*operator);
+        }
+        found.first().map(|(operator, _)| *operator)
     }
 
     /// Whether an array converts to another by array covariance (§10.2.8),

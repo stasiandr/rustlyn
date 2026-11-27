@@ -15,7 +15,7 @@
 
 use rustlyn_semantics::{
     BinaryOperator, BoundExpression, BoundExpressionKind, BoundStatementKind, ConstantValue,
-    ConversionKind, LocalId, SpecialType, SymbolId, SymbolKind, Type, UnaryOperator,
+    ConversionKind, LocalId, SpecialType, SymbolId, SymbolKind, Type, TypeKind, UnaryOperator,
 };
 
 use crate::codegen::BodyEmitter;
@@ -1014,8 +1014,8 @@ impl BodyEmitter<'_, '_> {
                     return Ok(());
                 }
                 self.emit_tree_node(condition, tree)?;
-                self.emit_tree_node(consequence, tree)?;
-                self.emit_tree_node(alternative, tree)?;
+                self.emit_tree_branch(consequence, &node.ty, tree)?;
+                self.emit_tree_branch(alternative, &node.ty, tree)?;
                 let conditional = self.tree_named("ConditionalExpression");
                 let expression = self.tree_named("Expression");
                 let factory = self.emitter.framework_member(
@@ -1084,6 +1084,17 @@ impl BodyEmitter<'_, '_> {
             }
             BoundExpressionKind::Sequence(steps) if steps.len() == 1 => {
                 self.emit_tree_node(&steps[0], tree)
+            }
+            // `x & y` on two `bool?`, which the binder wrote out as the
+            // three-valued choice it is, is the lifted `And` of the two
+            // sides, as Roslyn writes it; `|` is `Or`.
+            BoundExpressionKind::Sequence(steps) if lifted_boolean_logic(steps).is_some() => {
+                let Some((and, left, right)) = lifted_boolean_logic(steps) else {
+                    unreachable!("the shape was just matched");
+                };
+                self.emit_tree_node(left, tree)?;
+                self.emit_tree_node(right, tree)?;
+                self.binary_factory(if and { "And" } else { "Or" })
             }
             // The binder's lifted user-defined operator, `l` and `r` held and
             // tested for values, is the operator on the two as they were:
@@ -1392,11 +1403,18 @@ impl BodyEmitter<'_, '_> {
             for (operand, other) in [(left, right), (right, left)] {
                 if is_null(operand) && !is_null(other) && !other.ty.is_error() {
                     let other_first = std::ptr::eq(operand, right);
+                    // Two references are compared as `object`s: the `null`
+                    // of `x == null` on a class is an `object` constant.
+                    let held = if self.compares_as_object(&other.ty) {
+                        self.object_type()?
+                    } else {
+                        other.ty.clone()
+                    };
                     if other_first {
                         self.emit_tree_node(other, tree)?;
-                        self.emit_tree_null(&other.ty)?;
+                        self.emit_tree_null(&held)?;
                     } else {
-                        self.emit_tree_null(&other.ty)?;
+                        self.emit_tree_null(&held)?;
                         self.emit_tree_node(other, tree)?;
                     }
                     let name = self.binary_factory_name(operator, result);
@@ -1452,6 +1470,59 @@ impl BodyEmitter<'_, '_> {
             self.emitter.special_type_of(&ty),
             Some(SpecialType::Single | SpecialType::Double | SpecialType::Decimal)
         )
+    }
+
+    /// Whether `==` on a value of this type is a comparison of references
+    /// that names no operator: a class or an interface.
+    fn compares_as_object(&self, ty: &Type) -> bool {
+        let symbols = self.emitter.compilation.symbols();
+        ty.symbol().is_some_and(|symbol| {
+            matches!(
+                symbols.get(symbol).type_kind(),
+                Some(TypeKind::Class | TypeKind::Interface)
+            ) && self.emitter.special_type_of(ty) != Some(SpecialType::String)
+        })
+    }
+
+    /// One branch of a conditional, as the type of the conditional itself:
+    /// `Expression.Condition` takes two branches of one type. A `null` is
+    /// the constant `null` of that type, and a branch of another type —
+    /// the `string` of `b ? "a" : (object)1`, the `D` where a `C` is
+    /// wanted — is converted to it, as Roslyn writes it.
+    fn emit_tree_branch(
+        &mut self,
+        branch: &BoundExpression,
+        ty: &Type,
+        tree: &mut Tree,
+    ) -> Result<(), EmitError> {
+        if ty.is_error() || matches!(ty, Type::Null) {
+            return self.emit_tree_node(branch, tree);
+        }
+        if matches!(
+            branch.kind,
+            BoundExpressionKind::Literal(ConstantValue::Null)
+        ) && (matches!(branch.ty, Type::Null) || branch.ty.is_error())
+        {
+            return self.emit_tree_null(ty);
+        }
+        // A reference conversion the binder wrote is left out of a tree
+        // (see `Conversion` above), and here it is the branch's own type.
+        let (inner, reached) = match &branch.kind {
+            BoundExpressionKind::Conversion {
+                operand,
+                conversion: ConversionKind::ImplicitReference,
+                written: false,
+            } if branch.ty == *ty && operand.ty != *ty && !operand.ty.is_error() => {
+                (operand.as_ref(), true)
+            }
+            _ => (branch, branch.ty != *ty && !branch.ty.is_error()),
+        };
+        self.emit_tree_node(inner, tree)?;
+        if reached && inner.ty != *ty {
+            self.push_type(ty)?;
+            self.unary_type_factory("Convert", "UnaryExpression")?;
+        }
+        Ok(())
     }
 
     /// `Expression.Constant(null, type)`.
@@ -2358,6 +2429,52 @@ fn lifted_operator(steps: &[BoundExpression]) -> Option<BoundExpressionKind> {
         arguments: vec![left, right],
         virtual_call: *virtual_call,
     })
+}
+
+/// `(l = x, r = y, l.GetValueOrDefault() ? r : …)` or `… ? l : …`: the
+/// binder's `x & y` or `x | y` on two `bool?`, as `true` for `&` and the
+/// two sides as they were written.
+fn lifted_boolean_logic(
+    steps: &[BoundExpression],
+) -> Option<(bool, &BoundExpression, &BoundExpression)> {
+    let [first, second, chosen] = steps else {
+        return None;
+    };
+    fn held(step: &BoundExpression) -> Option<(LocalId, &BoundExpression)> {
+        match &step.kind {
+            BoundExpressionKind::Assignment { target, value } => match target.kind {
+                BoundExpressionKind::Local(local) => Some((local, value.as_ref())),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let ((left_local, left), (right_local, right)) = (held(first)?, held(second)?);
+    let BoundExpressionKind::Conditional {
+        condition,
+        consequence,
+        ..
+    } = &chosen.kind
+    else {
+        return None;
+    };
+    // The test is the value of the left side, and the answer where that
+    // value settles it is a side held in a local: `r` for `&`, `l` for `|`.
+    let BoundExpressionKind::Call {
+        receiver: Some(tested),
+        ..
+    } = &condition.kind
+    else {
+        return None;
+    };
+    if !matches!(tested.kind, BoundExpressionKind::Local(local) if local == left_local) {
+        return None;
+    }
+    match consequence.kind {
+        BoundExpressionKind::Local(local) if local == right_local => Some((true, left, right)),
+        BoundExpressionKind::Local(local) if local == left_local => Some((false, left, right)),
+        _ => None,
+    }
 }
 
 /// The factory that writes a call to a user-defined operator as the

@@ -1109,33 +1109,27 @@ impl BodyBinder<'_> {
         arguments: &[BoundExpression],
         span: TextSpan,
     ) -> Option<BoundExpression> {
-        let types: Vec<Type> = arguments
-            .iter()
-            .map(|argument| argument.ty.clone())
-            .collect();
         // `Read<Token>()` says what `T` is where no argument could: a local
         // function or an imported static is named the same way as any other
         // method, type arguments and all.
         let explicit = self.explicit_type_arguments(name_node);
+        // A lambda argument is what infers the type parameter of
+        // `U Conv<U>(Func<int, U> f)`, as it is for any method: the call is
+        // resolved through the lambdas, not on the types of the arguments
+        // alone, which a lambda does not have yet.
+        let mut arguments = arguments.to_vec();
         let Resolved {
             method,
             type_arguments,
             substitution,
-        } = self.resolve_call(
-            candidates,
-            &types,
-            &self.evidence(arguments),
-            &Type::Void,
-            &explicit,
-        )?;
+        } = self.resolve_with_lambdas(candidates, &mut arguments, &Type::Void, &explicit, false)?;
         self.body
             .references
             .insert(name_node.span(), BoundSymbol::Declared(method));
         let ty = self
             .member_type(method, &Type::Void)
             .substitute(&substitution);
-        let arguments =
-            self.convert_arguments(method, arguments.to_vec(), &Type::Void, &substitution, span);
+        let arguments = self.convert_arguments(method, arguments, &Type::Void, &substitution, span);
         // An instance local function is an instance method in metadata, so
         // the call has to carry the `this` the source did not write.
         let receiver = self.implicit_receiver(method, span);
