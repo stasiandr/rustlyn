@@ -18259,6 +18259,42 @@ class P
     );
 }
 
+/// An `if` with an `else`, and every loop, inside a `catch` or a `finally`.
+/// Nothing branches to a handler, so while its body was being written
+/// everything in it looked unreachable: the `if` left out the jump over its
+/// `else` and ran both branches, and a loop left out its jump back and ran
+/// once. In iterators and `async` methods too.
+#[test]
+fn branches_and_loops_inside_a_catch_or_a_finally_run_as_written() {
+    check(
+        "HandlerControlFlow",
+        r#"
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+class P
+{
+    static void A(bool c) { try { throw new Exception(); } catch (Exception) { if (c) Console.Write("a "); else Console.Write("b "); } }
+    static void B(bool c) { try { } finally { if (c) Console.Write("a "); else Console.Write("b "); } }
+    static void C() { try { throw new Exception(); } catch { int i = 0; while (i < 3) { Console.Write("c" + i + " "); i++; } } finally { for (int j = 0; j < 2; j++) Console.Write("f" + j + " "); foreach (var x in new[] { 7, 8 }) Console.Write(x + " "); int k = 0; do { k++; } while (k < 5); Console.Write(k + " "); } }
+    static IEnumerable<int> It() { int fuel = 0; try { yield return 1; } finally { while (true) { if (++fuel > 3) break; Console.Write("loop" + fuel + " "); } } }
+    static async Task As(bool c) { try { await Task.Yield(); throw new Exception(); } catch (Exception) when (c || !c) { if (c) Console.Write("x "); else Console.Write("y "); for (int i = 0; i < 2; i++) Console.Write(i + " "); } finally { if (!c) Console.Write("z "); else Console.Write("w "); } }
+    static int D(int n) { try { return n; } finally { if (n > 0) { try { throw new Exception(); } catch { if (n > 1) Console.Write("deep "); else Console.Write("shallow "); } } else Console.Write("zero "); } }
+    static void Main()
+    {
+        A(true); A(false); B(true); B(false); Console.WriteLine(); C(); Console.WriteLine();
+        foreach (var v in It()) Console.Write(v + " "); Console.WriteLine();
+        As(true).Wait(); As(false).Wait(); Console.WriteLine(); D(2); D(1); D(0); Console.WriteLine();
+        using (var ms = new System.IO.MemoryStream()) { if (ms.Length == 0) Console.Write("u1 "); else Console.Write("u2 "); }
+        lock (typeof(P)) { for (int i = 0; i < 2; i++) Console.Write("l" + i + " "); }
+        Console.WriteLine();
+    }
+}
+"#,
+        "a b a b \nc0 c1 c2 f0 f1 7 8 5 \n1 loop1 loop2 loop3 \nx 0 1 w y 0 1 z \ndeep shallow zero \nu1 l0 l1 \n",
+    );
+}
+
 /// A relational pattern on a native integer compares native integers, the
 /// constant as one, and a pointer takes a native integer for an offset.
 /// `n switch { > 5 => ... }` asked whether the `nint` was an `int` and so

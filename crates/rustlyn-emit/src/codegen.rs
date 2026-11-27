@@ -2336,7 +2336,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
 
             let handler_start = self.stream.label();
             let handler_end = self.stream.label();
-            self.stream.mark(handler_start);
+            self.stream.mark_handler(handler_start, 0);
             let suspended = self.begin_guarded_finally();
             self.emit_dispose_of(slot, held, enumeration)?;
             self.end_guarded_finally(suspended);
@@ -4235,7 +4235,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
             let handler_start = self.stream.label();
             let handler_end = self.stream.label();
             self.stream.mark(outer_end);
-            self.stream.mark(handler_start);
+            self.stream.mark_handler(handler_start, 0);
             let suspended = self.begin_guarded_finally();
             self.protected += 1;
             self.emit_statement(finally)?;
@@ -4291,7 +4291,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
 
         let handler_start = self.stream.label();
         let handler_end = self.stream.label();
-        self.stream.mark(handler_start);
+        self.stream.mark_handler(handler_start, 0);
         let suspended = self.begin_guarded_finally();
         self.emit_dispose(first)?;
         self.end_guarded_finally(suspended);
@@ -4363,7 +4363,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
 
         let handler_start = self.stream.label();
         let handler_end = self.stream.label();
-        self.stream.mark(handler_start);
+        self.stream.mark_handler(handler_start, 0);
         let suspended = self.begin_guarded_finally();
         let unlocked = self.stream.label();
         self.load_local(taken);
@@ -4548,7 +4548,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 let filter_start = self.stream.label();
                 let keep = self.stream.label();
                 let decided = self.stream.label();
-                self.stream.mark(filter_start);
+                self.stream.mark_handler(filter_start, 1);
                 self.stream.emit(Instruction::IsInstance(token));
                 self.stream.emit(Instruction::Dup);
                 self.stream.emit(Instruction::BranchIfTrue(keep));
@@ -4570,7 +4570,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
 
         let handler_start = self.stream.label();
         let handler_end = self.stream.label();
-        self.stream.mark(handler_start);
+        self.stream.mark_handler(handler_start, 1);
         // The handler is entered with the exception pushed. A filter has
         // already stored it, so there it is only in the way.
         match (local, &catch.filter) {

@@ -550,18 +550,40 @@ impl InstructionStream {
         self.marks.push(label);
     }
 
+    /// Fixes at the current position the label a handler or a filter starts
+    /// at, which the runtime enters with `pushed` values on the stack: the
+    /// exception for a `catch` or a filter, nothing for a `finally`.
+    ///
+    /// Said before the handler's code is written, not after: nothing
+    /// branches to a handler, so until it is known for an entry everything
+    /// in it looks unreachable, and an `if` inside a `catch` that asks
+    /// whether its first branch can run on into the second is told it
+    /// cannot.
+    pub(crate) fn mark_handler(&mut self, label: Label, pushed: i32) {
+        self.mark(label);
+        self.enter(label, pushed);
+    }
+
+    fn enter(&mut self, label: Label, pushed: i32) {
+        if !self.entry_points.iter().any(|(known, _)| *known == label) {
+            self.entry_points.push((label, pushed));
+        }
+    }
+
     /// Records a protected region and its handler.
     pub(crate) fn region(&mut self, region: ExceptionRegion) {
         // A handler and a filter are entered by the runtime rather than by a
         // branch, with the exception already pushed, so the stack depth they
         // start at has to be declared or `.maxstack` would come out too small.
+        // `mark_handler` has said so already for a handler written the usual
+        // way; this is for one that was not.
         match region.kind {
-            HandlerKind::Catch(_) => self.entry_points.push((region.handler_start, 1)),
+            HandlerKind::Catch(_) => self.enter(region.handler_start, 1),
             HandlerKind::Filter(filter) => {
-                self.entry_points.push((filter, 1));
-                self.entry_points.push((region.handler_start, 1));
+                self.enter(filter, 1);
+                self.enter(region.handler_start, 1);
             }
-            HandlerKind::Finally => self.entry_points.push((region.handler_start, 0)),
+            HandlerKind::Finally => self.enter(region.handler_start, 0),
         }
         self.regions.push(region);
     }

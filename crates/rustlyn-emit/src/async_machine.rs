@@ -2084,7 +2084,7 @@ impl BodyEmitter<'_, '_> {
         let exception_sig = self.emitter.sig_type(&exception)?;
         let handler_start = self.stream.label();
         let handler_end = self.stream.label();
-        self.stream.mark(handler_start);
+        self.stream.mark_handler(handler_start, 1);
         self.stream.emit(Instruction::StoreLocal(exception_slot));
         if plan.iterator.is_some() {
             // An `async` iterator's builder only completes; what it throws
