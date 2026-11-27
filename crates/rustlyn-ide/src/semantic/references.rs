@@ -26,6 +26,7 @@ use rustlyn_semantics::{
 use rustlyn_syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 use rustlyn_text::TextSpan;
 
+use super::implicit::UseKind;
 use super::{Resolved, Semantic, View, attribute_stem, contains_word, names_declaration, parallel};
 
 /// How a reference touches what it names.
@@ -130,6 +131,17 @@ impl Semantic {
             });
             found.extend(per_file.into_iter().flatten());
         }
+        // An indexer is used by its brackets, with no name to search for.
+        if !local {
+            let indexers: Vec<SymbolId> = targets
+                .iter()
+                .filter_map(|target| match target {
+                    Resolved::Symbol(symbol) if self.is_indexer(*symbol) => Some(*symbol),
+                    _ => None,
+                })
+                .collect();
+            found.extend(self.indexer_references(&indexers));
+        }
         found.sort_by(|a, b| {
             a.path
                 .cmp(&b.path)
@@ -137,6 +149,51 @@ impl Semantic {
         });
         found.dedup_by(|a, b| a.path == b.path && a.span == b.span);
         Some((word, found))
+    }
+
+    /// Whether `symbol` is an indexer.
+    fn is_indexer(&self, symbol: SymbolId) -> bool {
+        self.compilation
+            .symbols()
+            .get(symbol)
+            .as_property()
+            .is_some_and(|property| property.is_indexer)
+    }
+
+    /// The `x[i]` of the project that run one of `indexers`, as references:
+    /// read, or written when assigned.
+    fn indexer_references(&self, indexers: &[SymbolId]) -> Vec<Reference> {
+        if indexers.is_empty() {
+            return Vec::new();
+        }
+        let mut found = Vec::new();
+        for symbol in indexers {
+            let Some(container) = self.compilation.symbols().get(*symbol).container else {
+                continue;
+            };
+            let index = self.implicit_index(super::implicit::construct::INDEX, container);
+            for used in index.by_symbol.get(symbol).into_iter().flatten() {
+                let (Some(path), Some(source), Some(view)) = (
+                    self.paths.get(&used.tree),
+                    self.compilation.trees().source(used.tree),
+                    self.view(used.tree),
+                ) else {
+                    continue;
+                };
+                found.push(Reference {
+                    path: path.clone(),
+                    span: used.span,
+                    kind: if matches!(used.kind, UseKind::Write | UseKind::ReadWrite) {
+                        ReferenceKind::Write
+                    } else {
+                        ReferenceKind::Read
+                    },
+                    container: view.container_name(used.span.start()),
+                    preview: line_preview(source.text(), used.span.start()),
+                });
+            }
+        }
+        found
     }
 
     /// A member and every member that is the same member seen from
@@ -336,6 +393,15 @@ impl View<'_> {
     /// method called; but `twice(3)` is a use of `twice`, and what the
     /// variable is, is recorded against the same name as a reference.
     pub fn resolve_use(&mut self, token: &SyntaxToken) -> Option<Resolved> {
+        // The `this` of an indexer's declaration names the indexer.
+        if token.kind() == SyntaxKind::ThisKeyword
+            && token.parent().kind() == SyntaxKind::IndexerDeclaration
+        {
+            return self
+                .model
+                .declared_symbol(token.parent())
+                .map(Resolved::Symbol);
+        }
         let resolved = self.resolve(token)?;
         if let Resolved::Symbol(symbol) = resolved {
             let found = self.compilation().symbols().get(symbol);
@@ -723,16 +789,23 @@ pub(super) fn declares(token: &SyntaxToken, resolved: &Resolved) -> bool {
 /// assignment, compound or not; incremented or decremented; passed by `ref`
 /// or `out`; or one of the variables a deconstruction assigns.
 pub(super) fn is_written(token: &SyntaxToken) -> bool {
+    use_kind_of(token) != UseKind::Read
+}
+
+/// How the name `token` is used where it stands: written (`x = 1`, `out x`,
+/// an element of `(x, y) = pair`), read and written (`x += 1`, `x++`,
+/// `ref x`), or read.
+pub(super) fn use_kind_of(token: &SyntaxToken) -> UseKind {
     let mut node = token.parent().clone();
     if !matches!(
         node.kind(),
         SyntaxKind::IdentifierName | SyntaxKind::GenericName
     ) {
-        return false;
+        return UseKind::Read;
     }
     loop {
         let Some(parent) = node.parent().cloned() else {
-            return false;
+            return UseKind::Read;
         };
         match parent.kind() {
             // `this.count = 0` writes `count`; `a.b = 1` writes `b`, not `a`.
@@ -741,36 +814,51 @@ pub(super) fn is_written(token: &SyntaxToken) -> bool {
             | SyntaxKind::MemberBindingExpression
             | SyntaxKind::QualifiedName => {
                 if parent.children().last().as_ref() != Some(&node) {
-                    return false;
+                    return UseKind::Read;
                 }
                 node = parent;
             }
             SyntaxKind::ParenthesizedExpression => node = parent,
+            SyntaxKind::SimpleAssignmentExpression => {
+                return if parent.children().next().as_ref() == Some(&node) {
+                    UseKind::Write
+                } else {
+                    UseKind::Read
+                };
+            }
             kind if is_assignment(kind) => {
-                return parent.children().next().as_ref() == Some(&node);
+                return if parent.children().next().as_ref() == Some(&node) {
+                    UseKind::ReadWrite
+                } else {
+                    UseKind::Read
+                };
             }
             SyntaxKind::PreIncrementExpression
             | SyntaxKind::PreDecrementExpression
             | SyntaxKind::PostIncrementExpression
-            | SyntaxKind::PostDecrementExpression => return true,
+            | SyntaxKind::PostDecrementExpression => return UseKind::ReadWrite,
             SyntaxKind::Argument => {
-                if parent.child_tokens().any(|token| {
+                let keyword = parent.child_tokens().find_map(|token| {
                     matches!(
                         token.kind(),
                         SyntaxKind::OutKeyword | SyntaxKind::RefKeyword
                     )
-                }) {
-                    return true;
+                    .then(|| token.kind())
+                });
+                match keyword {
+                    Some(SyntaxKind::OutKeyword) => return UseKind::Write,
+                    Some(_) => return UseKind::ReadWrite,
+                    None => {}
                 }
                 // `(a, b) = pair`: an element of a tuple on the left.
                 match parent.parent() {
                     Some(tuple) if tuple.kind() == SyntaxKind::TupleExpression => {
                         node = tuple.clone();
                     }
-                    _ => return false,
+                    _ => return UseKind::Read,
                 }
             }
-            _ => return false,
+            _ => return UseKind::Read,
         }
     }
 }

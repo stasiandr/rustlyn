@@ -461,7 +461,7 @@ impl Context {
                     let mut site = self.make_site(&target.path, &model, at, method.as_ref());
                     site.notes.push(Note::ByRef);
                     site.sources =
-                        self.out_sources(at, name, &target.path, &model, method.as_ref(), &[], 0);
+                        self.ref_sources(at, name, &target.path, &model, method.as_ref());
                     sites.push(site);
                 } else if let Some((value, method_name)) = flow::element_write(units, name) {
                     let method = self.enclosing_member(&target.path, at);
@@ -508,6 +508,13 @@ impl Context {
                     self.out_sources(at, name, &target.path, &model, method.as_ref(), &[], 0);
             }
             sites.push(site);
+        }
+        // A parameter of a primary constructor, and the property a record's
+        // positional parameter declares, are written by the constructor's
+        // callers.
+        if let Some((owner, index)) = self.positional_parameter(&declaration, &model) {
+            let owner = method_declaration(&owner, &model, &declaration.path);
+            sites.extend(self.callers(&owner, index, true));
         }
         sites.extend(self.declared(&declaration, &model));
         let known: HashSet<String> = sites
@@ -940,6 +947,143 @@ impl Context {
         (!found.is_empty()).then_some(found)
     }
 
+    /// The type whose header declares the parameter `declaration` is, and
+    /// the parameter's number: `class C(int t)`, `record R(int V)`.
+    fn positional_parameter(
+        &self,
+        declaration: &Decl,
+        model: &Arc<Document>,
+    ) -> Option<(Declaration, usize)> {
+        let units = model.units();
+        let offset = model.offset(declaration.line, declaration.character);
+        let outline = self.outline(&declaration.path);
+        let owner = outline
+            .declarations
+            .iter()
+            .filter(|d| {
+                d.kind.is_type()
+                    && !d.parameters.is_empty()
+                    && parameters(d, units).is_some_and(|list| list.contains(offset))
+            })
+            .min_by_key(|d| d.full_range.length)?;
+        let index = parameter_index(&declaration.short_name(), owner)?;
+        Some((owner.clone(), index))
+    }
+
+    /// Where the value comes from at `ref x` (with its receivers: `ref
+    /// this.x`): the writes of the method it is passed to, of the local that
+    /// becomes another name for it, of the callers that assign through what
+    /// the method returns by reference. A reference that goes where this
+    /// does not follow is said to: the value may be written there.
+    fn ref_sources(
+        &self,
+        offset: usize,
+        name: R,
+        path: &str,
+        model: &Arc<Document>,
+        method: Option<&Declaration>,
+    ) -> Vec<Source> {
+        let units = model.units();
+        let unknown = |chain: String| {
+            vec![Source::new(
+                SourceKind::Unknown(chain, Some(Unknown::ThroughReference)),
+                &[],
+            )]
+        };
+        if let Some(alias) = flow::ref_alias(units, name) {
+            let Some(method) = method else {
+                return unknown(string(units, alias));
+            };
+            let found: Vec<Source> = self
+                .local_writes(alias.location, method, path, model, &[], 0)
+                .into_iter()
+                .filter(|write| write.offset != alias.location)
+                .flat_map(|write| write.sources)
+                .collect();
+            return if found.is_empty() {
+                unknown(string(units, alias))
+            } else {
+                found
+            };
+        }
+        if flow::is_ref_return(units, name) {
+            let Some(method) = method else {
+                return unknown(string(units, name));
+            };
+            let found = self.ref_return_sources(method, path);
+            return if found.is_empty() {
+                unknown(method.name.clone())
+            } else {
+                found
+            };
+        }
+        let found = self.out_sources(offset, name, path, model, method, &[], 0);
+        if !found.is_empty() {
+            return found;
+        }
+        let chain = flow::enclosing_call(units, offset).map_or_else(
+            || string(units, name),
+            |call| format!("{}(ref …)", call.chain),
+        );
+        unknown(chain)
+    }
+
+    /// What is written through the reference `method` returns (`ref int
+    /// Slot() => ref _t`): in each call, `Slot() = 5`, `Slot() += 1`, and
+    /// the writes to a local that takes it as another name.
+    fn ref_return_sources(&self, method: &Declaration, path: &str) -> Vec<Source> {
+        let mut found = Vec::new();
+        for target in self.references(path, method.name_range.location) {
+            let Some(target_model) = self.model(&target.path) else {
+                continue;
+            };
+            let units = target_model.units();
+            let at = target_model.offset(target.line, target.character);
+            if target.path == path && at == method.name_range.location {
+                continue;
+            }
+            let name = R::new(at, target.length);
+            let Some(arguments) = flow::parameter_list(units, name) else {
+                continue;
+            };
+            let call = R::new(at, arguments.end() + 1 - at);
+            let caller = self.enclosing_member(&target.path, at);
+            match flow::access(units, call) {
+                Access::Write {
+                    rhs: Some(value), ..
+                } => found.extend(self.sources(
+                    value,
+                    &target.path,
+                    &target_model,
+                    caller.as_ref(),
+                    &[],
+                    1,
+                    Kind::Literal,
+                )),
+                _ => {
+                    if let Some(alias) = flow::ref_alias(units, call)
+                        && let Some(caller) = &caller
+                    {
+                        found.extend(
+                            self.local_writes(
+                                alias.location,
+                                caller,
+                                &target.path,
+                                &target_model,
+                                &[],
+                                0,
+                            )
+                            .into_iter()
+                            .filter(|write| write.offset != alias.location)
+                            .flat_map(|write| write.sources),
+                        );
+                    }
+                }
+            }
+        }
+        found
+    }
+
     /// `out x` in a call: the call puts the value. An assembly's call is a
     /// transformation (`int.TryParse(s, out x)`, `map.TryGetValue(k, out
     /// x)`): then the value comes from the receiver and the other
@@ -959,6 +1103,11 @@ impl Context {
         let Some(call) = flow::enclosing_call(units, offset) else {
             return Vec::new();
         };
+        // `Interlocked.Exchange(ref x, v)`, `Volatile.Write(ref x, v)`: the
+        // value is the argument after the place.
+        if let Some(value) = atomic_value(&call, local, units) {
+            return self.sources(value, path, model, method, via, depth + 1, Kind::Literal);
+        }
         // A project method puts the value into its out parameter: its writes, not a return.
         if let Some(target) = self.definition(path, call.range.location)
             && target.kind == DeclKind::Method
@@ -2859,6 +3008,24 @@ fn parameter_index(name: &str, method: &Declaration) -> Option<usize> {
             .unwrap_or(parameter);
         head.split([' ', '\t']).rfind(|p| !p.is_empty()) == Some(name)
     })
+}
+
+/// The value an atomic write puts into the place `local` is, when `call` is
+/// one: `Interlocked.Exchange(ref x, v)`, `CompareExchange(ref x, v, c)`,
+/// `Add(ref x, v)` and `Volatile.Write(ref x, v)` put `v`.
+fn atomic_value(call: &flow::Source, local: R, units: &[u16]) -> Option<R> {
+    let mut parts = call.chain.rsplit('.');
+    let method = parts.next()?;
+    let holder = parts.next()?;
+    let wanted = match (holder, method) {
+        ("Interlocked", "Exchange" | "CompareExchange" | "Add" | "And" | "Or")
+        | ("Volatile", "Write") => 1,
+        _ => return None,
+    };
+    let place = flow::argument(units, call.range, 0)?;
+    place
+        .contains(local.location)
+        .then(|| flow::argument(units, call.range, wanted))?
 }
 
 /// The first occurrence of `needle` in `haystack`.

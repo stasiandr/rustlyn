@@ -233,7 +233,7 @@ pub fn analyze(request: &Request, config: &Config) -> Result<Report, String> {
     let known = Packages::read(&request.root);
     let package_changes = files.as_deref().map(|files| {
         packages::changes(files, &|path| {
-            std::fs::read_to_string(Path::new(&request.root).join(path)).ok()
+            rustlyn_ide::document::read_source(Path::new(&request.root).join(path)).ok()
         })
     });
     let past_changes: Vec<packages::Changes> = request
@@ -396,8 +396,9 @@ pub fn analyze(request: &Request, config: &Config) -> Result<Report, String> {
     if let Some(files) = &files {
         // What is not code.
         let scripts: Vec<&Listed> = cone.values().collect();
-        let text_of =
-            |path: &str| std::fs::read_to_string(Path::new(&request.root).join(path)).ok();
+        let text_of = |path: &str| {
+            rustlyn_ide::document::read_source(Path::new(&request.root).join(path)).ok()
+        };
         findings.extend(judge::watched(config, files, &[]));
         findings.extend(judge::assets(&request.root, files, &scripts));
         findings.extend(judge::mentions(config, files, &text_of));

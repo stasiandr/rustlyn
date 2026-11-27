@@ -399,6 +399,31 @@ impl Walker<'_, '_> {
         // A constructor's name is its identifier; an operator's is the
         // operator token, which the grammar puts where the name goes.
         let name_span = self.identifier(node).or_else(|| self.operator_name(node));
+        // A conversion has no name: the `operator` keyword stands for it, and
+        // it is told from the others of its type by the type it converts to.
+        let conversion = (node.kind() == SyntaxKind::ConversionOperatorDeclaration)
+            .then(|| {
+                let keyword = node.child_token_of_kind(SyntaxKind::OperatorKeyword)?;
+                let direction = node
+                    .child_tokens()
+                    .find(|token| {
+                        matches!(
+                            token.kind(),
+                            SyntaxKind::ImplicitKeyword | SyntaxKind::ExplicitKeyword
+                        )
+                    })
+                    .map_or_else(
+                        || "implicit".to_string(),
+                        |token| self.tree.text(token.span()),
+                    );
+                let target = self.return_type(node).unwrap_or_default();
+                Some((keyword.span(), format!("{direction} operator {target}")))
+            })
+            .flatten();
+        let name_span = match &conversion {
+            Some((span, _)) => Some(*span),
+            None => name_span,
+        };
         let Some(name_span) = name_span else { return };
 
         let kind = match node.kind() {
@@ -414,7 +439,7 @@ impl Walker<'_, '_> {
         self.push(
             node,
             Declaration {
-                name: self.tree.text(name_span),
+                name: conversion.map_or_else(|| self.tree.text(name_span), |(_, name)| name),
                 kind,
                 keyword: type_text.clone().unwrap_or_else(|| "void".into()),
                 name_span,
@@ -945,6 +970,102 @@ impl Cacheable for FileOutline {
     }
 }
 
+/// Which accessor of a property, an indexer or an event.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum AccessorKind {
+    Get,
+    Set,
+    Init,
+    Add,
+    Remove,
+}
+
+/// The accessors of the property, indexer or event of `text` whose whole
+/// declaration is the bytes `declaration`, each with the bytes it spans. An
+/// expression-bodied property has one getter, spanning its `=> …`.
+#[must_use]
+pub fn accessors(
+    text: &str,
+    declaration: std::ops::Range<usize>,
+) -> Vec<(AccessorKind, std::ops::Range<usize>)> {
+    let tree = parse_with(
+        SourceText::new("Program.cs", text),
+        &ParseOptions::default(),
+    );
+    let root = tree.root();
+    let range = |span: TextSpan| span.start() as usize..span.end() as usize;
+    let Some(node) = root.descendants().find(|node| {
+        range(node.span()) == declaration
+            && matches!(
+                node.kind(),
+                SyntaxKind::PropertyDeclaration
+                    | SyntaxKind::IndexerDeclaration
+                    | SyntaxKind::EventDeclaration
+            )
+    }) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    if let Some(arrow) = node.child_of_kind(SyntaxKind::ArrowExpressionClause) {
+        found.push((AccessorKind::Get, range(arrow.span())));
+    }
+    for accessor in node
+        .child_of_kind(SyntaxKind::AccessorList)
+        .into_iter()
+        .flat_map(|list| list.children())
+    {
+        let kind = match accessor.kind() {
+            SyntaxKind::GetAccessorDeclaration => AccessorKind::Get,
+            SyntaxKind::SetAccessorDeclaration => AccessorKind::Set,
+            SyntaxKind::InitAccessorDeclaration => AccessorKind::Init,
+            SyntaxKind::AddAccessorDeclaration => AccessorKind::Add,
+            SyntaxKind::RemoveAccessorDeclaration => AccessorKind::Remove,
+            _ => continue,
+        };
+        found.push((kind, range(accessor.span())));
+    }
+    found
+}
+
+/// The outline of `text` read with the symbols its `#if` and `#elif` lines
+/// name defined, except those they only negate (`#if !X` stays as the build
+/// without `X` has it): the code a build with its usual switches turned on
+/// holds, which an outline read with the build's own symbols may not show.
+#[must_use]
+pub fn outline_with_conditions_active(text: &str) -> Arc<FileOutline> {
+    let mut symbols: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        let Some(condition) = line
+            .strip_prefix("#if")
+            .or_else(|| line.strip_prefix("#elif"))
+        else {
+            continue;
+        };
+        let mut negated = false;
+        let mut word = String::new();
+        for c in condition.chars().chain(std::iter::once(' ')) {
+            if c.is_alphanumeric() || c == '_' {
+                word.push(c);
+                continue;
+            }
+            if !word.is_empty() {
+                if !negated && word != "true" && word != "false" && !symbols.contains(&word) {
+                    symbols.push(word.clone());
+                }
+                word.clear();
+            }
+            if !c.is_whitespace() {
+                negated = c == '!';
+            }
+        }
+    }
+    Arc::new(FileOutline::of(
+        &SourceText::new("Program.cs", text),
+        &ParseOptions::with_symbols(symbols),
+    ))
+}
+
 /// A convenience for callers that only have text.
 #[must_use]
 pub fn outline(text: &str) -> Arc<FileOutline> {
@@ -1273,6 +1394,66 @@ mod tests {
             let read = FileOutline::decode(&mut Reader::new(&bytes[..length]));
             assert!(read.is_none() || read.as_ref() != Some(&outline));
         }
+    }
+
+    /// A conversion has no name: it is declared at its `operator` keyword and
+    /// told from the others of its type by the type it converts to.
+    #[test]
+    fn a_conversion_operator_is_a_declaration() {
+        let text = "class M {\n    public static implicit operator int(M m) => 0;\n    public static explicit operator M(int v) => null;\n    public static M operator +(M a, M b) => a;\n}\n";
+        let outline = build(text);
+        let operators: Vec<(&str, &str)> = outline
+            .declarations
+            .iter()
+            .filter(|d| d.kind == DeclarationKind::Operator)
+            .map(|d| {
+                (
+                    d.name.as_str(),
+                    &text[d.name_span.start() as usize..d.name_span.end() as usize],
+                )
+            })
+            .collect();
+        assert_eq!(
+            operators,
+            vec![
+                ("implicit operator int", "operator"),
+                ("explicit operator M", "operator"),
+                ("+", "+"),
+            ]
+        );
+    }
+
+    /// The accessors of a property are told apart by the bytes they span.
+    #[test]
+    fn a_property_has_its_accessors() {
+        let text = "class P {\n    int v;\n    public int X {\n        get { return v; }\n        set { v = value; }\n    }\n    public int Y => v;\n    public int Z { get; init; }\n}\n";
+        let outline = build(text);
+        let span = |name: &str| {
+            let found = outline
+                .declarations
+                .iter()
+                .find(|d| d.name == name)
+                .expect("declared");
+            found.full_span.start() as usize..found.full_span.end() as usize
+        };
+        let kinds = |name: &str| -> Vec<(AccessorKind, String)> {
+            accessors(text, span(name))
+                .into_iter()
+                .map(|(kind, range)| (kind, text[range].to_owned()))
+                .collect()
+        };
+        assert_eq!(
+            kinds("X"),
+            vec![
+                (AccessorKind::Get, "get { return v; }".to_owned()),
+                (AccessorKind::Set, "set { v = value; }".to_owned()),
+            ]
+        );
+        assert_eq!(kinds("Y"), vec![(AccessorKind::Get, "=> v".to_owned())]);
+        assert_eq!(
+            kinds("Z").iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            vec![AccessorKind::Get, AccessorKind::Init]
+        );
     }
 
     #[test]

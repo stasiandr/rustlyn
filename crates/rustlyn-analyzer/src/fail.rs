@@ -44,7 +44,7 @@ impl Lines {
 
     fn file(&mut self, path: &Path) -> &(String, Vec<usize>) {
         self.files.entry(path.to_path_buf()).or_insert_with(|| {
-            let text = std::fs::read_to_string(path).unwrap_or_default();
+            let text = rustlyn_ide::document::read_source(path).unwrap_or_default();
             let mut starts = vec![0];
             starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
             (text, starts)

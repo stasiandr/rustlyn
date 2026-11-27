@@ -30,11 +30,17 @@ pub struct Member {
     pub(crate) utf16_offset: usize,
     /// The lines of the whole declaration.
     pub lines: Range<usize>,
+    /// The bytes of the whole declaration, from the start of the file: what
+    /// tells apart two members written on one line.
+    pub span: Range<usize>,
     /// The lines before the body: attributes, modifiers, the signature.
     pub head: Range<usize>,
     /// A type's bases as written.
     pub bases: Vec<String>,
     pub attributes: Vec<String>,
+    /// The words before the name, outside attribute lists: `public`,
+    /// `static`, `readonly`, the type.
+    pub modifiers: Vec<String>,
     /// A field's or property's type, a method's return type.
     pub type_text: Option<String>,
     pub container: Option<String>,
@@ -80,6 +86,19 @@ impl How {
     }
 }
 
+/// Which code of a property or an indexer a change touched. A getter and a
+/// setter are different code: whoever only assigns the property does not run
+/// the getter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Touched {
+    /// The whole member, or a part that every use runs.
+    All,
+    /// The getter alone.
+    Getter,
+    /// The setter (or the `init`) alone.
+    Setter,
+}
+
 /// A member the change touched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
@@ -89,6 +108,15 @@ pub struct Change {
     /// The changed lines inside the member: new lines, a removed member's
     /// old ones.
     pub lines: Vec<usize>,
+    /// For a property or an indexer whose body changed: the accessor it
+    /// changed in.
+    pub touched: Touched,
+    /// What the member was before, for one that still exists.
+    pub before: Option<Member>,
+    /// The member is in code the project's build leaves out (an `#if` that
+    /// is not on): the compiler does not see it, and nothing says who calls
+    /// it.
+    pub inactive: bool,
 }
 
 /// The members of one text.
@@ -142,13 +170,78 @@ impl Members {
     }
 
     /// The innermost member whose lines hold `line`; a type's line outside
-    /// its members is the type's.
+    /// its members is the type's. Of members written on one line, the
+    /// narrowest in bytes.
     #[must_use]
     pub fn enclosing(&self, line: usize) -> Option<&Member> {
         self.list
             .iter()
             .filter(|m| m.lines.contains(&line))
-            .min_by_key(|m| m.lines.len())
+            .min_by_key(|m| (m.lines.len(), m.span.len()))
+    }
+
+    /// The innermost member whose bytes hold `offset`: the one a name at
+    /// `offset` is in, which a line cannot say where several members share
+    /// it.
+    #[must_use]
+    pub fn enclosing_at(&self, offset: usize) -> Option<&Member> {
+        self.list
+            .iter()
+            .filter(|m| m.span.contains(&offset))
+            .min_by_key(|m| m.span.len())
+    }
+
+    /// The innermost member that holds `line` and, when `columns` (bytes
+    /// from the start of the file) says where on the line the change is,
+    /// holds all of it.
+    #[must_use]
+    pub fn enclosing_columns(
+        &self,
+        line: usize,
+        columns: Option<&Range<usize>>,
+    ) -> Option<&Member> {
+        let holds = |m: &&Member| m.lines.contains(&line);
+        let within =
+            |m: &&Member| columns.is_some_and(|c| m.span.start <= c.start && c.end <= m.span.end);
+        self.list
+            .iter()
+            .filter(holds)
+            .filter(within)
+            .min_by_key(|m| (m.lines.len(), m.span.len()))
+            .or_else(|| self.enclosing(line))
+    }
+
+    /// The member whose name is at `line` and `character` (UTF-16 code units
+    /// from the start of the line) of `text`: the member the compiler named,
+    /// which is not always the innermost one on a line.
+    #[must_use]
+    pub fn named_at(&self, text: &str, line: usize, character: usize) -> Option<&Member> {
+        let starts = line_starts(text);
+        let start = *starts.get(line)?;
+        let end = starts.get(line + 1).copied().unwrap_or(text.len());
+        let mut units = 0;
+        let mut at = None;
+        for (index, c) in text[start..end].char_indices() {
+            if units >= character {
+                at = Some(start + index);
+                break;
+            }
+            units += c.len_utf16();
+        }
+        let at = at.or((units == character).then_some(end))?;
+        self.list.iter().find(|m| m.offset == at)
+    }
+
+    /// The innermost member that holds `line` and, when `columns` (bytes
+    /// from the start of the file) says where on the line the change is,
+    /// holds all of it: with two members on a line, the one that was
+    /// changed.
+    fn at_columns(&self, line: usize, columns: Option<&Range<usize>>) -> Option<&Member> {
+        let inner = self.enclosing_columns(line, columns)?;
+        if inner.is_type() && !inner.head.contains(&line) {
+            return None;
+        }
+        Some(inner)
     }
 
     #[must_use]
@@ -197,6 +290,9 @@ pub fn changes_by(
             member: member.clone(),
             how,
             lines: Vec::new(),
+            touched: Touched::All,
+            before: None,
+            inactive: false,
         });
         entry.how = entry.how.max(how);
         if !entry.lines.contains(&line) {
@@ -216,12 +312,27 @@ pub fn changes_by(
         })
         .collect();
 
+    let new_starts = line_starts(new_text);
+    let old_starts = line_starts(&old_text);
+    let old_lines = split_lines(&old_text);
+    // Where on a line a change is, when the line was replaced by one: the
+    // bytes between what the two lines share at the start and at the end.
+    let columns = |starts: &[usize], line: usize, own: &str, other: &str| {
+        let (from, to) = differing(own, other);
+        starts.get(line).map(|&s| s + from..s + to)
+    };
     for block in &file.blocks {
-        for line in block.new_lines.clone() {
+        let paired = block.new_lines.len() == block.old_lines.len();
+        for (k, line) in block.new_lines.clone().enumerate() {
             if new_lines.get(line).is_some_and(|l| l.trim().is_empty()) {
                 continue;
             }
-            let Some(member) = new.at_line(line) else {
+            let at = paired
+                .then(|| old_lines.get(block.old_lines.start + k))
+                .flatten()
+                .zip(new_lines.get(line))
+                .and_then(|(old, now)| columns(&new_starts, line, now, old));
+            let Some(member) = new.at_columns(line, at.as_ref()) else {
                 continue;
             };
             let before = old.by_key(&member.key);
@@ -242,7 +353,12 @@ pub fn changes_by(
             if block.removed.get(k).is_some_and(|l| l.trim().is_empty()) {
                 continue;
             }
-            let Some(was) = old.at_line(line) else {
+            let at = paired
+                .then(|| new_lines.get(block.new_lines.start + k))
+                .flatten()
+                .zip(old_lines.get(line))
+                .and_then(|(now, old)| columns(&old_starts, line, old, now));
+            let Some(was) = old.at_columns(line, at.as_ref()) else {
                 continue;
             };
             let now = new.by_key(&was.key).or_else(|| {
@@ -261,11 +377,91 @@ pub fn changes_by(
                     } else {
                         How::Body
                     };
-                    // Lines are new ones: a removed line lands on the
-                    // member's name.
-                    note(now, how, now.line);
+                    // Lines are new ones: a removed line lands on the line
+                    // that replaced it, or on the member's name.
+                    let replaced = block.new_lines.start + k;
+                    let at = if paired && now.lines.contains(&replaced) {
+                        replaced
+                    } else {
+                        now.line
+                    };
+                    note(now, how, at);
                 }
                 None => note(was, How::Removed, line),
+            }
+        }
+    }
+    // A change in code the build leaves out is in no member of the compiled
+    // structure: it is found in the structure with the file's own switches
+    // on, and said to be in code that is not built.
+    let lone: Vec<(usize, bool)> = file
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            let new = block.new_lines.clone().map(|line| (line, true));
+            let old = block.old_lines.clone().map(|line| (line, false));
+            new.chain(old)
+        })
+        .filter(|&(line, is_new)| {
+            let text = if is_new {
+                new_lines.get(line)
+            } else {
+                old_lines.get(line)
+            };
+            let members = if is_new { &new } else { &old };
+            text.is_some_and(|text| !text.trim().is_empty() && !text.trim_start().starts_with('#'))
+                && members
+                    .enclosing(line)
+                    .is_none_or(|m| m.is_type() && !m.head.contains(&line))
+        })
+        .collect();
+    if !lone.is_empty() {
+        let all_new = Members::of_outline(
+            &file.path,
+            new_text,
+            &rustlyn_ide::outline::outline_with_conditions_active(new_text),
+        );
+        let all_old = Members::of_outline(
+            file.old_path.as_deref().unwrap_or(&file.path),
+            &old_text,
+            &rustlyn_ide::outline::outline_with_conditions_active(&old_text),
+        );
+        for (line, is_new) in lone {
+            let (members, other) = if is_new {
+                (&all_new, &all_old)
+            } else {
+                (&all_old, &all_new)
+            };
+            let Some(member) = members.at_line(line) else {
+                continue;
+            };
+            let known = if is_new { &new } else { &old };
+            if known.by_key(&member.key).is_some() {
+                continue;
+            }
+            let survives = other.by_key(&member.key);
+            let how = match (is_new, survives.is_some()) {
+                (_, true) => How::Body,
+                (true, false) => How::Added,
+                (false, false) => How::Removed,
+            };
+            // A member that is still there is told by its new place.
+            let at = if is_new {
+                member
+            } else {
+                survives.unwrap_or(member)
+            };
+            let entry = found.entry(at.key.clone()).or_insert_with(|| Change {
+                member: at.clone(),
+                how,
+                lines: Vec::new(),
+                touched: Touched::All,
+                before: None,
+                inactive: true,
+            });
+            let line = if is_new { line } else { at.line };
+            if !entry.lines.contains(&line) {
+                entry.lines.push(line);
             }
         }
     }
@@ -285,17 +481,96 @@ pub fn changes_by(
                 member: member.clone(),
                 how: How::Removed,
                 lines: vec![member.line],
+                touched: Touched::All,
+                before: None,
+                inactive: false,
             });
         }
     }
     let mut list: Vec<Change> = found.into_values().collect();
     for change in &mut list {
         change.lines.sort_unstable();
+        if change.how != How::Removed && change.how != How::Added {
+            change.before = old
+                .by_key(&change.member.key)
+                .or_else(|| renamed_from.get(change.member.key.as_str()).copied())
+                .cloned();
+        }
+        if change.how == How::Body
+            && matches!(
+                change.member.kind,
+                DeclarationKind::Property | DeclarationKind::Indexer
+            )
+        {
+            change.touched = touched_accessor(new_text, &new_starts, &change.member, &change.lines);
+        }
     }
     list.sort_by(|a, b| {
         (a.member.path.as_str(), a.member.line).cmp(&(b.member.path.as_str(), b.member.line))
     });
     list
+}
+
+/// The accessor all of a property's changed lines are in: the getter or the
+/// setter; anything else, a line outside the accessors or one both share, is
+/// the whole member.
+fn touched_accessor(text: &str, starts: &[usize], member: &Member, lines: &[usize]) -> Touched {
+    use rustlyn_ide::outline::{AccessorKind, accessors};
+    let accessors = accessors(text, member.span.clone());
+    if accessors.is_empty() {
+        return Touched::All;
+    }
+    let mut touched: Option<Touched> = None;
+    for &line in lines {
+        let Some(&start) = starts.get(line) else {
+            return Touched::All;
+        };
+        let end = starts.get(line + 1).copied().unwrap_or(text.len());
+        let mut hit: Vec<AccessorKind> = accessors
+            .iter()
+            .filter(|(_, span)| span.start < end && span.end > start)
+            .map(|(kind, _)| *kind)
+            .collect();
+        hit.dedup();
+        let now = match hit.as_slice() {
+            [AccessorKind::Get] => Touched::Getter,
+            [AccessorKind::Set | AccessorKind::Init] => Touched::Setter,
+            _ => return Touched::All,
+        };
+        if touched.is_some_and(|before| before != now) {
+            return Touched::All;
+        }
+        touched = Some(now);
+    }
+    touched.unwrap_or(Touched::All)
+}
+
+/// Where two lines differ: the bytes of `own` from the first it does not
+/// share with `other` to the last that is not part of what they share at the
+/// end.
+pub(crate) fn differing(own: &str, other: &str) -> (usize, usize) {
+    let start = own
+        .bytes()
+        .zip(other.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let start = (0..=start)
+        .rev()
+        .find(|&i| own.is_char_boundary(i))
+        .unwrap_or(0);
+    let shared = own
+        .bytes()
+        .rev()
+        .zip(other.bytes().rev())
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(own.len() - start)
+        .min(other.len().saturating_sub(start));
+    let mut end = own.len() - shared;
+    while !own.is_char_boundary(end) {
+        end += 1;
+    }
+    (start, end.max(start))
 }
 
 /// A field, an event or an enum member has no body: any change to it is a
@@ -353,9 +628,11 @@ fn member(path: &str, text: &str, starts: &[usize], d: &Declaration) -> Member {
         offset,
         utf16_offset: utf16_len(&text[..offset]),
         lines: first..last + 1,
+        span: full_start.min(text.len())..full_end.max(full_start.min(text.len())),
         head: first..head_end.min(last + 1),
         bases: d.bases.clone(),
         attributes: d.attributes.clone(),
+        modifiers: words_outside_brackets(&text[full_start.min(name_start)..name_start]),
         type_text: d.type_text.clone(),
         container: d.container.clone(),
         signature: text
@@ -363,6 +640,26 @@ fn member(path: &str, text: &str, starts: &[usize], d: &Declaration) -> Member {
             .split_whitespace()
             .collect(),
     }
+}
+
+/// The words of `head` that are not inside `[…]`: an attribute's name and
+/// arguments are not modifiers.
+fn words_outside_brackets(head: &str) -> Vec<String> {
+    let mut depth = 0usize;
+    let mut outside = String::new();
+    for c in head.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            c if depth == 0 => outside.push(c),
+            _ => {}
+        }
+    }
+    outside
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Where the body starts: the first `{` or `=>` after the name outside the

@@ -70,8 +70,10 @@ pub use quick_info::QuickInfo;
 
 // MARK: - navigation: types, bases, implementations, calls
 mod hierarchy;
+mod implicit;
 mod links;
 pub use hierarchy::{HierarchyItem, IncomingCall, OutgoingCall};
+pub use implicit::UseKind;
 pub use links::{FileLinks, Link, LinkRole, LinkSymbol, LinkTarget};
 
 // MARK: - Unity: the methods the engine calls by name
@@ -110,6 +112,15 @@ pub struct Semantic {
     /// Every type and extension method there is, by namespace: what import
     /// completion searches. Made the first time it is asked for.
     completion_index: std::sync::OnceLock<Arc<complete::ImportIndex>>,
+    /// What the project reaches without naming it, by the constructs
+    /// searched: see [`implicit`].
+    implicit: Mutex<HashMap<(u32, rustlyn_semantics::SymbolId), Arc<implicit::ImplicitIndex>>>,
+    /// The names a body mentions that can bring it a value of a type, by
+    /// that type: see [`implicit`].
+    reaching: Mutex<HashMap<rustlyn_semantics::SymbolId, Arc<implicit::Reach>>>,
+    /// The types the signature of each member of the project mentions: what
+    /// [`implicit`] looks up the members that bring a value of a type by.
+    member_types: std::sync::OnceLock<Vec<implicit::MemberTypes>>,
 }
 
 /// How many bound bodies are kept before the cache starts over. A body is
@@ -410,6 +421,9 @@ impl Semantic {
                 .collect(),
             bodies: Mutex::new(HashMap::new()),
             completion_index: std::sync::OnceLock::new(),
+            implicit: Mutex::new(HashMap::new()),
+            reaching: Mutex::new(HashMap::new()),
+            member_types: std::sync::OnceLock::new(),
         }
     }
 
@@ -524,6 +538,9 @@ impl Semantic {
             reference_stamps,
             bodies: Mutex::new(HashMap::new()),
             completion_index: std::sync::OnceLock::new(),
+            implicit: Mutex::new(HashMap::new()),
+            reaching: Mutex::new(HashMap::new()),
+            member_types: std::sync::OnceLock::new(),
         })
     }
 

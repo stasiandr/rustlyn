@@ -19,10 +19,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustlyn_ide::Session;
 use rustlyn_ide::outline::DeclarationKind;
+use rustlyn_ide::semantic::UseKind;
 use rustlyn_ide::session::{Call, Uses};
 
 use super::ask::{absolute, ask};
-use super::changes::{Change, How, Member, Members, line_starts, utf16_len};
+use super::changes::{Change, How, Member, Members, Touched, line_starts, utf16_len};
 use super::compiler_risks::threads;
 use crate::value::UNIVERSAL_MEMBERS;
 use crate::value::flow::{self, Access, Utf16Range};
@@ -102,6 +103,10 @@ pub struct Node {
     pub depth: usize,
     /// How the change touched it.
     pub change: Option<How>,
+    /// What a changed member was before the change, when it still exists.
+    pub before: Option<Member>,
+    /// A changed member in code the project's build leaves out.
+    pub inactive: bool,
     pub edges: Vec<Edge>,
     /// How many calls or mentions there were in all, even when not all made
     /// it into the graph.
@@ -135,7 +140,7 @@ impl Files<'_> {
         self.texts
             .entry(path.to_owned())
             .or_insert_with(|| {
-                let text = std::fs::read_to_string(Path::new(root).join(path)).ok()?;
+                let text = rustlyn_ide::document::read_source(Path::new(root).join(path)).ok()?;
                 let members = Members::of(path, &text);
                 Some((text, members))
             })
@@ -202,6 +207,13 @@ pub fn walk_with(
         texts,
     };
     let mut impact = Impact::default();
+    // Which accessor of a changed property or indexer was changed: only its
+    // callers that run that accessor are reached.
+    let touched: HashMap<usize, Touched> = changes
+        .iter()
+        .enumerate()
+        .map(|(index, change)| (index, change.touched))
+        .collect();
     let mut queue: VecDeque<usize> = VecDeque::new();
     // Nodes that expand as data: their readers are reached.
     let mut data: HashSet<usize> = HashSet::new();
@@ -214,6 +226,8 @@ pub fn walk_with(
             member: change.member.clone(),
             depth: 0,
             change: Some(change.how),
+            before: change.before.clone(),
+            inactive: change.inactive,
             edges: Vec::new(),
             fan_in: 0,
         });
@@ -279,8 +293,9 @@ pub fn walk_with(
             // message of the project.
             let dispatched_here = dispatched.contains(&index);
             if let Some(calls) = answer.calls {
+                let accessor = touched.get(&index).copied().unwrap_or(Touched::All);
                 found.extend(
-                    callers(&mut files, &member, index, calls)
+                    callers(&mut files, &member, index, calls, accessor)
                         .into_iter()
                         .filter(|(_, e)| !dispatched_here || e.relation != Relation::CallsBase),
                 );
@@ -351,6 +366,8 @@ fn add(
         member,
         depth,
         change: None,
+        before: None,
+        inactive: false,
         edges: vec![edge],
         fan_in: 0,
     });
@@ -446,21 +463,46 @@ fn ask_all(
     answers.into_inner().unwrap_or_default()
 }
 
-/// Who calls a member: the calls from the compiler's call hierarchy.
+/// Who calls a member: the calls from the compiler's call hierarchy. The
+/// caller is the member the compiler named, which tells apart members
+/// written on one line. Of a property's callers, those that only assign it
+/// are not callers of a changed getter, and those that only read it are not
+/// callers of a changed setter (`touched`).
 fn callers(
     files: &mut Files<'_>,
     member: &Member,
     from: usize,
     calls: Vec<Call>,
+    touched: Touched,
 ) -> Vec<(Member, Edge)> {
+    let runs = |kind: UseKind| match touched {
+        Touched::All => true,
+        Touched::Getter => kind != UseKind::Write,
+        Touched::Setter => kind != UseKind::Read,
+    };
     let mut result = Vec::new();
     for call in calls {
         let path = files.relative(&call.path);
-        let line = call.ranges.first().map_or(0, |r| r.start_line as usize);
-        let Some((_, members)) = files.get(&path) else {
+        let Some(range) = call
+            .ranges
+            .iter()
+            .zip(&call.uses)
+            .find(|(_, kind)| runs(**kind))
+            .map(|(range, _)| range)
+        else {
             continue;
         };
-        let Some(caller) = members.enclosing(line) else {
+        let line = range.start_line as usize;
+        let Some((text, members)) = files.get(&path) else {
+            continue;
+        };
+        let named = call
+            .item
+            .location
+            .as_ref()
+            .filter(|at| at.path == call.path)
+            .and_then(|at| members.named_at(text, at.line as usize, at.character as usize));
+        let Some(caller) = named.or_else(|| members.enclosing(line)) else {
             continue;
         };
         if caller.key == member.key {
@@ -604,7 +646,7 @@ fn mentions(files: &mut Files<'_>, impact: &mut Impact, index: usize, limits: Li
         // Parse only the files the name is in: on a large project, a handful
         // out of thousands.
         if !files.texts.contains_key(&path)
-            && !std::fs::read_to_string(Path::new(files.root).join(&path))
+            && !rustlyn_ide::document::read_source(Path::new(files.root).join(&path))
                 .is_ok_and(|t| t.contains(name.as_str()))
         {
             continue;

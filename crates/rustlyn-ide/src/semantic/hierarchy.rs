@@ -34,6 +34,8 @@ use rustlyn_semantics::{
 use rustlyn_syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 use rustlyn_text::TextSpan;
 
+use super::implicit::UseKind;
+use super::references::use_kind_of;
 use super::{
     Found, Place, Resolved, Semantic, View, attribute_stem, contains_word, declaration_kind,
     describe_symbol, parallel,
@@ -70,8 +72,13 @@ pub struct IncomingCall {
     pub from: HierarchyItem,
     /// The file the calls are in, which is the caller's.
     pub path: PathBuf,
-    /// The name of each call, in bytes.
+    /// The name of each call, in bytes; for a use no name stands for, the
+    /// start of the construct (`a + b`, `m[3]`, `new()`, `foreach`).
     pub spans: Vec<TextSpan>,
+    /// How each of `spans` uses the target, in the same order: a property's
+    /// or an indexer's getter and setter are different code, and a call that
+    /// only assigns does not run the getter.
+    pub uses: Vec<UseKind>,
     /// Whether these calls name a member the target overrides or implements
     /// rather than the target itself: `shape.Area()` is a call to
     /// `IShape.Area` that may run `Circle.Area`. Roslyn lists these apart,
@@ -92,9 +99,9 @@ pub struct OutgoingCall {
 /// seen from the type it was reached from: `Shape<double>` reached from
 /// `Circle` maps `Shape`'s `T` to `double`.
 #[derive(Clone, Debug)]
-struct Supertype {
-    symbol: SymbolId,
-    arguments: HashMap<SymbolId, Type>,
+pub(super) struct Supertype {
+    pub(super) symbol: SymbolId,
+    pub(super) arguments: HashMap<SymbolId, Type>,
 }
 
 impl Semantic {
@@ -209,7 +216,7 @@ impl Semantic {
 
     /// What the cursor is on, as a symbol: a local has none, and is taken
     /// as its type where a type will do.
-    fn symbol_at(
+    pub(super) fn symbol_at(
         &self,
         path: &Path,
         offset: u32,
@@ -524,7 +531,7 @@ impl Semantic {
 
     /// Every type `ty` derives from or implements, nearest first, each with
     /// what its type parameters mean as seen from `ty`.
-    fn supertypes(&self, model: &SemanticModel<'_>, ty: SymbolId) -> Vec<Supertype> {
+    pub(super) fn supertypes(&self, model: &SemanticModel<'_>, ty: SymbolId) -> Vec<Supertype> {
         let symbols = self.compilation.symbols();
         let mut found: Vec<Supertype> = Vec::new();
         let mut seen: HashSet<SymbolId> = HashSet::from([ty]);
@@ -680,7 +687,7 @@ impl Semantic {
     /// member up the class chain with the name and the signature, which is
     /// how a base class's public method comes to implement an interface
     /// only a derived class lists (§19.6.5).
-    fn implementation_in(
+    pub(super) fn implementation_in(
         &self,
         model: &SemanticModel<'_>,
         ty: SymbolId,
@@ -892,9 +899,45 @@ impl Semantic {
         offset: u32,
         text: Option<&str>,
     ) -> Option<HierarchyItem> {
+        if let Some((view, symbol)) = self.operator_declared_at(path, offset, text) {
+            return Some(self.edited_item(&view, path, self.hierarchy_item(symbol)));
+        }
         let (view, _, symbol) = self.symbol_at(path, offset, text)?;
         let symbol = self.callable(symbol)?;
         Some(self.edited_item(&view, path, self.hierarchy_item(symbol)))
+    }
+
+    /// The operator, conversion or indexer declared at `offset`, which is
+    /// named by the token of the operator, by the `operator` keyword of a
+    /// conversion or by an indexer's `this`: none is an identifier that a
+    /// name can be resolved from.
+    fn operator_declared_at(
+        &self,
+        path: &Path,
+        offset: u32,
+        text: Option<&str>,
+    ) -> Option<(View<'_>, SymbolId)> {
+        let view = self.view_of(path, text)?;
+        let token = view
+            .root
+            .find_token(offset)
+            .filter(|token| token.span().contains(offset))?;
+        let declaration = token.parent().clone();
+        match declaration.kind() {
+            SyntaxKind::OperatorDeclaration | SyntaxKind::ConversionOperatorDeclaration => {
+                let after_keyword = declaration
+                    .child_tokens()
+                    .find(|candidate| candidate.kind() == SyntaxKind::OperatorKeyword)
+                    .is_some_and(|keyword| token.span().start() >= keyword.span().start());
+                if !after_keyword {
+                    return None;
+                }
+            }
+            SyntaxKind::IndexerDeclaration if token.kind() == SyntaxKind::ThisKeyword => {}
+            _ => return None,
+        }
+        let symbol = view.model.declared_symbol(&declaration)?;
+        Some((view, symbol))
     }
 
     /// Moves an item's places into the editor's text, when that is what
@@ -925,6 +968,14 @@ impl Semantic {
     /// marked `through_base`: `IShape.Area()` may be `Circle.Area()` when it
     /// runs. Calls from a lambda are its enclosing member's, and from a
     /// field's initializer the field's.
+    ///
+    /// A call is a name the body binds to the member, and also a construct
+    /// that runs the member without one: an operator, an indexer, a
+    /// target-typed `new()`, `foreach`, `using`, `await`, an interpolated
+    /// string's `ToString`, a collection initializer's `Add`, a
+    /// deconstruction, a pattern, a query, an attribute. `nameof(m.Area)`,
+    /// `typeof` and a documentation `cref` name the member and do not call
+    /// it.
     #[must_use]
     pub fn incoming_calls(&self, target: SymbolId) -> Vec<IncomingCall> {
         let symbols = self.compilation.symbols();
@@ -967,7 +1018,7 @@ impl Semantic {
             let Some(mut view) = self.view(tree) else {
                 return Vec::new();
             };
-            let mut calls: Vec<(SymbolId, bool, TextSpan)> = Vec::new();
+            let mut calls: Vec<(SymbolId, bool, TextSpan, UseKind)> = Vec::new();
             let tokens: Vec<_> = view
                 .root
                 .descendant_tokens()
@@ -984,6 +1035,18 @@ impl Semantic {
                 .collect();
             for token in tokens {
                 let parent = token.parent().clone();
+                // The name of a member in `nameof(…)` is its name, not a use.
+                if in_nameof(&token) {
+                    continue;
+                }
+                if let Some(attribute) = attribute_of(&token) {
+                    if let Some((caller, kind)) =
+                        self.attribute_use(&view, &token, &attribute, target, &bases)
+                    {
+                        calls.push((caller, false, token.span(), kind));
+                    }
+                    continue;
+                }
                 let Some(body) = view.body_for(&parent) else {
                     continue;
                 };
@@ -1006,33 +1069,89 @@ impl Semantic {
                 let Some(caller) = view.caller_of(&parent) else {
                     continue;
                 };
-                calls.push((caller, through_base, token.span()));
+                calls.push((caller, through_base, token.span(), use_kind_of(&token)));
             }
             let path = self.paths[&tree].clone();
             calls
                 .into_iter()
-                .map(|(caller, through, span)| (path.clone(), caller, through, span))
+                .map(|(caller, through, span, kind)| (path.clone(), caller, through, span, kind))
                 .collect::<Vec<_>>()
         });
 
+        let mut found: Vec<(PathBuf, SymbolId, bool, TextSpan, UseKind)> =
+            found.into_iter().flatten().collect();
+        let constructs = self.constructs_reaching(target);
+        if constructs != 0 {
+            let index = symbols
+                .get(target)
+                .container
+                .map(|container| self.implicit_index(constructs, container))
+                .unwrap_or_default();
+            // What the target's type is, and the classes it derives from: a
+            // use of a base member on a value of some other type is no use
+            // of the target, and neither is one on an interface, which every
+            // implementation answers to.
+            let model = SemanticModel::new(&self.compilation, 0);
+            let kinds: HashSet<SymbolId> = symbols
+                .get(target)
+                .container
+                .into_iter()
+                .flat_map(|container| {
+                    std::iter::once(container).chain(
+                        self.supertypes(&model, container)
+                            .into_iter()
+                            .map(|supertype| supertype.symbol)
+                            .filter(|&ty| symbols.get(ty).type_kind() != Some(TypeKind::Interface)),
+                    )
+                })
+                .collect();
+            for symbol in std::iter::once(target).chain(bases.iter().copied()) {
+                let through_base = symbol != target;
+                for used in index.by_symbol.get(&symbol).into_iter().flatten() {
+                    if through_base && used.receiver.is_some_and(|ty| !kinds.contains(&ty)) {
+                        continue;
+                    }
+                    if let Some(path) = self.paths.get(&used.tree) {
+                        found.push((
+                            path.clone(),
+                            used.caller,
+                            through_base,
+                            used.span,
+                            used.kind,
+                        ));
+                    }
+                }
+            }
+        }
+
         let mut grouped: Vec<IncomingCall> = Vec::new();
         let mut at: HashMap<(PathBuf, SymbolId, bool), usize> = HashMap::new();
-        for (path, caller, through_base, span) in found.into_iter().flatten() {
+        for (path, caller, through_base, span, kind) in found {
             let key = (path.clone(), caller, through_base);
             let slot = *at.entry(key).or_insert_with(|| {
                 grouped.push(IncomingCall {
                     from: self.hierarchy_item(caller),
                     path,
                     spans: Vec::new(),
+                    uses: Vec::new(),
                     through_base,
                 });
                 grouped.len() - 1
             });
             grouped[slot].spans.push(span);
+            grouped[slot].uses.push(kind);
         }
         for call in &mut grouped {
-            call.spans.sort_by_key(|span| span.start());
-            call.spans.dedup();
+            let mut pairs: Vec<(TextSpan, UseKind)> = call
+                .spans
+                .iter()
+                .copied()
+                .zip(call.uses.iter().copied())
+                .collect();
+            pairs.sort_by_key(|(span, _)| span.start());
+            pairs.dedup_by_key(|(span, _)| *span);
+            call.spans = pairs.iter().map(|(span, _)| *span).collect();
+            call.uses = pairs.iter().map(|(_, kind)| *kind).collect();
         }
         grouped.sort_by(|a, b| {
             a.through_base
@@ -1041,6 +1160,70 @@ impl Semantic {
                 .then_with(|| a.spans[0].start().cmp(&b.spans[0].start()))
         });
         grouped
+    }
+
+    /// An attribute that names the type of the constructor `target`, or sets
+    /// the property or field `target` by name: the member the attribute is
+    /// on is its caller. The constructor is the one the binder chose for the
+    /// arguments.
+    fn attribute_use(
+        &self,
+        view: &View<'_>,
+        token: &SyntaxToken,
+        attribute: &SyntaxNode,
+        target: SymbolId,
+        bases: &HashSet<SymbolId>,
+    ) -> Option<(SymbolId, UseKind)> {
+        let declaration = attribute.parent()?.parent()?.clone();
+        let bound = view
+            .model
+            .binder()
+            .bind_attribute(view.tree, &declaration, attribute)?;
+        let names_type = !token
+            .parent()
+            .ancestors()
+            .any(|node| node.kind() == SyntaxKind::AttributeArgument);
+        let hit = if names_type {
+            bound
+                .constructor
+                .is_some_and(|constructor| constructor == target || bases.contains(&constructor))
+        } else {
+            bound.named.iter().any(|(member, _)| *member == target)
+        };
+        if !hit {
+            return None;
+        }
+        // The member the attribute is on; a parameter's or a return value's
+        // attribute is its method's.
+        let owner = std::iter::once(declaration.clone())
+            .chain(declaration.ancestors())
+            .find_map(|node| self.attributed_symbol(view, &node))?;
+        let kind = if names_type {
+            UseKind::Call
+        } else {
+            UseKind::Write
+        };
+        Some((owner, kind))
+    }
+
+    /// The symbol declared by `node`, for a node that is a declaration.
+    fn attributed_symbol(&self, view: &View<'_>, node: &SyntaxNode) -> Option<SymbolId> {
+        if !node.kind().is_declaration_node() {
+            return None;
+        }
+        // A field's attributes are on the declaration, its symbols on the
+        // declarators.
+        let named = if matches!(
+            node.kind(),
+            SyntaxKind::FieldDeclaration | SyntaxKind::EventFieldDeclaration
+        ) {
+            node.descendants()
+                .find(|inner| inner.kind() == SyntaxKind::VariableDeclarator)?
+        } else {
+            node.clone()
+        };
+        let declared = view.model.declared_symbol(&named)?;
+        Some(self.callable(declared).unwrap_or(declared))
     }
 
     /// Every method, constructor, property and event `source`'s body calls
@@ -1312,7 +1495,7 @@ impl View<'_> {
     /// The member whose body `node` is in, as a call hierarchy names it:
     /// an accessor's property, a field initializer's field, a top-level
     /// statement's `<Main>$`.
-    fn caller_of(&self, node: &SyntaxNode) -> Option<SymbolId> {
+    pub(super) fn caller_of(&self, node: &SyntaxNode) -> Option<SymbolId> {
         let owner = SemanticModel::body_owner(node)?;
         let owner = match owner.kind() {
             SyntaxKind::GetAccessorDeclaration
@@ -1363,6 +1546,28 @@ fn called_at(body: &BoundBody, token: &SyntaxToken) -> Option<SymbolId> {
         })
 }
 
+/// Whether `token` is in the argument of a `nameof(…)`, which names what it
+/// is given without running it.
+fn in_nameof(token: &SyntaxToken) -> bool {
+    token.parent().ancestors().any(|node| is_nameof(&node))
+}
+
+/// Whether `node` is `nameof(…)`.
+pub(super) fn is_nameof(node: &SyntaxNode) -> bool {
+    node.kind() == SyntaxKind::InvocationExpression
+        && node.children().next().is_some_and(|callee| {
+            callee.kind() == SyntaxKind::IdentifierName && callee.text().trim() == "nameof"
+        })
+}
+
+/// The attribute `token` is in, when it is in one.
+fn attribute_of(token: &SyntaxToken) -> Option<SyntaxNode> {
+    token
+        .parent()
+        .ancestors()
+        .find(|node| node.kind() == SyntaxKind::Attribute)
+}
+
 /// Whether `token` names a member of `base`, which is called as it is and
 /// not dispatched.
 fn calls_base(token: &SyntaxToken) -> bool {
@@ -1376,7 +1581,7 @@ fn calls_base(token: &SyntaxToken) -> bool {
 
 /// `IShape.Area` as the interface it was written with and the member's own
 /// name; `None` for a name with no interface in front of it.
-fn split_explicit(name: &str) -> Option<(&str, &str)> {
+pub(super) fn split_explicit(name: &str) -> Option<(&str, &str)> {
     let mut depth = 0i32;
     let mut last = None;
     for (at, byte) in name.bytes().enumerate() {

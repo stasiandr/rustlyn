@@ -232,7 +232,8 @@ pub fn judge(
             }
             continue;
         };
-        let text = std::fs::read_to_string(Path::new(root).join(&file.path)).unwrap_or_default();
+        let text = rustlyn_ide::document::read_source(Path::new(root).join(&file.path))
+            .unwrap_or_default();
         let lines: Vec<&str> = text.lines().collect();
         // What the removed lines may name a sink by is judged against the
         // whole file, before and after.
@@ -240,7 +241,9 @@ pub fn judge(
         // The changed lines and the removed text of each member; `None` is
         // the file outside any member.
         let mut changed: BTreeMap<Option<usize>, (Vec<usize>, Vec<&str>)> = BTreeMap::new();
+        let starts = crate::blast::changes::line_starts(&text);
         for block in &file.blocks {
+            let paired = block.new_lines.len() == block.removed.len();
             let touched: Vec<usize> = if block.new_lines.is_empty() {
                 vec![block.new_lines.start]
             } else {
@@ -250,8 +253,19 @@ pub fn judge(
                     .filter(|&line| lines.get(line).is_none_or(|text| !text.trim().is_empty()))
                     .collect()
             };
+            // Where on a line the change is, when the line replaced one: of
+            // two members written on a line, the one it is in.
+            let columns = |line: usize| {
+                let k = line.checked_sub(block.new_lines.start)?;
+                let was = block.removed.get(k).filter(|_| paired)?;
+                let (from, to) = crate::blast::changes::differing(lines.get(line)?, was);
+                let start = *starts.get(line)?;
+                Some(start + from..start + to)
+            };
             let index_of = |line: usize| {
-                let member = own.members.enclosing(line)?;
+                let member = own
+                    .members
+                    .enclosing_columns(line, columns(line).as_ref())?;
                 own.members
                     .list
                     .iter()
@@ -263,11 +277,32 @@ pub fn judge(
                     entry.0.push(line);
                 }
             }
-            changed
-                .entry(index_of(block.new_lines.start))
-                .or_default()
-                .1
-                .extend(block.removed.iter().map(String::as_str));
+            // The removed lines go to the member of the first new line. A
+            // line of several members was replaced by a line, and only what
+            // changed of it is what was removed.
+            let crowded = |line: usize| {
+                own.members
+                    .list
+                    .iter()
+                    .filter(|m| !m.is_type() && m.lines.contains(&line))
+                    .count()
+                    > 1
+            };
+            if paired && block.new_lines.clone().any(crowded) {
+                for (k, was) in block.removed.iter().enumerate() {
+                    let line = block.new_lines.start + k;
+                    let now = lines.get(line).copied().unwrap_or_default();
+                    let (from, to) = crate::blast::changes::differing(was, now);
+                    let slice = was.get(from..to).unwrap_or(was);
+                    changed.entry(index_of(line)).or_default().1.push(slice);
+                }
+            } else {
+                changed
+                    .entry(index_of(block.new_lines.start))
+                    .or_default()
+                    .1
+                    .extend(block.removed.iter().map(String::as_str));
+            }
         }
         for (index, (lines, removed)) in &changed {
             let named = words.named(config, "removed", removed, &around);
@@ -636,7 +671,7 @@ pub fn judge_revision(
             continue;
         }
         let then = texts.get(&file.path).map_or("", String::as_str);
-        let now = std::fs::read_to_string(Path::new(root).join(&file.path)).ok();
+        let now = rustlyn_ide::document::read_source(Path::new(root).join(&file.path)).ok();
         let exact = file.status != Status::Deleted && now.as_deref() == Some(then);
         if exact || config.sink_of_path(&file.path).is_some() || !config.is_own(&file.path) {
             same.push(file.clone());
@@ -789,7 +824,7 @@ pub fn assets(root: &str, files: &[FileDiff], cone: &[&Listed]) -> Vec<Finding> 
     assets_of(
         files,
         cone,
-        &|path| std::fs::read_to_string(Path::new(root).join(path)).ok(),
+        &|path| rustlyn_ide::document::read_source(Path::new(root).join(path)).ok(),
         root,
     )
 }

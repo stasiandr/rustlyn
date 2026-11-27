@@ -156,20 +156,14 @@ pub fn stem(path: &str) -> &str {
 pub const MAX_SOURCE_BYTES: usize = 1 << 20;
 
 /// A source file from disk: at most [`MAX_SOURCE_BYTES`], no NUL bytes in
-/// its first 8 KiB, UTF-8 (a BOM dropped) or else Latin-1.
+/// its first 8 KiB, read as the compiler reads it.
 #[must_use]
 pub fn read_source(path: impl AsRef<Path>) -> Option<String> {
     let data = std::fs::read(path.as_ref()).ok()?;
     if data.len() > MAX_SOURCE_BYTES || data[..data.len().min(8192)].contains(&0) {
         return None;
     }
-    Some(match String::from_utf8(data) {
-        Ok(text) => match text.strip_prefix('\u{feff}') {
-            Some(rest) => rest.to_owned(),
-            None => text,
-        },
-        Err(error) => error.into_bytes().iter().map(|&b| char::from(b)).collect(),
-    })
+    Some(rustlyn_ide::document::decode_source(&data))
 }
 
 #[cfg(test)]

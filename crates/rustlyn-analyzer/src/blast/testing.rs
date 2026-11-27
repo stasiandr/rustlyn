@@ -38,6 +38,13 @@ impl Project {
         std::fs::write(path, text).expect("file");
     }
 
+    /// A file of exactly these bytes.
+    pub(crate) fn write_bytes(&self, name: &str, bytes: &[u8]) {
+        let path = self.0.join(name);
+        std::fs::create_dir_all(path.parent().expect("folder")).expect("folder");
+        std::fs::write(path, bytes).expect("file");
+    }
+
     /// A compiled session over what is on disk now.
     pub(crate) fn session(&self) -> Session {
         crate::blast::project::compiled(&self.root(), None).expect("compiled")

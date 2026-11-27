@@ -35,7 +35,7 @@ pub fn git_patch(root: &str, base: Option<&str>, staged: bool) -> Result<String,
             &["ls-files", "--others", "--exclude-standard", "--", "*.cs"],
         )?;
         for path in untracked.lines().filter(|l| !l.is_empty()) {
-            let Ok(text) = std::fs::read_to_string(Path::new(root).join(path)) else {
+            let Ok(text) = rustlyn_ide::document::read_source(Path::new(root).join(path)) else {
                 continue;
             };
             patch += &added_file_patch(path, &text);
@@ -96,7 +96,7 @@ pub fn git(root: &str, args: &[&str]) -> Result<String, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(rustlyn_ide::document::decode_lines(&output.stdout))
 }
 
 /// The project's compilation cache folder under `tool`'s cache: the second
@@ -139,11 +139,87 @@ pub fn canonical_root(root: &str) -> String {
         .map_or(text.clone(), str::to_owned)
 }
 
+/// The project root, which must be a folder: a root that is not there is an
+/// error, not a project with no changes.
+///
+/// # Errors
+///
+/// When `root` is not an existing folder.
+pub fn existing_root(root: &str) -> Result<(), String> {
+    if Path::new(root).is_dir() {
+        Ok(())
+    } else {
+        Err(format!("{root}: not a folder"))
+    }
+}
+
+/// A patch that is a patch: unified diff text, git's or plain. A text with no
+/// line a diff is made of is not a patch with no changes but a wrong file.
+///
+/// # Errors
+///
+/// When the text is not empty and none of its lines belongs to a diff.
+pub fn valid_patch(patch: &str) -> Result<(), String> {
+    const MARKS: [&str; 12] = [
+        "diff --git ",
+        "diff ",
+        "--- ",
+        "+++ ",
+        "@@ ",
+        "@@@ ",
+        "Binary files ",
+        "GIT binary patch",
+        "old mode ",
+        "new mode ",
+        "rename from ",
+        "similarity index ",
+    ];
+    if patch.trim().is_empty()
+        || patch
+            .lines()
+            .any(|line| MARKS.iter().any(|mark| line.starts_with(mark)))
+    {
+        return Ok(());
+    }
+    Err("the diff is not a unified diff (no ---, +++ or @@ lines)".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::blast::diff::{Status, parse};
     use crate::blast::testing::Project;
+
+    /// A root that is not a folder, and a patch with no line of a diff, are
+    /// errors; an empty patch, and one of lines that are, are not.
+    #[test]
+    fn a_missing_root_and_a_garbage_patch_are_errors() {
+        assert!(existing_root("/nowhere/at/all").is_err());
+        let project = Project::new("setup-root", &[("A.cs", "class A { }\n")]);
+        assert!(existing_root(&project.root()).is_ok());
+        assert!(valid_patch("this is not a diff\nat all\n").is_err());
+        assert!(valid_patch("").is_ok());
+        assert!(valid_patch("  \n").is_ok());
+        assert!(
+            valid_patch("diff --git a/A.cs b/A.cs\nBinary files a/A.cs and b/A.cs differ\n")
+                .is_ok()
+        );
+        assert!(valid_patch("--- a/A.cs\n+++ b/A.cs\n@@ -1 +1 @@\n-a\n+b\n").is_ok());
+    }
+
+    /// A patch is read by line: the lines that are not UTF-8 are Latin-1, as
+    /// the file they are from is.
+    #[test]
+    fn a_patch_with_latin_1_lines_is_read() {
+        let bytes = b"--- a/A.cs\n+++ b/A.cs\n@@ -1 +1 @@\n-// caf\xe9 \xc3\xa9\n+// caf\xe9 x\n";
+        let text = rustlyn_ide::document::decode_lines(bytes);
+        assert!(text.contains("// caf\u{e9} \u{c3}\u{a9}"), "{text:?}");
+        let valid = b"-// caf\xc3\xa9\n";
+        assert_eq!(
+            rustlyn_ide::document::decode_lines(valid),
+            "-// caf\u{e9}\n"
+        );
+    }
 
     #[test]
     fn working_copy_patch_with_new_files() {

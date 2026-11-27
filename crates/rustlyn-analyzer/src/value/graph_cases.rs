@@ -17,7 +17,7 @@ use super::project::{Project, Projects};
 use super::symbols::IndexSymbols;
 use super::testing::TempDir;
 use super::text::last_component;
-use super::wording::English;
+use super::wording::{English, Unknown, Wording};
 
 /// A compiler that writes what it was asked to stderr (`GRAPH_TRACE=1`).
 struct Traced(Arc<Session>);
@@ -616,4 +616,166 @@ fn s60_value_from_a_call_with_a_field_argument() {
         "A.cs",
         "class Pawn { public int Health = 30; }\nclass A {\n    static int Get(Pawn p) => p.Health;\n    int $0shown;\n    void Show(Pawn p) { shown = Get(p); }\n}\n",
     )]).path("A.shown <- A.Show <- Get() <- A.Get <- Pawn.Health <- Pawn.Health <- 30").sources("initial value 30");
+}
+
+// MARK: - writes through references, constructors and indexers
+//
+// Each example is written so that the value its field gets is known by
+// construction: the literal passed or assigned is the only one.
+
+#[test]
+fn s61_ref_argument_through_this() {
+    case(&[(
+        "A.cs",
+        "class A {\n    int $0T;\n    void Set() { Helper(ref this.T); }\n    static void Helper(ref int x) { x = 3001; }\n}\n",
+    )]).path("A.T <- A.Set <- Helper.x <- A.Helper <- 3001").sources("literal 3001");
+}
+
+#[test]
+fn s62_ref_argument_through_another_object() {
+    case(&[(
+        "A.cs",
+        "class A {\n    int $0T;\n    void Set(A o) { Helper(ref o.T); }\n    static void Helper(ref int x) { x = 3002; }\n}\n",
+    )]).sources("literal 3002");
+}
+
+#[test]
+fn s63_out_argument_through_this() {
+    case(&[(
+        "A.cs",
+        "class A {\n    int $0T;\n    void Set() { Helper(out this.T); }\n    static void Helper(out int x) { x = 3003; }\n}\n",
+    )]).sources("literal 3003");
+}
+
+#[test]
+fn s64_ref_local_is_another_name_for_the_field() {
+    case(&[(
+        "A.cs",
+        "class A {\n    int $0T;\n    void Set() { ref int r = ref T; r = 3005; }\n}\n",
+    )])
+    .sources("literal 3005");
+}
+
+#[test]
+fn s65_ref_local_of_this_field() {
+    case(&[(
+        "A.cs",
+        "class A {\n    int $0T;\n    void Set() { ref int r = ref this.T; r = 3006; }\n}\n",
+    )])
+    .sources("literal 3006");
+}
+
+#[test]
+fn s66_interlocked_exchange() {
+    case(&[(
+        "A.cs",
+        "using System.Threading;\nclass A {\n    int $0T;\n    void Set() { Interlocked.Exchange(ref T, 2003); }\n}\n",
+    )]).sources("literal 2003");
+}
+
+#[test]
+fn s67_interlocked_compare_exchange() {
+    case(&[(
+        "A.cs",
+        "using System.Threading;\nclass A {\n    int $0T;\n    void Set() { Interlocked.CompareExchange(ref T, 2004, 0); }\n}\n",
+    )]).sources("literal 2004");
+}
+
+#[test]
+fn s68_volatile_write() {
+    case(&[(
+        "A.cs",
+        "using System.Threading;\nclass A {\n    int $0T;\n    void Set() { Volatile.Write(ref T, 2005); }\n}\n",
+    )]).sources("literal 2005");
+}
+
+#[test]
+fn s69_interlocked_add() {
+    case(&[(
+        "A.cs",
+        "using System.Threading;\nclass A {\n    int $0T;\n    void Set() { Interlocked.Add(ref T, 2006); }\n}\n",
+    )]).sources("literal 2006");
+}
+
+#[test]
+fn s70_ref_return_written_by_its_caller() {
+    case(&[(
+        "A.cs",
+        "class A {\n    int $0T;\n    ref int Slot() { return ref T; }\n    void Set() { Slot() = 2002; }\n}\n",
+    )]).path("A.T <- A.Slot <- 2002").sources("literal 2002");
+}
+
+#[test]
+fn s71_ref_return_taken_by_a_ref_local() {
+    case(&[(
+        "A.cs",
+        "class A {\n    int $0T;\n    ref int Slot() => ref T;\n    void Set() { ref int r = ref Slot(); r = 2007; }\n}\n",
+    )]).sources("literal 2007");
+}
+
+#[test]
+fn s72_compound_assignment_through_a_ref_parameter() {
+    case(&[(
+        "A.cs",
+        "class A {\n    int $0T;\n    void Set() { Helper(ref this.T); }\n    static void Helper(ref int x) { x += 2014; }\n}\n",
+    )]).sources("literal 2014");
+}
+
+#[test]
+fn s73_primary_constructor_parameter_from_its_callers() {
+    case(&[(
+        "A.cs",
+        "class Cfg(int t) { public int $0T = t; }\nclass Use { Cfg Make() { return new Cfg(4001); } }\n",
+    )]).path("Cfg.T <- ctor.t <- Use.Make <- 4001").sources("literal 4001");
+}
+
+#[test]
+fn s74_positional_record_parameter_from_its_callers() {
+    case(&[(
+        "A.cs",
+        "record Rec(int $0V);\nclass Use { Rec Make() { return new Rec(4002); } }\n",
+    )])
+    .sources("literal 4002");
+}
+
+#[test]
+fn s75_indexer_setter_from_the_assignments_of_the_indexer() {
+    case(&[(
+        "A.cs",
+        "class A {\n    int $0T;\n    int this[int i] { set { T = value; } }\n    void Set() { this[0] = 1030; }\n}\n",
+    )]).sources("literal 1030");
+}
+
+#[test]
+fn s76_indexer_assigned_from_another_class() {
+    case(&[(
+        "A.cs",
+        "class A {\n    int $0T;\n    public int this[int i] { set { T = value; } }\n}\nclass B { void Run(A a) { a[1] = 1031; } }\n",
+    )]).sources("literal 1031");
+}
+
+#[test]
+fn s77_a_reference_that_escapes_is_said_to() {
+    let found = case(&[(
+        "A.cs",
+        "using System.Threading;\nclass A {\n    int $0T;\n    void Set() { Interlocked.Increment(ref T); }\n}\n",
+    )]);
+    // The graph says where the reference goes and that it is not followed;
+    // the words for the reader are the subtitle's.
+    assert!(
+        found.tree.contains("Interlocked.Increment(ref …) [unknown"),
+        "the value may be written through a reference:\n{}",
+        found.tree
+    );
+    assert!(
+        English
+            .unknown(Unknown::ThroughReference)
+            .contains("may be written through it"),
+        "the way it is said"
+    );
+    assert!(
+        !found.tree.contains("no writes were found"),
+        "not an assertion of no writes:\n{}",
+        found.tree
+    );
 }

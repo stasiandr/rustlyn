@@ -196,7 +196,11 @@ impl Blobs {
         let mut bytes = vec![0; size + 1];
         self.output.read_exact(&mut bytes).ok()?;
         bytes.pop();
-        String::from_utf8(bytes).ok()
+        // A blob with a NUL in its first bytes is not text.
+        if bytes[..bytes.len().min(8192)].contains(&0) {
+            return None;
+        }
+        Some(rustlyn_ide::document::decode_source(&bytes))
     }
 }
 

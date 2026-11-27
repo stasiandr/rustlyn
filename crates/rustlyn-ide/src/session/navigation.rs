@@ -18,7 +18,7 @@ use rustlyn_text::TextSpan;
 use super::{Definition, Location, Refusal, Session};
 use crate::outline::DeclarationKind;
 use crate::search::{MatchKind, SearchKind, Target, search};
-use crate::semantic::{Found, HierarchyItem, Place, Semantic};
+use crate::semantic::{Found, HierarchyItem, Place, Semantic, UseKind};
 
 /// From one line and column to another, in the editor's units: the columns
 /// in UTF-16 code units.
@@ -60,6 +60,9 @@ pub struct Call {
     pub path: PathBuf,
     /// The name of each call.
     pub ranges: Vec<LineRange>,
+    /// How each of `ranges` uses the member, in the same order: a property's
+    /// getter and setter are different code.
+    pub uses: Vec<UseKind>,
     /// Whether these calls name a member the one asked about overrides or
     /// implements: they may run it, and may not.
     pub through_base: bool,
@@ -241,11 +244,21 @@ impl Session {
         let mut texts = Texts::default();
         Ok(calls
             .into_iter()
-            .map(|call| Call {
-                item: self.item(&semantic, &mut texts, &call.from),
-                ranges: self.ranges_in(&semantic, &mut texts, &call.path, &call.spans),
-                path: self.relative(&call.path),
-                through_base: call.through_base,
+            .map(|call| {
+                let text = texts.get(self, &semantic, &call.path);
+                let (ranges, uses) = call
+                    .spans
+                    .iter()
+                    .zip(&call.uses)
+                    .filter_map(|(&span, &kind)| Some((line_range(text, span)?, kind)))
+                    .unzip();
+                Call {
+                    item: self.item(&semantic, &mut texts, &call.from),
+                    ranges,
+                    uses,
+                    path: self.relative(&call.path),
+                    through_base: call.through_base,
+                }
             })
             .collect())
     }
@@ -265,11 +278,15 @@ impl Session {
         let mut texts = Texts::default();
         Ok(calls
             .into_iter()
-            .map(|call| Call {
-                item: self.item(&semantic, &mut texts, &call.to),
-                ranges: self.ranges_in(&semantic, &mut texts, &call.path, &call.spans),
-                path: self.relative(&call.path),
-                through_base: false,
+            .map(|call| {
+                let ranges = self.ranges_in(&semantic, &mut texts, &call.path, &call.spans);
+                Call {
+                    item: self.item(&semantic, &mut texts, &call.to),
+                    uses: vec![UseKind::Call; ranges.len()],
+                    ranges,
+                    path: self.relative(&call.path),
+                    through_base: false,
+                }
             })
             .collect())
     }

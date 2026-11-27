@@ -106,11 +106,31 @@ impl Server {
         }
     }
 
-    /// The answer to one message; none to a notification.
+    /// The answer to one message; none to a notification. A batch (a JSON
+    /// array of messages) is answered with an array of the answers to those
+    /// that have one, and not at all when none has (JSON-RPC 2.0, §6).
     pub fn handle(&mut self, line: &str) -> Option<Json> {
         let Some(message) = Json::parse(line.as_bytes()) else {
             return Some(error(Json::Null, -32700, "not JSON"));
         };
+        let Json::Array(batch) = message else {
+            return self.handle_message(&message);
+        };
+        if batch.is_empty() {
+            return Some(error(Json::Null, -32600, "an empty batch"));
+        }
+        let replies: Vec<Json> = batch
+            .iter()
+            .filter_map(|message| self.handle_message(message))
+            .collect();
+        (!replies.is_empty()).then_some(Json::Array(replies))
+    }
+
+    /// The answer to one request or notification.
+    fn handle_message(&mut self, message: &Json) -> Option<Json> {
+        if !matches!(message, Json::Object(_)) {
+            return Some(error(Json::Null, -32600, "not a request"));
+        }
         let id = message.get("id").cloned();
         let method = message.str("method").unwrap_or_default().to_owned();
         let params = message.object_or_empty("params");
@@ -180,8 +200,12 @@ impl Server {
             .str("root")
             .ok_or("root is required: the project root")?;
         let root = setup::canonical_root(root);
+        setup::existing_root(&root)?;
         let patch = match arguments.str("diff") {
-            Some(diff) => diff.to_owned(),
+            Some(diff) => {
+                setup::valid_patch(diff)?;
+                diff.to_owned()
+            }
             None => setup::git_patch(
                 &root,
                 arguments.str("base"),
@@ -370,5 +394,85 @@ mod tests {
         assert_eq!(keys, vec!["A.F()", "A.G()"]);
         // The second call is on the same session.
         assert!(server.handle(&call.to_text()).is_some());
+    }
+
+    /// A batch (an array of requests) is answered with an array of the
+    /// answers to those that have one; one of notifications only is not
+    /// answered, an empty one is a request that is not valid.
+    #[test]
+    fn a_batch_is_answered_with_an_array() {
+        let mut server = Server::default();
+        let batch = r#"[
+            {"jsonrpc":"2.0","id":1,"method":"ping"},
+            {"jsonrpc":"2.0","method":"notifications/initialized"},
+            {"jsonrpc":"2.0","id":"two","method":"tools/list"},
+            7
+        ]"#;
+        let reply = server.handle(batch).expect("an answer");
+        let Json::Array(replies) = &reply else {
+            panic!("an array: {}", reply.to_text());
+        };
+        assert_eq!(replies.len(), 3, "{}", reply.to_text());
+        assert_eq!(replies[0].int("id"), Some(1));
+        assert_eq!(replies[1].str("id"), Some("two"));
+        assert!(replies[1].object("result").is_some());
+        assert_eq!(
+            replies[2].object("error").and_then(|e| e.int("code")),
+            Some(-32600),
+            "an element that is not a request is invalid"
+        );
+        assert!(
+            server
+                .handle(r#"[{"jsonrpc":"2.0","method":"notifications/initialized"}]"#)
+                .is_none()
+        );
+        let empty = server.handle("[]").expect("an answer");
+        assert_eq!(
+            empty.object("error").and_then(|e| e.int("code")),
+            Some(-32600)
+        );
+    }
+
+    /// A root that is not there and a diff that is not a diff are errors,
+    /// not a project with no changes.
+    #[test]
+    fn bad_input_is_an_error_result() {
+        let mut server = Server::default();
+        let project = Project::new("bad", &[("A.cs", "class A { }\n")]);
+        let ask = |server: &mut Server, root: &str, diff: &str| {
+            let call = object(vec![
+                ("jsonrpc", Json::String("2.0".into())),
+                ("id", Json::Int(1)),
+                ("method", Json::String("tools/call".into())),
+                (
+                    "params",
+                    object(vec![
+                        ("name", Json::String(TOOL.into())),
+                        (
+                            "arguments",
+                            object(vec![
+                                ("root", Json::String(root.into())),
+                                ("diff", Json::String(diff.into())),
+                            ]),
+                        ),
+                    ]),
+                ),
+            ]);
+            let reply = server.handle(&call.to_text()).expect("reply");
+            let result = reply.object("result").expect("result");
+            (
+                result.bool("isError") == Some(true),
+                result.objects("content").expect("content")[0]
+                    .str("text")
+                    .expect("text")
+                    .to_owned(),
+            )
+        };
+        let (failed, text) = ask(&mut server, "/nowhere/at/all", "");
+        assert!(failed, "{text}");
+        assert!(text.contains("not a folder"), "{text}");
+        let (failed, text) = ask(&mut server, &project.root(), "this is not a diff\n");
+        assert!(failed, "{text}");
+        assert!(text.contains("not a unified diff"), "{text}");
     }
 }

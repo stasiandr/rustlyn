@@ -66,6 +66,14 @@ pub enum Reason {
     /// The field's value is set in `asset`: a rename or a type change
     /// without `[FormerlySerializedAs]` loses it.
     SerializedField { asset: String },
+    /// The change is in code the project's build leaves out (an `#if` that
+    /// is off): the compiler does not see it, so no caller of it is known and
+    /// nothing checks it.
+    NotBuilt,
+    /// The field's value is set in `asset`, and the change leaves what is
+    /// stored there alone: a default or an attribute changed, and instances
+    /// there keep the value they have.
+    SerializedValueKept { asset: String },
     /// A `UnityEvent` in `asset` calls the method by name.
     UnityEvent { asset: String },
     /// A compile error the change introduced.
@@ -98,7 +106,9 @@ impl Reason {
             Self::WideFanIn { .. } => "wide_fan_in",
             Self::PerFrame => "per_frame",
             Self::UnityMessage => "unity_message",
+            Self::NotBuilt => "not_built",
             Self::SerializedField { .. } => "serialized_field",
+            Self::SerializedValueKept { .. } => "serialized_value_kept",
             Self::UnityEvent { .. } => "unity_event",
             Self::CompileError { .. } => "compile_error",
             Self::Threads { .. } => "threads",
@@ -129,6 +139,13 @@ impl fmt::Display for Reason {
             Self::SerializedField { asset } => write!(
                 f,
                 "the field's value is set in {asset}: a rename or a type change without [FormerlySerializedAs] loses it"
+            ),
+            Self::NotBuilt => f.write_str(
+                "in code this build leaves out (an #if that is off): no callers are known, and the compiler checks nothing here",
+            ),
+            Self::SerializedValueKept { asset } => write!(
+                f,
+                "the field's value is set in {asset}: serialized instances keep their own value, not the new default"
             ),
             Self::UnityEvent { asset } => {
                 write!(f, "{asset} calls it by name from a UnityEvent")
@@ -262,6 +279,9 @@ pub fn assess(
                 ));
             }
             _ => {}
+        }
+        if node.inactive {
+            risks.push(Risk::new(Level::Medium, Reason::NotBuilt));
         }
         if node.fan_in >= WIDE && node.depth <= 1 {
             risks.push(Risk::new(

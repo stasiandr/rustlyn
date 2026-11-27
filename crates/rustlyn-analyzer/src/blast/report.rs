@@ -81,7 +81,8 @@ pub fn analyze(request: &Request, session: &Session, extensions: &Extensions<'_>
     unsaved.sort();
     for path in unsaved {
         let buffer = &request.unsaved[path];
-        let disk = std::fs::read_to_string(Path::new(&request.root).join(path)).unwrap_or_default();
+        let disk = rustlyn_ide::document::read_source(Path::new(&request.root).join(path))
+            .unwrap_or_default();
         let base = match files.iter().position(|f| &f.path == path) {
             Some(i) => files.remove(i).old_text(&disk),
             None => disk,
@@ -104,7 +105,8 @@ pub fn analyze(request: &Request, session: &Session, extensions: &Extensions<'_>
         } else if let Some(buffer) = request.unsaved.get(&file.path) {
             buffer.clone()
         } else {
-            std::fs::read_to_string(Path::new(&request.root).join(&file.path)).unwrap_or_default()
+            rustlyn_ide::document::read_source(Path::new(&request.root).join(&file.path))
+                .unwrap_or_default()
         };
         found.extend(changes(file, &text));
         old_texts.insert(file.path.clone(), file.old_text(&text));

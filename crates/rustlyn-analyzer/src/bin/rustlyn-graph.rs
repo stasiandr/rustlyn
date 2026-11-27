@@ -110,7 +110,7 @@ fn run() -> Result<i32, String> {
     let (Some(line), Some(column)) = (line, column) else {
         return Err("a position File.cs:line:column".to_owned());
     };
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+    let text = rustlyn_ide::document::read_source(&path).map_err(|e| format!("{path}: {e}"))?;
     let offset = line_start_utf16(&text, line) as usize + column.saturating_sub(1);
     let compiler: &dyn Compiler = &*session;
     compiler.open(&path);

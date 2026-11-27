@@ -102,6 +102,7 @@ fn run() -> Result<i32, String> {
         }
     }
     let root = setup::canonical_root(&root.unwrap_or_else(|| ".".to_owned()));
+    setup::existing_root(&root)?;
     let config_path = config.unwrap_or_else(|| format!("{root}/.rustlyn/reach.json"));
     let config = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("{config_path}: {e}"))
@@ -124,16 +125,22 @@ fn run() -> Result<i32, String> {
     } else {
         Some(match diff.as_deref() {
             Some("-") => {
-                let mut text = String::new();
+                let mut bytes = Vec::new();
                 std::io::stdin()
-                    .read_to_string(&mut text)
+                    .read_to_end(&mut bytes)
                     .map_err(|e| e.to_string())?;
-                text
+                rustlyn_ide::document::decode_lines(&bytes)
             }
-            Some(path) => std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?,
+            Some(path) => {
+                let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+                rustlyn_ide::document::decode_lines(&bytes)
+            }
             None => setup::git_patch(&root, base.as_deref(), staged)?,
         })
     };
+    if let Some(patch) = &patch {
+        setup::valid_patch(patch)?;
+    }
     let request = Request {
         cache: cache
             .then(|| setup::cache_dir("rustlyn-reach", &root))

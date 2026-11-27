@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustlyn_ide::DeclarationKind;
-use rustlyn_ide::semantic::{LinkRole, LinkSymbol, Place, Semantic};
+use rustlyn_ide::semantic::{LinkRole, LinkSymbol, Place, Semantic, UseKind};
 
 use super::config::Config;
 use super::packages::Packages;
@@ -219,7 +219,12 @@ impl Graph {
             .members
             .list
             .iter()
-            .position(|member| member.offset == offset)?;
+            .position(|member| member.offset == offset)
+            .or_else(|| {
+                file.members.list.iter().position(|member| {
+                    declared_at_start(member.kind) && member.span.start == offset
+                })
+            })?;
         Some(file.first + u32::try_from(index).ok()?)
     }
 }
@@ -236,6 +241,9 @@ struct Target {
     component: Option<String>,
     /// The Unity package it is declared in.
     package: Option<String>,
+    /// For a property or an indexer: whether its getter and its setter have
+    /// code of their own.
+    accessors: Option<(bool, bool)>,
 }
 
 /// An edge before its target is a node: the target's file may not have been
@@ -420,12 +428,28 @@ pub fn build(root: &str, semantic: &Semantic, config: &Config, packages: &Packag
                 .collect()
         })
         .collect();
+    // A constructor, an operator, an indexer and a property are declared
+    // where the declaration begins, not at a name.
+    let by_start: Vec<HashMap<usize, u32>> = graph
+        .files
+        .iter()
+        .map(|file| {
+            file.members
+                .list
+                .iter()
+                .enumerate()
+                .filter(|(_, member)| declared_at_start(member.kind))
+                .map(|(index, member)| (member.span.start, index as u32))
+                .collect()
+        })
+        .collect();
     for (index, (edges, hits)) in raw.into_iter().enumerate() {
         let first = graph.files[index].first;
         for edge in edges {
             let to = match edge.target {
                 RawTarget::Own(file, offset) => by_offset[file as usize]
                     .get(&offset)
+                    .or_else(|| by_start[file as usize].get(&offset))
                     .map(|&member| graph.files[file as usize].first + member),
                 RawTarget::Type(name) => graph.types.get(&name).copied(),
             };
@@ -505,6 +529,7 @@ impl Context<'_> {
             sink: None,
             component: None,
             package: None,
+            accessors: found.accessor_code,
         };
         if found.kind == DeclarationKind::Namespace {
             return target;
@@ -573,6 +598,52 @@ fn stash_component(type_text: &str) -> Option<String> {
     (!inner.contains([',', '<'])).then(|| inner.trim_start_matches("global::").to_owned())
 }
 
+/// Whether the compiler places a member of this kind where its declaration
+/// begins rather than at its name.
+const fn declared_at_start(kind: DeclarationKind) -> bool {
+    matches!(
+        kind,
+        DeclarationKind::Constructor
+            | DeclarationKind::Destructor
+            | DeclarationKind::Operator
+            | DeclarationKind::Indexer
+            | DeclarationKind::Property
+    )
+}
+
+/// The edges of an implicit use of `target`: a call for what runs code, and
+/// for a property, the read or write it is and the call of an accessor that
+/// has code.
+fn implicit_edge(target: &Target, how: UseKind, mut push: impl FnMut(EdgeKind)) {
+    match target.kind {
+        DeclarationKind::Method
+        | DeclarationKind::Constructor
+        | DeclarationKind::Destructor
+        | DeclarationKind::Operator
+        | DeclarationKind::Indexer
+        | DeclarationKind::Delegate => push(EdgeKind::Calls),
+        DeclarationKind::Property
+        | DeclarationKind::Event
+        | DeclarationKind::Field
+        | DeclarationKind::EnumMember => {
+            let reads = matches!(how, UseKind::Call | UseKind::Read | UseKind::ReadWrite);
+            let writes = matches!(how, UseKind::Write | UseKind::ReadWrite);
+            if reads {
+                push(EdgeKind::Reads);
+            }
+            if writes {
+                push(EdgeKind::Writes);
+            }
+            if let Some((getter, setter)) = target.accessors
+                && ((reads && getter) || (writes && setter))
+            {
+                push(EdgeKind::Calls);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn read_file(context: &Context<'_>, path: &str) -> RawFile {
     let semantic = context.semantic;
     let full = Path::new(context.root).join(path);
@@ -591,20 +662,18 @@ fn read_file(context: &Context<'_>, path: &str) -> RawFile {
     let mut file = RawFile::default();
     // A package's own code uses itself all it likes.
     let home = context.packages.package_of(path);
-    // The innermost member around each line, asked for link after link.
-    let mut owners: HashMap<u32, Option<u32>> = HashMap::new();
-    let mut owner_at = |line: u32| {
-        *owners.entry(line).or_insert_with(|| {
-            let inner = members.enclosing(line as usize)?;
-            let index = members
-                .list
-                .iter()
-                .position(|member| std::ptr::eq(member, inner))?;
-            u32::try_from(index).ok()
-        })
+    // The innermost member around each name, asked for link after link: by
+    // the bytes it is at, which tells apart members written on one line.
+    let owner_at = |offset: u32| {
+        let inner = members.enclosing_at(offset as usize)?;
+        let index = members
+            .list
+            .iter()
+            .position(|member| std::ptr::eq(member, inner))?;
+        u32::try_from(index).ok()
     };
     for link in &links.links {
-        let Some(owner) = owner_at(link.line) else {
+        let Some(owner) = owner_at(link.span.start()) else {
             continue;
         };
         let target = context.target(link.target);
@@ -640,6 +709,16 @@ fn read_file(context: &Context<'_>, path: &str) -> RawFile {
                 offset: link.span.start(),
             });
         };
+        // A construct that runs the member without writing its name: an
+        // operator, an indexer, a target-typed `new()`, `foreach`, `using`.
+        if let Some(how) = link.implicit {
+            if let Some((to, offset)) = target.own
+                && link.role == LinkRole::Body
+            {
+                implicit_edge(&target, how, |kind| push(RawTarget::Own(to, offset), kind));
+            }
+            continue;
+        }
         if link.role == LinkRole::Base {
             if let Some((to, offset)) = target.own
                 && target.kind.is_type()
@@ -690,14 +769,26 @@ fn read_file(context: &Context<'_>, path: &str) -> RawFile {
             DeclarationKind::Property
             | DeclarationKind::Event
             | DeclarationKind::Field
-            | DeclarationKind::EnumMember => match text::access(bytes, start, end) {
-                text::Access::Read => push(own, EdgeKind::Reads),
-                text::Access::Write => push(own, EdgeKind::Writes),
-                text::Access::Both => {
-                    push(RawTarget::Own(to, offset), EdgeKind::Reads);
-                    push(own, EdgeKind::Writes);
+            | DeclarationKind::EnumMember => {
+                let access = text::access(bytes, start, end);
+                match access {
+                    text::Access::Read => push(own, EdgeKind::Reads),
+                    text::Access::Write => push(own, EdgeKind::Writes),
+                    text::Access::Both => {
+                        push(RawTarget::Own(to, offset), EdgeKind::Reads);
+                        push(own, EdgeKind::Writes);
+                    }
                 }
-            },
+                // A property with code in an accessor is called by whoever
+                // runs that accessor.
+                if let Some((getter, setter)) = target.accessors {
+                    let reads = matches!(access, text::Access::Read | text::Access::Both);
+                    let writes = matches!(access, text::Access::Write | text::Access::Both);
+                    if (reads && getter) || (writes && setter) {
+                        push(RawTarget::Own(to, offset), EdgeKind::Calls);
+                    }
+                }
+            }
             kind if kind.is_type() => match text::generic_owner(bytes, start) {
                 Some(method) if COMPONENT_READS.contains(&method) => {
                     push(own, EdgeKind::ReadsComponent);

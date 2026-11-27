@@ -26,6 +26,7 @@ use rustlyn_text::{SourceText, TextSpan};
 /// only to the [`Semantic`] it came from.
 pub type LinkSymbol = SymbolId;
 
+use super::implicit::UseKind;
 use super::{Place, Resolved, Semantic, View, declaration_kind};
 use crate::outline::{DeclarationKind, FileOutline};
 
@@ -56,6 +57,10 @@ pub struct Link {
     pub statement: (u32, u32),
     pub target: SymbolId,
     pub role: LinkRole,
+    /// For a use that writes no name of its own — `a + b`, `m[3]`, `new()`,
+    /// `foreach`, `using` — how it uses the target; the span is where the
+    /// construct begins. `None` for a name.
+    pub implicit: Option<UseKind>,
 }
 
 /// The names of one compiled file.
@@ -81,6 +86,11 @@ pub struct LinkTarget {
     /// The type of a field, property or event, as C# writes it, with every
     /// named type qualified: `Scellecs.Morpeh.Stash<Game.Health>`.
     pub type_text: Option<String>,
+    /// For a property or an indexer declared in source: whether its getter
+    /// and whether its setter (or `init`) hold code of their own, as opposed
+    /// to the ones an automatic property makes. A use of the property runs
+    /// its code only where it does.
+    pub accessor_code: Option<(bool, bool)>,
 }
 
 impl Semantic {
@@ -94,17 +104,38 @@ impl Semantic {
         let lines = self.compilation.trees().source(tree)?.lines();
         let mut view = self.view(tree)?;
 
-        let mut found: Vec<(TextSpan, SymbolId, LinkRole)> = Vec::new();
+        let mut found: Vec<(TextSpan, SymbolId, LinkRole, Option<UseKind>)> = Vec::new();
         let mut seen: HashSet<TextSpan> = HashSet::new();
+        let mut implicit_seen: HashSet<(TextSpan, SymbolId)> = HashSet::new();
+        let text = self.compilation.trees().source(tree)?.text();
         for owner in body_owners(&view.root) {
             // Bound here rather than through the view: the shared cache of
             // bodies is for an editor that asks about one method again and
             // again, and a pass over the project would only churn it.
             let body = view.model.bind_body_for_editor(&owner);
             let within = owner.span();
+            // What `nameof(x.M)` names it does not run.
+            let nameofs: Vec<TextSpan> = if text.contains("nameof") {
+                owner
+                    .descendants()
+                    .filter(super::hierarchy::is_nameof)
+                    .map(|node| node.span())
+                    .collect()
+            } else {
+                Vec::new()
+            };
             for (&at, &symbol) in &body.symbols {
-                if within.contains_span(at) && seen.insert(at) {
-                    found.push((at, symbol, LinkRole::Body));
+                if within.contains_span(at)
+                    && !nameofs.iter().any(|span| span.contains_span(at))
+                    && seen.insert(at)
+                {
+                    found.push((at, symbol, LinkRole::Body, None));
+                }
+            }
+            // A construct begins where a name may stand: `a` of `a + b`.
+            for (at, symbol, kind, _) in self.implicit_symbols(&view.model, &body, &owner, text) {
+                if implicit_seen.insert((at, symbol)) {
+                    found.push((at, symbol, LinkRole::Body, Some(kind)));
                 }
             }
         }
@@ -118,14 +149,14 @@ impl Semantic {
             if let Some(Resolved::Symbol(symbol)) = view.resolve(&token)
                 && seen.insert(token.span())
             {
-                found.push((token.span(), symbol, role));
+                found.push((token.span(), symbol, role, None));
             }
         }
-        found.sort_by_key(|(at, _, _)| at.start());
+        found.sort_by_key(|(at, _, _, _)| at.start());
 
         let links = found
             .into_iter()
-            .map(|(span, target, role)| {
+            .map(|(span, target, role, implicit)| {
                 let line = lines.line_of(span.start());
                 let statement = if role == LinkRole::Body {
                     statement_of(&view, span).map_or((line, line), |statement| {
@@ -143,6 +174,7 @@ impl Semantic {
                     statement,
                     target,
                     role,
+                    implicit,
                 }
             })
             .collect();
@@ -179,6 +211,10 @@ impl Semantic {
                 symbols,
             )
         });
+        let accessor_code = matches!(found.kind, SymbolKind::Property)
+            .then(|| self.compilation.declaration_node(symbol))
+            .flatten()
+            .map(|node| accessors_with_code(&node));
         LinkTarget {
             name: found.name.clone(),
             container,
@@ -189,6 +225,7 @@ impl Semantic {
                 .next()
                 .map(|found| found.place),
             type_text,
+            accessor_code,
         }
     }
 
@@ -222,6 +259,36 @@ impl Semantic {
     }
 }
 
+/// Whether the getter and the setter of a property declaration have bodies:
+/// `=> x`, `{ … }`. An expression-bodied property is a getter.
+fn accessors_with_code(node: &SyntaxNode) -> (bool, bool) {
+    if node
+        .child_of_kind(SyntaxKind::ArrowExpressionClause)
+        .is_some()
+    {
+        return (true, false);
+    }
+    let mut code = (false, false);
+    for accessor in node
+        .child_of_kind(SyntaxKind::AccessorList)
+        .into_iter()
+        .flat_map(|list| list.children())
+    {
+        let has_body = accessor.child_of_kind(SyntaxKind::Block).is_some()
+            || accessor
+                .child_of_kind(SyntaxKind::ArrowExpressionClause)
+                .is_some();
+        match accessor.kind() {
+            SyntaxKind::GetAccessorDeclaration => code.0 |= has_body,
+            SyntaxKind::SetAccessorDeclaration | SyntaxKind::InitAccessorDeclaration => {
+                code.1 |= has_body;
+            }
+            _ => {}
+        }
+    }
+    code
+}
+
 /// A type as C# writes it, with every named type qualified:
 /// `Scellecs.Morpeh.Stash<Game.Health>`.
 fn qualified(ty: &Type, symbols: &Symbols) -> String {
@@ -253,7 +320,7 @@ fn qualified(ty: &Type, symbols: &Symbols) -> String {
 
 /// The nodes of a file whose bodies are bound one by one: members, accessors
 /// and the declarators of fields with an initializer.
-fn body_owners(root: &SyntaxNode) -> Vec<SyntaxNode> {
+pub(super) fn body_owners(root: &SyntaxNode) -> Vec<SyntaxNode> {
     let mut owners = Vec::new();
     if root
         .children()

@@ -60,8 +60,17 @@ rustlyn-blast --mcp
 
 Without `--diff` it diffs the git working copy against `--base` (default `HEAD`).
 The exit code is 0 when there are no high risks, 3 when there are, and 2 on an
-error. `--json` prints a report for agents. `--mcp` runs the same analysis as a
-Model Context Protocol server over stdio.
+error: a ROOT that is not a folder, a `--diff` file that cannot be read or has
+no line of a diff in it, a failing `git`. An empty diff is not an error; it is a
+change with no members. `--json` prints a report for agents. `--mcp` runs the
+same analysis as a Model Context Protocol server over stdio: a `root` that is
+not a folder and a `diff` that is not a diff are an error result (`isError`),
+and a JSON-RPC batch (an array of requests) is answered with an array of
+answers, as JSON-RPC 2.0 has it.
+
+Sources are read as the compiler reads them: UTF-8, UTF-16 with a byte-order
+mark, and — as `csc` does — any other bytes as Latin-1; a patch is read by line
+the same way. A file that is not UTF-8 is analyzed, not skipped.
 
 ```
 Change: 4 changed members in 1 files; 2 more reached, assets 1. Risk: high.
@@ -76,6 +85,73 @@ Change: 4 changed members in 1 files; 2 more reached, assets 1. Risk: high.
       ⚠ medium: Unity calls it every frame: an error or slow code shows at once
 ▣ Assets/Hero.prefab — has Assets/Player.cs (Hero › MonoBehaviour); sets field health
 ```
+
+What counts as a caller. The walk asks the compiler's bound bodies who runs a
+changed member, so a caller is a member whose code runs it, whether or not it
+writes the member's name:
+
+* a call, a method group made a delegate (`Func<int> f = o.M;`), a handler
+  subscribed to an event (`e += o.M`);
+* a constructor by `new C(…)`, by a target-typed `new(…)`, by `: base(…)` or
+  `: this(…)`, and by an object initializer (`new C { P = 1 }` runs the
+  constructor and the setter `P`), a collection initializer (`Add`), `with`
+  (a record's own copy constructor and the `init` setters it names) and an
+  attribute (the constructor it binds and the properties it sets by name; the
+  member it is on is the caller);
+* an indexer used as `m[i]`, its getter by a read, its setter by an assignment;
+* operators: binary, unary, compound assignment, `++` and `--`, `true` and
+  `false` (`if (m)`, `a && b`), implicit and explicit conversions, wherever a
+  value of the one type is taken as the other (assigned, passed, cast);
+* `foreach` (`GetEnumerator`, `MoveNext`, `Current` and the enumerator's
+  `Dispose`), `using` and `await using` (`Dispose`, `DisposeAsync`), `await`
+  (`GetAwaiter`, `IsCompleted`, `GetResult`), a deconstruction or a positional
+  pattern (`Deconstruct`), a list pattern (`Length`, `Count`, the indexer), a
+  query expression (`Select`, `Where`, …), `lock` on a `System.Threading.Lock`
+  the project declares (the framework's own runs no member of the project);
+* `ToString()` where the static type shows that the value is written as text:
+  an interpolation hole, a string concatenation, an argument of
+  `Console.WriteLine`, `string.Format`, `StringBuilder.Append` or `Debug.Log`.
+  A value typed `object` or as an interface shows nothing, and is not a caller.
+
+A name that is not a run is not a caller: `nameof(m.F)`, `typeof(T)` and a
+documentation `cref`. Another type's member of the same name is another
+member, and so is the overload the compiler did not bind. A call by name
+through an interface or a base member is listed as `calls_base`, as before. A
+construct that runs a base class's member on a value of the changed member's
+type, or of a class it derives from, is listed the same way; one that runs an
+interface's is every implementation's, and is not listed, nor is a use of a
+base member on a value of an unrelated type (the `IDisposable.Dispose` of the
+`IEnumerator<int>` a `foreach` disposes, for a collection that is no
+enumerator).
+
+A property's getter and setter are different code. When the changed lines are
+all in the getter, the callers are the code that reads the property; when all
+in the setter (or `init`), the code that assigns it; `p.P += 1` does both. A
+change outside the accessors, or in both, reaches all of them. Two members
+written on one line are told apart by where the change is on the line, and a
+caller is the member the compiler names, not the innermost one on its line.
+
+A change in code the build leaves out — an `#if` that is off for the project —
+is not in the compiler's view. It is not dropped: the member is named from the
+file's own structure (read with the symbols its conditions name turned on),
+and it carries a medium risk, `not_built`: no callers are known, and nothing
+checks it.
+
+The search does not follow `dynamic`, reflection, or a method called by a name
+in a string (`SendMessage("Hit")`, a `UnityEvent` set up in the editor; those a
+scene or prefab calls by name are listed under assets).
+
+The Unity field risk is about the value an asset stores. A prefab or scene that
+sets a field keeps the value under the field's name and type. It is lost, and
+the risk is high (`serialized_field`), when the field is renamed (the old name
+is gone, with no `[FormerlySerializedAs("old")]` on a field that replaces it),
+removed, given another type, or stops being serialized (`public` to private
+without `[SerializeField]`, `static`, `const`, `readonly`, `[NonSerialized]`).
+A changed default or an added attribute loses nothing: serialized instances
+keep their own value, and the report says so as a low note
+(`serialized_value_kept`). A scene or prefab that places the prefab and
+overrides the field (`PrefabInstance`, `m_Modifications`, `propertyPath`) is
+listed with the same finding.
 
 ### rustlyn-reach
 
@@ -144,7 +220,11 @@ The cone is walked backward from every place where own code names a sink:
 * who calls a member of the cone is in it, by the *slice* of the calling
   statement — the statement, the conditions it runs under, the conditions
   under which an earlier `return` leaves before it, and the statements that
-  give the locals those mention their values;
+  give the locals those mention their values. A call is any use that runs the
+  member, as for `rustlyn-blast`: an operator, a conversion, `m[i]`, `new()`,
+  `foreach`, `using`, `await`, `$"{m}"`. A property whose getter or setter has
+  code of its own is called by whoever reads or assigns it; the property is one
+  member, so its getter and its setter are not told apart in the cone;
 * a field, a property or an ECS component read on those lines is in it as
   data, and so is who writes it. Two systems that never call each other are
   linked by the component one sets and the other reads;
@@ -235,6 +315,23 @@ it surveys the folder's members and reports how many graphs could be built
 cleanly. `--expect` checks that a chain of nodes is present, which is useful in
 tests.
 
+The writes of a member are the places that assign it by name: `=`, `+=`, `??=`,
+`++`, a deconstruction, an object initializer, `with`, an `out` or `ref`
+argument — also through a receiver (`ref this.T`, `out o.T`) — a `ref` local
+that is another name for it (`ref int r = ref T; r = 5;`), the callers of a
+`ref`-returning member (`Slot() = 5`), `Interlocked.Exchange`/`CompareExchange`/
+`Add`/`And`/`Or` and `Volatile.Write`, the arguments of the callers of the
+primary constructor whose parameter a member is initialized from (`class
+C(int t) { public int T = t; }`), the same for a record's positional parameter
+(`record R(int V)` with `new R(4)`), and the assignments an indexer's setter is
+reached by (`this[0] = 5` for a `set { T = value; }`).
+
+"No writes were found by name" is an assertion about names. Where a reference to
+the place escapes into code the graph cannot follow — a method of an assembly it
+does not model, a delegate, a reference stored away — the node says that the
+value may be written through a reference there, and the list of writes is not
+empty.
+
 ```
 Wallet.balance [value] Shop.cs:5
    ← Wallet.Withdraw [code] Shop.cs:10  │ balance -= amount; — changes the old value
@@ -323,6 +420,16 @@ println!("{}", report.text());
 - Parts of `value` still work on UTF-16 text internally, which is why
   `Decl` and `Target` positions are UTF-16 columns, the same as
   `rustlyn-ide`'s `Location`.
+- A use no name stands for is found where the compiler binds it to the
+  member. Binding a body costs more than reading its text, so the search binds
+  only the bodies that hold a construct that can reach the member (`foreach`
+  and `using` for a `Dispose`, a `[` for an indexer, `new(` for a constructor)
+  and that mention a name that can bring them a value of the member's type, of
+  a type derived from it or of a base class of it: the type's name, or the
+  name of a member declared with such a type or taking one. A value that reaches a body by no such name
+  (a `dynamic`, a type argument inferred from a value the body gets from an
+  assembly) is not found. `ToString` is followed only where the static type
+  shows it, and `lock` only on a `System.Threading.Lock` the project declares.
 - `reach` reads a body by its text, not its flow: a slice takes every
   assignment to a local, before the statement or after it. It does not follow
   a value through a call's arguments into the callee, and a delegate stored

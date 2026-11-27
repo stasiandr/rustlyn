@@ -91,6 +91,10 @@ pub enum Unknown {
     LambdaParameter,
     /// A local whose value cannot be told.
     Local,
+    /// A reference to the place escapes into code the graph does not follow
+    /// (a method of an assembly, a returned `ref`, a delegate): the value
+    /// may be written there.
+    ThroughReference,
 }
 
 /// Why an expansion found nothing.
@@ -255,6 +259,9 @@ pub trait Wording {
             Unknown::NotRecognized => "the compiler did not recognize the name",
             Unknown::LambdaParameter => "lambda parameter",
             Unknown::Local => "a local — where its value comes from cannot be told",
+            Unknown::ThroughReference => {
+                "a reference to the place goes where the graph cannot follow: the value may be written through it here"
+            }
         }
         .to_owned()
     }
@@ -277,7 +284,7 @@ pub trait Wording {
                 "no calls were found — the engine or reflection calls the method".to_owned()
             }
             Failure::NoWrites => {
-                "no writes were found — the value is set in the declaration or through reflection"
+                "no writes were found by name — the value is set in the declaration, through reflection, or by code that only holds a reference to it"
                     .to_owned()
             }
         }

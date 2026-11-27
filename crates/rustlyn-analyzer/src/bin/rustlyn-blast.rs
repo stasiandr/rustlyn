@@ -107,17 +107,22 @@ fn run() -> Result<i32, String> {
         return Ok(0);
     }
     let root = setup::canonical_root(&root.unwrap_or_else(|| ".".to_owned()));
+    setup::existing_root(&root)?;
     let patch = match diff.as_deref() {
         Some("-") => {
-            let mut text = String::new();
+            let mut bytes = Vec::new();
             std::io::stdin()
-                .read_to_string(&mut text)
+                .read_to_end(&mut bytes)
                 .map_err(|e| e.to_string())?;
-            text
+            rustlyn_ide::document::decode_lines(&bytes)
         }
-        Some(path) => std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?,
+        Some(path) => {
+            let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+            rustlyn_ide::document::decode_lines(&bytes)
+        }
         None => setup::git_patch(&root, base.as_deref(), staged)?,
     };
+    setup::valid_patch(&patch)?;
     let mut phases = Vec::new();
     let folder = if cache {
         setup::cache_dir("rustlyn-blast", &root)

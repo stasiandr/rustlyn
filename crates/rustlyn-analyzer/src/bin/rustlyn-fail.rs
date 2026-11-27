@@ -43,7 +43,7 @@ fn main() {
         Path::new(&root).join(&file)
     };
     let file = std::fs::canonicalize(&file).unwrap_or(file);
-    let Ok(text) = std::fs::read_to_string(&file) else {
+    let Ok(text) = rustlyn_ide::document::read_source(&file) else {
         eprintln!("rustlyn-fail: cannot read {}", file.display());
         std::process::exit(2);
     };

@@ -32,6 +32,9 @@ pub(crate) mod ask;
 #[cfg(test)]
 pub(crate) mod testing;
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::HashMap;
 
 use rustlyn_ide::Session;

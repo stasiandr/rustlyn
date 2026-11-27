@@ -82,7 +82,7 @@ impl<'a> CompilerRisks<'a> {
                 let absolute = self.absolute(path);
                 let session = self.session;
                 let _ = ask(|| session.open(&absolute));
-                let Ok(text) = std::fs::read_to_string(&absolute) else {
+                let Ok(text) = rustlyn_ide::document::read_source(&absolute) else {
                     return Vec::new();
                 };
                 let keep = |d: &FileDiagnostic| d.severity == 3 || d.code.starts_with(THREADS);
@@ -294,7 +294,7 @@ fn failure_risk(root: &str, failure: &Failure) -> Risk {
         via: failure.chain.last().map(|step| step.callee.clone()),
     };
     let path = relative_to(root, &absolute(root, &failure.path));
-    let line = std::fs::read_to_string(Path::new(root).join(&path))
+    let line = rustlyn_ide::document::read_source(Path::new(root).join(&path))
         .ok()
         .map_or(0, |t| {
             let starts = line_starts(&t);

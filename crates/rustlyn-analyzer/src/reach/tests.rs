@@ -1176,3 +1176,99 @@ fn the_cone_lists_its_packages() {
         Some(vec!["com.vendor.ads".to_owned()])
     );
 }
+
+/// Members that run code the sink is called from, and the code that runs
+/// them without writing their names.
+const BOX: &str = "using System;
+using Vendor.Ads;
+namespace Game {
+    public class Box : IDisposable {
+        public Box() { Tracker.Start(); }
+        public int this[int i] { get { Tracker.Start(); return i; } set { Tracker.Stop(); } }
+        public static Box operator +(Box a, Box b) { Tracker.Send(\"add\"); return a; }
+        public static implicit operator int(Box b) { Tracker.Send(\"int\"); return 0; }
+        public override string ToString() { Tracker.Send(\"str\"); return \"\"; }
+        public void Dispose() { Tracker.Stop(); }
+        int _p;
+        public int P { get { return _p; } set { Tracker.SetConsent(true); } }
+        public int Plain() { return 1; }
+        public static Box operator -(Box a, Box b) { return a; }
+        public bool Cheap() { return true; }
+    }
+    public class Calls {
+        public Box NewTarget() { Box b = new(); return b; }
+        public int IndexRead(Box b) { return b[1]; }
+        public void IndexWrite(Box b) { b[1] = 2; }
+        public Box Add(Box a, Box c) { return a + c; }
+        public Box Sub(Box a, Box c) { return a - c; }
+        public int Conv(Box b) { int i = b; return i; }
+        public string Interp(Box b) { return $\"{b}\"; }
+        public void Using(Box b) { using (b) { } }
+        public void SetP(Box b) { b.P = 4; }
+        public void Init() { var b = new Box { P = 3 }; }
+        public int Plain(Box b) { return b.Plain(); }
+        public string Name() { return nameof(Box.Cheap); }
+        public Type Kind() { return typeof(Box); }
+    }
+}
+";
+
+/// A caller that runs a member of the cone through a construct — `new()`,
+/// `m[i]`, `a + b`, a conversion, `$"{m}"`, `using`, an assignment of a
+/// property whose setter has code — is on the way to the sink as much as
+/// one that names it; one that only names it in `nameof` or `typeof`, or
+/// that runs another operator, is not.
+#[test]
+fn a_construct_that_runs_a_member_of_the_cone_leads_to_the_sink() {
+    let project = project("constructs");
+    project.write("Game/Box.cs", BOX);
+    let report = run(&project, CONFIG, None);
+    let text = report.cone_text(true);
+    for name in [
+        "NewTarget()",
+        "IndexRead(Game.Box)",
+        "IndexWrite(Game.Box)",
+        "Add(Game.Box, Game.Box)",
+        "Conv(Game.Box)",
+        "Interp(Game.Box)",
+        "Using(Game.Box)",
+        "SetP(Game.Box)",
+        "Init()",
+    ] {
+        let found = role(&report, &format!("Game.Calls.{name}")).or_else(|| {
+            role(
+                &report,
+                &format!("Game.Calls.{}", name.replace("Game.Box", "Box")),
+            )
+        });
+        assert!(found.is_some(), "{name} is on the way: {text}");
+    }
+    for name in ["Sub", "Plain", "Name", "Kind"] {
+        assert!(
+            !report
+                .cone
+                .iter()
+                .any(|listed| listed.name.starts_with(&format!("Game.Calls.{name}("))),
+            "{name} is not on the way: {text}"
+        );
+    }
+}
+
+/// Two members written on one line are told apart: the change is to the one
+/// it is in, not to the class that holds both.
+#[test]
+fn members_on_one_line_are_judged_each() {
+    const ONE: &str = "using Vendor.Ads;\nnamespace Game {\n    public class One { void A() { Tracker.Start(); } void B() { int x = 1; } }\n}\n";
+    let project = project("one-line");
+    project.write("Game/One.cs", ONE);
+    let new = ONE.replace("int x = 1;", "int x = 2;");
+    project.write("Game/One.cs", &new);
+    let report = run(&project, CONFIG, Some(patch("Game/One.cs", ONE, &new)));
+    assert!(!report.affects(), "{}", report.text(true));
+    assert_eq!(report.unaffected, 1, "{}", report.text(true));
+    let new = ONE.replace("Tracker.Start();", "Tracker.Stop();");
+    project.write("Game/One.cs", &new);
+    let report = run(&project, CONFIG, Some(patch("Game/One.cs", ONE, &new)));
+    assert!(report.affects(), "{}", report.text(true));
+    assert_eq!(report.findings[0].name, "Game.One.A()");
+}

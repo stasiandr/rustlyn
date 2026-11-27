@@ -256,6 +256,44 @@ impl Document {
     }
 }
 
+/// A source file as the compiler reads it: a byte-order mark says UTF-8 or
+/// UTF-16, bytes that are not UTF-8 are taken as Latin-1 (what `csc` does),
+/// and a leading mark is not part of the text. Every offset the session
+/// answers in is an offset into this text, so whoever reads the file to
+/// look at what the session points at reads it here.
+///
+/// # Errors
+///
+/// When the file cannot be read.
+pub fn read_source(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    Ok(decode_source(&std::fs::read(path)?))
+}
+
+/// The text of source `bytes`, as [`read_source`] reads a file.
+#[must_use]
+pub fn decode_source(bytes: &[u8]) -> String {
+    decode(bytes).0
+}
+
+/// Text that holds sources — a patch, the output of `git show` — by line:
+/// each line is UTF-8 where it is and Latin-1 where it is not, which is how
+/// the lines of a file that is read as Latin-1 come out of a tool that
+/// prints the bytes it has.
+#[must_use]
+pub fn decode_lines(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    let mut text = String::with_capacity(bytes.len());
+    for line in bytes.split_inclusive(|&byte| byte == b'\n') {
+        match std::str::from_utf8(line) {
+            Ok(line) => text.push_str(line),
+            Err(_) => text.extend(line.iter().map(|&byte| char::from(byte))),
+        }
+    }
+    text
+}
+
 /// Turns bytes into text, and says how it read them.
 fn decode(bytes: &[u8]) -> (String, Encoding) {
     if let Some(rest) = bytes.strip_prefix(Encoding::Utf8Bom.mark()) {

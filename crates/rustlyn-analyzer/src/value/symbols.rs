@@ -198,7 +198,7 @@ impl IndexSymbols {
         if let Some(text) = texts.get(path) {
             return Some(text.clone());
         }
-        let text = Arc::new(std::fs::read_to_string(path).ok()?);
+        let text = Arc::new(rustlyn_ide::document::read_source(path).ok()?);
         texts.insert(path.to_path_buf(), text.clone());
         Some(text)
     }

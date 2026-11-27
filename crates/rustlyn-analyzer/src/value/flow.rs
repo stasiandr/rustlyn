@@ -1622,9 +1622,80 @@ pub fn is_out_argument(text: &[u16], name: R) -> bool {
     word(text, i) == "out"
 }
 
-/// `ref x` in a call: the method may overwrite the value.
+/// Where the chain `name` ends begins: `this.T`, `o.T` and `a.b.T` start at
+/// `this`, `o` and `a`; a name with no receiver starts where it is.
+#[must_use]
+pub fn chain_start(text: &[u16], name: usize) -> usize {
+    let mut start = name;
+    loop {
+        let mut i = skip_space_backward(text, start);
+        if i > 0 && text[i - 1] == DOT {
+            i -= 1;
+            // `a?.b`
+            if i > 0 && text[i - 1] == QUESTION {
+                i -= 1;
+            }
+        } else {
+            break;
+        }
+        let end = skip_space_backward(text, i);
+        let mut begin = end;
+        while begin > 0 && is_ident_part(text[begin - 1]) {
+            begin -= 1;
+        }
+        if !(begin < end && is_ident_start(text[begin])) {
+            break;
+        }
+        start = begin;
+    }
+    start
+}
+
+/// `ref x`, `ref this.x`, `ref o.x` in a call or a declaration: the place
+/// is passed on, and what it is passed to may overwrite the value.
 pub fn is_ref_argument(text: &[u16], name: R) -> bool {
-    word(text, skip_space_backward(text, name.location)) == "ref"
+    let start = chain_start(text, name.location);
+    word(text, skip_space_backward(text, start)) == "ref"
+}
+
+/// `ref int r = ref this.T;`, `r = ref T;`: the local `r` is another name
+/// for the place `name` is the end of a chain of, and what is written to
+/// `r` is written there.
+#[must_use]
+pub fn ref_alias(text: &[u16], name: R) -> Option<R> {
+    let start = chain_start(text, name.location);
+    let keyword = skip_space_backward(text, start);
+    if word(text, keyword) != "ref" {
+        return None;
+    }
+    let equals = skip_space_backward(text, keyword - 3);
+    if equals == 0 || text[equals - 1] != EQ {
+        return None;
+    }
+    // Not `==`, `!=`, `<=`, `>=`, `+=`…: a plain assignment or initializer.
+    if equals >= 2 && matches!(text[equals - 2], c if c == EQ || c == 0x21 || c == LT || c == GT) {
+        return None;
+    }
+    let end = skip_space_backward(text, equals - 1);
+    let alias = word(text, end);
+    if alias.is_empty() || !is_ident_start(text[end - alias.encode_utf16().count()]) {
+        return None;
+    }
+    let length = alias.encode_utf16().count();
+    Some(R::new(end - length, length))
+}
+
+/// `return ref x;` and `=> ref x`: the method hands out the place.
+#[must_use]
+pub fn is_ref_return(text: &[u16], name: R) -> bool {
+    let start = chain_start(text, name.location);
+    let keyword = skip_space_backward(text, start);
+    if word(text, keyword) != "ref" {
+        return false;
+    }
+    let before = skip_space_backward(text, keyword - 3);
+    word(text, before) == "return"
+        || (before >= 2 && text[before - 2] == EQ && text[before - 1] == GT)
 }
 
 /// A lambda parameter: `x => …`, `(a, b) => …`, `(int a) => …`.
