@@ -118,11 +118,22 @@ fn main() {
                 if verbose && failure.verdict != Verdict::Unknown {
                     let conditions: Vec<&str> =
                         failure.conditions.iter().map(|c| c.text.as_str()).collect();
+                    let line = std::fs::read_to_string(&failure.path)
+                        .map(|text| {
+                            text.as_bytes()
+                                .iter()
+                                .take(failure.span.start() as usize)
+                                .filter(|b| **b == b'\n')
+                                .count()
+                                + 1
+                        })
+                        .unwrap_or(0);
                     println!(
-                        "{}: {:?} {} when [{}]",
+                        "{}: {:?} {} at {}:{line} when [{}]",
                         found.member,
                         failure.verdict,
                         failure.exception,
+                        failure.path.display(),
                         conditions.join(" && ")
                     );
                     for input in &failure.inputs {

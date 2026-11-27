@@ -266,6 +266,31 @@ Wallet.Withdraw — places that can fail: 2, possible: 1
    amount = 15 — the only call in the project: Shop.cs:20:18
 ```
 
+What each verdict says:
+
+- **fails always, once it gets here** — every value the inputs can have leads
+  to the failure, and nothing on the way there is open. It is not given for a
+  failure behind a loop that may not run, a `catch` or a `catch` filter, a
+  statement above that may return or throw, a label a `goto` may reach, a
+  `goto case` into a `switch` section, or a call that runs a member a subtype
+  may replace.
+- **possible** — some values lead to it, and the way there may be closed.
+- **impossible** — no value the inputs can have makes the conditions hold
+  together. Two conditions on one input count together only for a value it has
+  at both: a write to a parameter, a local or a field between them, and for a
+  field a call, an `await`, a `yield` or a `lock`, make them about two values.
+- **unknown** — an input has no known value, or a condition is of a kind the
+  values cannot tell.
+
+A parameter has what every call in the project passes until the body writes to
+it (nothing is known of the parameters of a member that is virtual, implements
+an interface member or is used as a delegate: calls reach it without naming
+it); after that it has that or what the body gives it, and nothing is known
+after `+=`, `++`, `ref` or `out`. The `default` of a `switch` holds where no
+other label does; an arm of a `switch` expression, where its pattern matches
+and no arm before it did. A call of an `async` method that is not awaited does
+not throw, and a call of an iterator runs none of its body.
+
 ## Extending the analyses
 
 The engine knows C#, Unity and NuGet. It knows nothing about a particular
@@ -302,6 +327,13 @@ println!("{}", report.text());
   assignment to a local, before the statement or after it. It does not follow
   a value through a call's arguments into the callee, and a delegate stored
   in a field and invoked elsewhere is a read of the field, not a call.
+- `fail` takes the values a method is called with, and the values a field or
+  property is given, from the project's own code: a public method that code
+  outside the project calls, or a public field it sets, may get others, and
+  `impossible` is said of the project as it is.
+  A virtual or interface member's failures are not told from its overrides',
+  an exception that a `catch` rethrows is not followed out of it, and what an
+  iterator or a delegate runs is not followed.
 - Morpeh-style ECS stashes are recognised by `value::ecs` and `reach`. Other ECS frameworks
   need their own provider.
 - Unity source generators are not run, so members they add are invisible

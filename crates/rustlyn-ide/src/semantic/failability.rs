@@ -10,33 +10,72 @@
 //!    that may be zero, or a member of the project it calls that can fail in
 //!    turn — followed into, with its parameters standing for the arguments.
 //! 2. **When**: the conditions on the way there — the `if` around it, the
-//!    early `return` before it, the `&&`, `?:` and `??` it sits under.
+//!    early `return` before it, the `&&`, `?:` and `??` it sits under, the
+//!    `case` or arm of a `switch` (its `default` holds where no other label
+//!    does), a loop that may not run, a `catch` that runs only when the block
+//!    before it fails.
 //! 3. **Can it**: each condition is evaluated over the values its inputs can
-//!    have. A parameter has what every call in the project passes; a field
-//!    what its initializer and every assignment write (only the default,
-//!    when nothing does); a local what is assigned to it. Where all of them
-//!    are known, the conditions are tried for every combination, and the
-//!    failure is *never*, *always* or *possible*; where something is not
-//!    known, it is *unknown*, and the inputs say which one.
+//!    have. A parameter has what every call in the project passes, until the
+//!    body writes to it (nothing is known of a member that calls reach
+//!    without naming it: a virtual one, an implementation of an interface
+//!    member, one used as a delegate); after that it has that or what the
+//!    body gives it, and where a write is not followed (`+=`, `++`, `ref`,
+//!    `out`) nothing is known. A field has what its initializer and every
+//!    assignment write (only the default, when nothing does, and for a
+//!    struct's always the default too); a local what is assigned to it.
+//!    Where all of them are known, the conditions are tried for every
+//!    combination.
 //!
-//! The analysis is flow-insensitive about values — a field holds whatever
-//! any write gives it, at any time — which errs towards "possible", never
-//! towards "never".
+//! # What a verdict says
+//!
+//! - **Never**: no combination of values the inputs can have makes the
+//!   conditions hold together. Two conditions on one input hold together
+//!   only for a value it has at both: when something that can change it lies
+//!   between them (a write to it, a loop that writes it, a jump back to a
+//!   label, and for a field a call of code that may write it, an `await`, a
+//!   `yield`, a `lock`) they are about two values.
+//! - **Always**: every combination makes them hold, and nothing on the way is
+//!   open: not a loop that may not run, a statement above that may return or
+//!   throw, a label that a `goto` may reach, a `catch` or its filter, a `goto
+//!   case` into a `switch` section, nor a call whose member a subtype may
+//!   replace. The member fails whenever it gets there.
+//! - **Possible**: some combination holds, and the way there may be closed.
+//! - **Unknown**: an input has no known value, or a condition is of a kind
+//!   the values cannot tell. The failure's inputs say which.
+//!
+//! Something is asserted only where it is certain, so every doubt goes
+//! towards *possible* or *unknown*, never towards *never* or *always*.
+//!
+//! What a call does not do: a call of an `async` method that is not awaited
+//! does not throw — what it fails with is kept in its task — and a call of an
+//! iterator runs none of its body. A call that goes through the run-time
+//! type (a virtual, abstract or interface member, on a receiver whose exact
+//! type is not known) may run another body than the one it names, and what
+//! it fails with is unknown.
+//!
+//! The values of an input are those it can have at any time, over the whole
+//! project: a field holds whatever any write gives it. That errs towards
+//! *possible*; the order of events is followed only to tell which reads of
+//! one input can differ.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustlyn_semantics::{
-    BinaryOperator, BoundBody, BoundExpression, BoundExpressionKind as E, BoundPatternKind,
-    BoundStatement, BoundStatementKind as S, BoundSwitchLabel, ConstantValue, LocalId, MethodKind,
-    Modifiers, RefKind, SemanticModel, SpecialType, SymbolId, SymbolKind, Type, TypeKind,
-    UnaryOperator,
+    BinaryOperator, BoundBody, BoundExpression, BoundExpressionKind as E, BoundPattern,
+    BoundPatternKind as P, BoundStatement, BoundStatementKind as S, BoundSwitchLabel,
+    ConstantValue, LocalId, MethodKind, Modifiers, RefKind, SemanticModel, SpecialType, SymbolId,
+    SymbolKind, Type, TypeKind, UnaryOperator,
 };
 use rustlyn_syntax::{SyntaxKind, SyntaxNode};
 use rustlyn_text::TextSpan;
 
-use super::walk::{Visited, expression_children, walk_body, walk_statement};
+use super::walk::{
+    Visited, expression_children, pattern_expressions, statement_children, walk_body,
+    walk_statement,
+};
 use super::{Resolved, Semantic, View, contains_word, display_type};
 use crate::project::ProjectKind;
 
@@ -50,6 +89,34 @@ const MAX_VALUES: usize = 32;
 const MAX_COMBINATIONS: usize = 1024;
 /// Places kept per input, for showing where its values come from.
 const MAX_PLACES: usize = 8;
+
+/// Library namespaces whose members run nothing of the project's, given no
+/// delegate to call.
+const PURE_NAMESPACES: [&str; 3] = [
+    "System.Collections.Generic.",
+    "System.Text.",
+    "System.Globalization.",
+];
+/// Library types likewise.
+const PURE_TYPES: [&str; 17] = [
+    "System.String",
+    "System.Math",
+    "System.MathF",
+    "System.Char",
+    "System.Convert",
+    "System.Boolean",
+    "System.Byte",
+    "System.SByte",
+    "System.Int16",
+    "System.Int32",
+    "System.Int64",
+    "System.UInt16",
+    "System.UInt32",
+    "System.UInt64",
+    "System.Single",
+    "System.Double",
+    "System.Decimal",
+];
 
 // MARK: - what is reported
 
@@ -124,14 +191,19 @@ pub struct CallStep {
 /// Whether the failure can happen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Verdict {
-    /// Every value the inputs can have leads to it: the member fails
-    /// whenever it gets there.
+    /// Every value the inputs can have leads to it, and nothing on the way
+    /// there is open: the member fails whenever it gets there. Not given
+    /// for a failure behind a loop that may not run, a `catch`, a filter, a
+    /// statement above that may return, a label a `goto` may reach, or a
+    /// call whose member may be replaced by a subtype's.
     Always,
-    /// Some values lead to it.
+    /// Some values lead to it, and the way there may be closed.
     Possible,
-    /// None do: the conditions never hold together.
+    /// None do: the conditions never hold together, each read of an input
+    /// being of the value it has at that point.
     Never,
-    /// An input's values are not known.
+    /// An input's values are not known, or a condition is of a kind the
+    /// values cannot tell.
     Unknown,
 }
 
@@ -334,20 +406,96 @@ impl Tri {
             _ => Self::True,
         }
     }
+
+    const fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::True, _) | (_, Self::True) => Self::True,
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::Maybe, _) | (_, Self::Maybe) => Self::Maybe,
+            _ => Self::False,
+        }
+    }
+
+    const fn not(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            other => other,
+        }
+    }
 }
 
 // MARK: - the engine
+
+/// What a field is read through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Recv {
+    /// The current object, or a static field.
+    This,
+    Local(LocalId),
+    Param(SymbolId),
+    /// Another expression: two reads through it are told apart by where they
+    /// are written, so that what one of them knows is not taken for the other.
+    Other(u64),
+}
 
 /// Something a condition reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Atom {
     Param(SymbolId),
-    Field(SymbolId),
+    Field(SymbolId, Recv),
     Local(LocalId),
 }
 
-/// An atom in the frame it is read in.
-type Key = (usize, Atom);
+/// The version a read has when it is not tied to a place in the code: it
+/// stands for the atom at any time.
+const ANY: u32 = u32::MAX;
+
+/// An atom, in the frame it is read in, at a version: two reads of an atom
+/// with the same version see the same value, because nothing that can change
+/// it happened between them. A parameter at version `0` has what its callers
+/// pass; at any other, what a write may have made of it.
+type Key = (usize, Atom, u32);
+
+/// The versions of the atoms a condition reads, as they were where it was
+/// made; `None` for an expression that is read at any time.
+type Ver<'a> = Option<&'a HashMap<Atom, u32>>;
+
+fn version(ver: Ver<'_>, atom: &Atom) -> u32 {
+    ver.map_or(ANY, |versions| versions.get(atom).copied().unwrap_or(0))
+}
+
+/// The atom a field or property read is, through its receiver.
+fn field_atom(field: SymbolId, receiver: Option<&BoundExpression>) -> Atom {
+    let through = match receiver.map(strip) {
+        None => Recv::This,
+        Some(receiver) => match &receiver.kind {
+            E::This | E::Base | E::TypeExpression(_) | E::NamespaceExpression(_) => Recv::This,
+            E::Local(l) => Recv::Local(*l),
+            E::Parameter(p) => Recv::Param(*p),
+            _ => Recv::Other(
+                (u64::from(receiver.span.start()) << 32) | u64::from(receiver.span.end()),
+            ),
+        },
+    };
+    Atom::Field(field, through)
+}
+
+/// A variable of the body, or a field, that an expression is the place of.
+fn place_atom(target: &BoundExpression) -> Option<Atom> {
+    let target = strip(target);
+    match &target.kind {
+        E::Local(l) => Some(Atom::Local(*l)),
+        E::Parameter(p) => Some(Atom::Param(*p)),
+        E::Field {
+            receiver, field, ..
+        } => Some(field_atom(*field, receiver.as_deref())),
+        E::Property {
+            receiver, property, ..
+        } => Some(field_atom(*property, receiver.as_deref())),
+        _ => None,
+    }
+}
 
 /// One bound body being looked at: the member asked about, a member called
 /// on the way, or a caller whose arguments are being evaluated.
@@ -356,6 +504,9 @@ struct Frame {
     body: Arc<BoundBody>,
     /// The member the body is of.
     member: Option<SymbolId>,
+    /// Where the walk starts, when that is a local function of the body
+    /// rather than the body itself: its place in the body's list.
+    local_function: Option<usize>,
     /// What the parameters are where a call on the way said: the argument
     /// it passed. A parameter not here has what its callers pass.
     arguments: HashMap<SymbolId, (Abs, Input)>,
@@ -376,9 +527,49 @@ enum Test {
     OutOfRange(BoundExpression, BoundExpression),
     /// That the string parses as the number type.
     Parses(BoundExpression, SpecialType),
+    /// That the value matches one of these labels of a `switch`: each a
+    /// pattern, and the `when` that has to hold with it.
+    Matches(BoundExpression, Arc<Vec<Label>>, Range<usize>),
     /// Something the values cannot tell, said in words: "the sequence is
-    /// empty".
+    /// empty". Whether it holds is not known.
     Opaque(String),
+    /// A way in that may be closed, said in words: "the loop above does not
+    /// return". It may hold and may not, and a failure behind it is at most
+    /// possible, never certain.
+    Reach(String),
+    /// That the filter of a `catch` holds. A filter whose value is not
+    /// known may hold or not.
+    Filter(BoundExpression),
+}
+
+/// A `case` of a switch statement or an arm of a switch expression.
+#[derive(Clone, Debug)]
+struct Label {
+    pattern: BoundPattern,
+    when: Option<BoundExpression>,
+}
+
+impl Test {
+    /// The expressions the test reads.
+    fn expressions(&self) -> Vec<&BoundExpression> {
+        match self {
+            Self::Truth(e)
+            | Self::Null(e)
+            | Self::Zero(e)
+            | Self::Parses(e, _)
+            | Self::Filter(e) => vec![e],
+            Self::Equals(a, b) | Self::OutOfRange(a, b) => vec![a, b],
+            Self::Matches(governing, labels, range) => {
+                let mut found = vec![governing];
+                for label in &labels[range.clone()] {
+                    pattern_expressions(&label.pattern, &mut found);
+                    found.extend(&label.when);
+                }
+                found
+            }
+            Self::Opaque(_) | Self::Reach(_) => Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -388,6 +579,9 @@ struct Cond {
     /// Whether the test holds on the way, or its opposite does.
     holds: bool,
     span: TextSpan,
+    /// The version of each atom the test reads, as it was where the
+    /// condition was made.
+    versions: Arc<HashMap<Atom, u32>>,
 }
 
 /// A failure as found, before its verdict.
@@ -419,6 +613,26 @@ struct Engine<'s> {
     caller_depth: usize,
     /// The calls of each member, found once.
     sites: HashMap<SymbolId, Arc<Vec<Site>>>,
+    /// What each body writes, by the body's address.
+    scans: HashMap<usize, Arc<Scan>>,
+    /// Whether each property is `{ get; set; }` with no bodies.
+    auto_properties: HashMap<SymbolId, bool>,
+    /// Whether calling a member runs code of the project's, apart from
+    /// what it is handed.
+    runs: HashMap<SymbolId, bool>,
+}
+
+/// The variables a body writes, found once for all that ask.
+#[derive(Default)]
+struct Scan {
+    /// What each variable is given where a write names the value.
+    assigned: HashMap<Atom, Vec<BoundExpression>>,
+    /// Variables written in ways whose value is not tracked: `+=`, `++`,
+    /// `ref` and `out`, a pattern, a `foreach`.
+    opaque: HashSet<Atom>,
+    /// Variables a lambda or a local function writes: they change whenever
+    /// that code runs, which is whenever anything is called.
+    closure: HashSet<Atom>,
 }
 
 impl Semantic {
@@ -437,7 +651,7 @@ impl Semantic {
             || "<body>".to_owned(),
             |member| self.compilation.symbols().qualified_name(member),
         );
-        let frame = engine.push_frame(tree, body, member, HashMap::new());
+        let frame = engine.push_frame(tree, body, member, None, HashMap::new());
         let mut found = Vec::new();
         let mut stack = member.into_iter().collect::<Vec<_>>();
         engine.collect(frame, &[], &[], &mut stack, &mut found);
@@ -487,6 +701,9 @@ impl<'s> Engine<'s> {
             evaluating_params: HashSet::new(),
             caller_depth: 0,
             sites: HashMap::new(),
+            scans: HashMap::new(),
+            auto_properties: HashMap::new(),
+            runs: HashMap::new(),
         }
     }
 
@@ -528,12 +745,14 @@ impl<'s> Engine<'s> {
         tree: usize,
         body: Arc<BoundBody>,
         member: Option<SymbolId>,
+        local_function: Option<usize>,
         arguments: HashMap<SymbolId, (Abs, Input)>,
     ) -> usize {
         self.frames.push(Frame {
             tree,
             body,
             member,
+            local_function,
             arguments,
         });
         self.frames.len() - 1
@@ -566,8 +785,30 @@ impl<'s> Engine<'s> {
     /// Whether a property is `{ get; set; }` with no bodies: a field
     /// under another name, whose values are what is written to it.
     fn is_auto_property(&mut self, property: SymbolId) -> bool {
-        let symbol = self.semantic.compilation.symbols().get(property);
+        if let Some(&known) = self.auto_properties.get(&property) {
+            return known;
+        }
+        let found = self.find_auto_property(property);
+        self.auto_properties.insert(property, found);
+        found
+    }
+
+    fn find_auto_property(&mut self, property: SymbolId) -> bool {
+        let symbols = self.semantic.compilation.symbols();
+        let symbol = symbols.get(property);
         if symbol.kind != SymbolKind::Property || !in_project(self.semantic, property) {
+            return false;
+        }
+        // What an abstract, virtual or interface property gives is what a
+        // subtype's member gives, not what is written to this one.
+        let in_interface = symbol
+            .container
+            .is_some_and(|c| symbols.get(c).type_kind() == Some(TypeKind::Interface));
+        if in_interface
+            || symbol.modifiers.contains(Modifiers::ABSTRACT)
+            || symbol.modifiers.contains(Modifiers::VIRTUAL)
+            || symbol.modifiers.contains(Modifiers::OVERRIDE)
+        {
             return false;
         }
         let Some(location) = symbol.locations.first().copied() else {
@@ -663,6 +904,26 @@ impl<'s> Engine<'s> {
         found: &mut Vec<Found>,
     ) {
         let body = self.frames[frame].body.clone();
+        let local_function = self.frames[frame].local_function;
+        let scan = self.scan(frame);
+        let symbols = self.semantic.compilation.symbols();
+        let by_ref = self.frames[frame]
+            .member
+            .and_then(|member| symbols.get(member).as_method())
+            .map(|method| {
+                method
+                    .parameters
+                    .iter()
+                    .copied()
+                    .filter(|p| {
+                        symbols
+                            .get(*p)
+                            .as_parameter()
+                            .is_some_and(|detail| detail.ref_kind != RefKind::None)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut walker = Walker {
             engine: self,
             frame,
@@ -670,11 +931,232 @@ impl<'s> Engine<'s> {
             stack,
             found: Vec::new(),
             catches: Vec::new(),
+            state: State::default(),
+            scan,
+            by_ref,
+            awaited: HashSet::new(),
         };
         let mut conds = conditions.to_vec();
-        walker.statements(&body.statements, &mut conds);
+        match local_function {
+            Some(at) => {
+                walker.statement(&body.local_functions[at].body, &mut conds);
+            }
+            None => {
+                walker.statements(&body.statements, &mut conds);
+            }
+        }
         let mine = std::mem::take(&mut walker.found);
         found.extend(mine);
+    }
+
+    // MARK: what code changes
+
+    /// Whether a field can change while the body runs: any but a constant
+    /// or a `readonly` one.
+    fn volatile_field(&self, field: SymbolId) -> bool {
+        let modifiers = self.semantic.compilation.symbols().get(field).modifiers;
+        !(modifiers.contains(Modifiers::READONLY) || modifiers.contains(Modifiers::CONST))
+    }
+
+    /// Whether calling a member runs code that may write any field. A
+    /// member of the project does; so does what is handed a delegate to call.
+    /// The library's own collections, strings and numbers run nothing of the
+    /// project's.
+    fn runs_code(
+        &mut self,
+        method: SymbolId,
+        receiver: Option<&BoundExpression>,
+        arguments: &[BoundExpression],
+    ) -> bool {
+        let semantic = self.semantic;
+        let own = match self.runs.get(&method) {
+            Some(&own) => own,
+            None => {
+                let symbols = semantic.compilation.symbols();
+                let container = symbols
+                    .get(method)
+                    .container
+                    .map(|c| symbols.qualified_name(c))
+                    .unwrap_or_default();
+                let own = in_project(semantic, method)
+                    || !(PURE_NAMESPACES.iter().any(|ns| container.starts_with(ns))
+                        || PURE_TYPES.contains(&container.as_str()));
+                self.runs.insert(method, own);
+                own
+            }
+        };
+        if own {
+            // `n.ToString()` is the number's, whichever type declares it.
+            let symbols = semantic.compilation.symbols();
+            let primitive = !in_project(semantic, method)
+                && receiver.map(strip).is_some_and(|r| match &r.ty {
+                    Type::Named { symbol, .. } => {
+                        PURE_TYPES.contains(&symbols.qualified_name(*symbol).as_str())
+                    }
+                    _ => false,
+                });
+            if !primitive {
+                return true;
+            }
+        }
+        let callback = |e: &BoundExpression| {
+            let e = strip(e);
+            matches!(
+                e.kind,
+                E::Lambda(_)
+                    | E::UnboundLambda(_)
+                    | E::MethodGroup { .. }
+                    | E::DelegateCreation { .. }
+            ) || is_delegate(semantic, &e.ty)
+        };
+        receiver.into_iter().chain(arguments).any(callback)
+    }
+
+    /// What writing to a place changes.
+    fn written_place(&mut self, target: &BoundExpression, out: &mut Effects) {
+        let target = strip(target);
+        match &target.kind {
+            E::Local(l) => {
+                out.written.insert(Atom::Local(*l));
+            }
+            E::Parameter(p) => {
+                out.written.insert(Atom::Param(*p));
+            }
+            E::Field { field, .. } => {
+                out.fields.insert(*field);
+            }
+            E::Property { property, receiver } => {
+                if self.is_auto_property(*property) {
+                    out.fields.insert(*property);
+                } else if self.runs_code(*property, receiver.as_deref(), &[]) {
+                    out.havoc = true;
+                }
+            }
+            E::IndexerAccess {
+                indexer,
+                receiver,
+                arguments,
+            } if self.runs_code(*indexer, Some(receiver), arguments) => {
+                out.havoc = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// What an expression changes, apart from what the expressions it holds
+    /// do.
+    fn node_effects(&mut self, e: &BoundExpression, out: &mut Effects) {
+        match &e.kind {
+            E::Assignment { target, .. } | E::CompoundAssignment { target, .. } => {
+                self.written_place(target, out);
+            }
+            E::Increment { target, method, .. } => {
+                self.written_place(target, out);
+                out.havoc |= method.is_some();
+            }
+            E::RefArgument { kind, operand } if *kind != RefKind::In => {
+                self.written_place(operand, out);
+            }
+            E::AddressOf { operand } | E::MakeRef(operand) => self.written_place(operand, out),
+            E::Call {
+                method,
+                receiver,
+                arguments,
+                ..
+            } => {
+                out.havoc |= self.runs_code(*method, receiver.as_deref(), arguments);
+            }
+            E::ObjectCreation {
+                constructor,
+                arguments,
+                ..
+            } => {
+                out.havoc |= constructor.is_none_or(|c| self.runs_code(c, None, arguments));
+            }
+            E::Property { property, receiver } => {
+                if !self.is_auto_property(*property) {
+                    out.havoc |= self.runs_code(*property, receiver.as_deref(), &[]);
+                }
+            }
+            E::IndexerAccess {
+                indexer,
+                receiver,
+                arguments,
+            } => {
+                out.havoc |= self.runs_code(*indexer, Some(receiver), arguments);
+            }
+            E::Await { .. }
+            | E::EventAssignment { .. }
+            | E::Dynamic(_)
+            | E::FunctionPointerCall { .. }
+            | E::With { .. } => out.havoc = true,
+            E::IsPattern { pattern, .. } => self.pattern_effects(pattern, out),
+            E::Switch { arms, .. } => {
+                for arm in arms {
+                    self.pattern_effects(&arm.pattern, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The locals a pattern gives a value.
+    fn pattern_effects(&self, pattern: &BoundPattern, out: &mut Effects) {
+        let mut declared = Vec::new();
+        pattern_locals(pattern, &mut declared);
+        out.written.extend(declared.into_iter().map(Atom::Local));
+    }
+
+    /// Everything an expression changes, in the expressions it holds too,
+    /// but not in a lambda it makes.
+    fn effects_of(&mut self, e: &BoundExpression, out: &mut Effects) {
+        self.node_effects(e, out);
+        for child in expression_children(e) {
+            self.effects_of(child, out);
+        }
+    }
+
+    /// Everything a statement changes, lambdas it makes included: they may
+    /// run in it.
+    fn statement_effects(&mut self, frame: usize, statement: &BoundStatement, out: &mut Effects) {
+        let body = self.frames[frame].body.clone();
+        walk_statement(&body, statement, &mut |visited| match visited {
+            Visited::Expression(e) => self.node_effects(e, out),
+            Visited::Statement(s) => match &s.kind {
+                S::LocalDeclaration { local, .. } => {
+                    out.written.insert(Atom::Local(*local));
+                }
+                S::ForEach { local, .. } => {
+                    out.written.insert(Atom::Local(*local));
+                    out.havoc = true;
+                }
+                S::Using { resources, .. } => {
+                    out.written
+                        .extend(resources.iter().map(|r| Atom::Local(r.local)));
+                    out.havoc = true;
+                }
+                S::Lock { .. } | S::YieldReturn(_) | S::ConstructorInitializer { .. } => {
+                    out.havoc = true;
+                }
+                S::Try { catches, .. } => {
+                    out.written
+                        .extend(catches.iter().filter_map(|c| c.local).map(Atom::Local));
+                    for filter in catches.iter().filter_map(|c| c.filter.as_ref()) {
+                        self.effects_of(filter, out);
+                    }
+                }
+                S::Switch { sections, .. } => {
+                    for section in sections {
+                        for label in &section.labels {
+                            if let BoundSwitchLabel::Case(case) = label {
+                                self.pattern_effects(&case.pattern, out);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+        });
     }
 
     // MARK: judging
@@ -683,21 +1165,14 @@ impl<'s> Engine<'s> {
         // The atoms the conditions read, and what each can be.
         let mut keys: Vec<Key> = Vec::new();
         for cond in &found.conditions {
-            let mut add = |expression: &BoundExpression| {
+            for expression in cond.test.expressions() {
                 atoms_of(expression, &mut |atom| {
-                    let key = (cond.frame, atom);
+                    let at = cond.versions.get(&atom).copied().unwrap_or(0);
+                    let key = (cond.frame, atom, at);
                     if !keys.contains(&key) {
                         keys.push(key);
                     }
                 });
-            };
-            match &cond.test {
-                Test::Truth(e) | Test::Null(e) | Test::Zero(e) | Test::Parses(e, _) => add(e),
-                Test::Equals(a, b) | Test::OutOfRange(a, b) => {
-                    add(a);
-                    add(b);
-                }
-                Test::Opaque(_) => {}
             }
         }
         let mut known: Vec<(Key, Vec<Val>)> = Vec::new();
@@ -792,24 +1267,27 @@ impl<'s> Engine<'s> {
     }
 
     fn test(&mut self, cond: &Cond, assignment: &HashMap<Key, Val>) -> Tri {
+        let versions = cond.versions.clone();
+        let at = Some(&*versions);
+        let frame = cond.frame;
         let value = match &cond.test {
-            Test::Truth(e) => self.eval(cond.frame, e, assignment),
+            Test::Truth(e) => self.eval(frame, e, assignment, at),
             Test::Null(e) => {
-                let v = self.eval(cond.frame, e, assignment);
+                let v = self.eval(frame, e, assignment, at);
                 v.map(&|v| Some(Val::Bool(*v == Val::Null)))
             }
             Test::Zero(e) => {
-                let v = self.eval(cond.frame, e, assignment);
+                let v = self.eval(frame, e, assignment, at);
                 v.map(&|v| v.number().map(|n| Val::Bool(n == 0.0)))
             }
             Test::Equals(a, b) => {
-                let a = self.eval(cond.frame, a, assignment);
-                let b = self.eval(cond.frame, b, assignment);
+                let a = self.eval(frame, a, assignment, at);
+                let b = self.eval(frame, b, assignment, at);
                 a.map2(&b, &|x, y| equal(x, y).map(Val::Bool))
             }
             Test::OutOfRange(array, index) => {
-                let array = self.eval(cond.frame, array, assignment);
-                let index = self.eval(cond.frame, index, assignment);
+                let array = self.eval(frame, array, assignment, at);
+                let index = self.eval(frame, index, assignment, at);
                 array.map2(&index, &|a, i| match (a, i.integer()?) {
                     (Val::Array(length), i) => {
                         Some(Val::Bool(i < 0 || i >= i128::try_from(*length).ok()?))
@@ -818,7 +1296,7 @@ impl<'s> Engine<'s> {
                 })
             }
             Test::Parses(text, special) => {
-                let text = self.eval(cond.frame, text, assignment);
+                let text = self.eval(frame, text, assignment, at);
                 let special = *special;
                 text.map(&|v| match v {
                     Val::Str(s) => Some(Val::Bool(parses(s, special))),
@@ -826,17 +1304,151 @@ impl<'s> Engine<'s> {
                     _ => None,
                 })
             }
+            Test::Matches(governing, labels, range) => {
+                self.matches(frame, governing, &labels[range.clone()], assignment, at)
+            }
             Test::Opaque(_) => Abs::Top,
+            Test::Reach(_) => Abs::Set(vec![Val::Bool(true), Val::Bool(false)]),
+            Test::Filter(e) => match self.eval(frame, e, assignment, at) {
+                value if value.truth() == Tri::Unknown => {
+                    Abs::Set(vec![Val::Bool(true), Val::Bool(false)])
+                }
+                value => value,
+            },
         };
         let truth = value.truth();
-        if cond.holds {
-            truth
-        } else {
-            match truth {
-                Tri::True => Tri::False,
-                Tri::False => Tri::True,
-                other => other,
+        if cond.holds { truth } else { truth.not() }
+    }
+
+    /// Whether the governing value matches one of the labels, for each value
+    /// it can have.
+    fn matches(
+        &mut self,
+        frame: usize,
+        governing: &BoundExpression,
+        labels: &[Label],
+        assignment: &HashMap<Key, Val>,
+        at: Ver<'_>,
+    ) -> Abs {
+        let Abs::Set(values) = self.eval(frame, governing, assignment, at) else {
+            return Abs::Top;
+        };
+        let mut out = Abs::Set(Vec::new());
+        for value in &values {
+            let mut any = Tri::False;
+            for label in labels {
+                let mut matched =
+                    self.pattern(frame, value, &label.pattern, governing, assignment, at);
+                if matched != Tri::False
+                    && let Some(when) = &label.when
+                {
+                    matched = matched.and(self.eval(frame, when, assignment, at).truth());
+                }
+                any = any.or(matched);
+                if any == Tri::True {
+                    break;
+                }
             }
+            out = match any {
+                Tri::True => out.union(Abs::one(Val::Bool(true))),
+                Tri::False => out.union(Abs::one(Val::Bool(false))),
+                Tri::Maybe => out
+                    .union(Abs::one(Val::Bool(true)))
+                    .union(Abs::one(Val::Bool(false))),
+                Tri::Unknown => return Abs::Top,
+            };
+        }
+        out
+    }
+
+    /// Whether a value matches a pattern, where that can be told from the
+    /// value alone.
+    fn pattern(
+        &mut self,
+        frame: usize,
+        value: &Val,
+        pattern: &BoundPattern,
+        governing: &BoundExpression,
+        assignment: &HashMap<Key, Val>,
+        at: Ver<'_>,
+    ) -> Tri {
+        let single =
+            |this: &mut Self, e: &BoundExpression| match this.eval(frame, e, assignment, at) {
+                Abs::Set(values) if values.len() == 1 => values.into_iter().next(),
+                _ => None,
+            };
+        match &pattern.kind {
+            P::Discard | P::Var { .. } => Tri::True,
+            P::Constant(constant) => single(self, constant)
+                .and_then(|constant| equal(value, &constant))
+                .map_or(
+                    Tri::Unknown,
+                    |same| if same { Tri::True } else { Tri::False },
+                ),
+            P::Relational {
+                operator,
+                value: bound,
+            } => {
+                // `null` is neither above nor below anything.
+                if *value == Val::Null {
+                    return Tri::False;
+                }
+                let (Some(bound), Some(value)) =
+                    (single(self, bound).and_then(|b| b.number()), value.number())
+                else {
+                    return Tri::Unknown;
+                };
+                let holds = match operator {
+                    BinaryOperator::LessThan => value < bound,
+                    BinaryOperator::GreaterThan => value > bound,
+                    BinaryOperator::LessThanOrEqual => value <= bound,
+                    BinaryOperator::GreaterThanOrEqual => value >= bound,
+                    _ => return Tri::Unknown,
+                };
+                if holds { Tri::True } else { Tri::False }
+            }
+            // A type test fails for null; for anything else it is only known
+            // where the type tested is the type the value already has.
+            P::Type(ty) | P::Declaration { ty, .. } => {
+                if *value == Val::Null {
+                    Tri::False
+                } else if governing.ty == *ty {
+                    Tri::True
+                } else {
+                    Tri::Unknown
+                }
+            }
+            P::Not(inner) => self
+                .pattern(frame, value, inner, governing, assignment, at)
+                .not(),
+            P::And(a, b) => {
+                let a = self.pattern(frame, value, a, governing, assignment, at);
+                if a == Tri::False {
+                    return Tri::False;
+                }
+                a.and(self.pattern(frame, value, b, governing, assignment, at))
+            }
+            P::Or(a, b) => {
+                let a = self.pattern(frame, value, a, governing, assignment, at);
+                if a == Tri::True {
+                    return Tri::True;
+                }
+                a.or(self.pattern(frame, value, b, governing, assignment, at))
+            }
+            // `{ }`: anything that is not null.
+            P::Recursive(recursive)
+                if recursive.ty.is_none()
+                    && recursive.properties.is_empty()
+                    && recursive.positional.is_empty()
+                    && recursive.deconstruct.is_none() =>
+            {
+                if *value == Val::Null {
+                    Tri::False
+                } else {
+                    Tri::True
+                }
+            }
+            _ => Tri::Unknown,
         }
     }
 
@@ -844,8 +1456,8 @@ impl<'s> Engine<'s> {
         let tree = self.frames[cond.frame].tree;
         let text_of = |e: &BoundExpression| self.text(tree, e.span);
         let text = match (&cond.test, cond.holds) {
-            (Test::Truth(e), true) => text_of(e),
-            (Test::Truth(e), false) => negated(e, &text_of),
+            (Test::Truth(e) | Test::Filter(e), true) => text_of(e),
+            (Test::Truth(e) | Test::Filter(e), false) => negated(e, &text_of),
             (Test::Null(e), holds) => {
                 format!("{} {} null", text_of(e), if holds { "==" } else { "!=" })
             }
@@ -871,7 +1483,46 @@ impl<'s> Engine<'s> {
                     if holds { "" } else { " not" }
                 )
             }
-            (Test::Opaque(words), _) => words.clone(),
+            (Test::Matches(governing, labels, range), holds) => {
+                let governing = text_of(governing);
+                let labels = &labels[range.clone()];
+                let patterns: Vec<String> = labels
+                    .iter()
+                    .map(|label| {
+                        // `case 1:`, `case int n when n > 5:` and `1` all
+                        // name the pattern alone.
+                        let text = self.text(tree, label.pattern.span);
+                        let text = text.strip_prefix("case ").unwrap_or(&text);
+                        let text = text.split(" when ").next().unwrap_or(text);
+                        text.trim_end_matches(':').trim().to_owned()
+                    })
+                    .collect();
+                if labels.iter().any(|label| label.when.is_some()) {
+                    let each: Vec<String> = labels
+                        .iter()
+                        .zip(&patterns)
+                        .map(|(label, pattern)| match &label.when {
+                            Some(when) => {
+                                format!("{governing} is {pattern} && {}", text_of(when))
+                            }
+                            None => format!("{governing} is {pattern}"),
+                        })
+                        .collect();
+                    let any = each
+                        .iter()
+                        .map(|one| format!("({one})"))
+                        .collect::<Vec<_>>()
+                        .join(" || ");
+                    if holds { any } else { format!("!({any})") }
+                } else if holds {
+                    format!("{governing} is {}", patterns.join(" or "))
+                } else if let [one] = patterns.as_slice() {
+                    format!("{governing} is not {one}")
+                } else {
+                    format!("{governing} is not ({})", patterns.join(" or "))
+                }
+            }
+            (Test::Opaque(words) | Test::Reach(words), _) => words.clone(),
         };
         Condition {
             text,
@@ -882,55 +1533,73 @@ impl<'s> Engine<'s> {
 
     // MARK: evaluating
 
-    fn eval(&mut self, frame: usize, e: &BoundExpression, assignment: &HashMap<Key, Val>) -> Abs {
+    fn eval(
+        &mut self,
+        frame: usize,
+        e: &BoundExpression,
+        assignment: &HashMap<Key, Val>,
+        at: Ver<'_>,
+    ) -> Abs {
         match &e.kind {
             E::Literal(value) => Abs::one(Val::from_constant(value)),
-            E::Parameter(p) => self.read((frame, Atom::Param(*p)), assignment),
-            E::Local(l) => self.read((frame, Atom::Local(*l)), assignment),
-            E::Field { field, .. } => {
+            E::Parameter(p) => {
+                let atom = Atom::Param(*p);
+                self.read((frame, atom, version(at, &atom)), assignment)
+            }
+            E::Local(l) => {
+                let atom = Atom::Local(*l);
+                self.read((frame, atom, version(at, &atom)), assignment)
+            }
+            E::Field { field, receiver } => {
                 if let Some(constant) = self.constant(*field) {
                     return Abs::one(constant);
                 }
-                self.read((frame, Atom::Field(*field)), assignment)
+                let atom = field_atom(*field, receiver.as_deref());
+                self.read((frame, atom, version(at, &atom)), assignment)
             }
             E::Default(ty) => self.default_of(frame, ty).map_or(Abs::Top, Abs::one),
             E::Conversion { operand, .. } => {
-                let value = self.eval(frame, operand, assignment);
+                let value = self.eval(frame, operand, assignment, at);
                 let special = self.special(frame, &e.ty);
-                value.map(&|v| convert(v, special))
+                value.map(&|v| convert(v, special).filter(|v| fits(special, v)))
             }
             E::Unary { operator, operand } => {
-                let value = self.eval(frame, operand, assignment);
+                let value = self.eval(frame, operand, assignment, at);
                 let operator = *operator;
-                value.map(&|v| unary(operator, v))
+                let special = self.special(frame, &e.ty);
+                value.map(&|v| unary(operator, v).filter(|v| fits(special, v)))
             }
             E::Binary {
                 operator,
                 left,
                 right,
             } => {
-                let left = self.eval(frame, left, assignment);
+                let left = self.eval(frame, left, assignment, at);
                 // `a && b` with `a` false is false, whatever `b` would be.
                 match (operator, left.truth()) {
                     (BinaryOperator::LogicalAnd, Tri::False) => return Abs::one(Val::Bool(false)),
                     (BinaryOperator::LogicalOr, Tri::True) => return Abs::one(Val::Bool(true)),
                     _ => {}
                 }
-                let right = self.eval(frame, right, assignment);
+                let right = self.eval(frame, right, assignment, at);
                 let operator = *operator;
-                let integral = self.special(frame, &e.ty).is_some_and(is_integral);
-                left.map2(&right, &|a, b| binary(operator, a, b, integral))
+                let special = self.special(frame, &e.ty);
+                let integral = special.is_some_and(is_integral);
+                // A result the type cannot hold wraps, or throws: not known.
+                left.map2(&right, &|a, b| {
+                    binary(operator, a, b, integral).filter(|v| fits(special, v))
+                })
             }
             E::Conditional {
                 condition,
                 consequence,
                 alternative,
-            } => match self.eval(frame, condition, assignment).truth() {
-                Tri::True => self.eval(frame, consequence, assignment),
-                Tri::False => self.eval(frame, alternative, assignment),
+            } => match self.eval(frame, condition, assignment, at).truth() {
+                Tri::True => self.eval(frame, consequence, assignment, at),
+                Tri::False => self.eval(frame, alternative, assignment, at),
                 _ => {
-                    let a = self.eval(frame, consequence, assignment);
-                    let b = self.eval(frame, alternative, assignment);
+                    let a = self.eval(frame, consequence, assignment, at);
+                    let b = self.eval(frame, alternative, assignment, at);
                     a.union(b)
                 }
             },
@@ -938,14 +1607,14 @@ impl<'s> Engine<'s> {
                 lengths, elements, ..
             } => match lengths.as_slice() {
                 [] => Abs::one(Val::Array(elements.len())),
-                [length] => self.eval(frame, length, assignment).map(&|v| {
+                [length] => self.eval(frame, length, assignment, at).map(&|v| {
                     v.integer()
                         .and_then(|n| usize::try_from(n).ok())
                         .map(Val::Array)
                 }),
                 _ => Abs::one(Val::Object),
             },
-            E::ArrayLength { array } => self.eval(frame, array, assignment).map(&|v| match v {
+            E::ArrayLength { array } => self.eval(frame, array, assignment, at).map(&|v| match v {
                 Val::Array(length) => i128::try_from(*length).ok().map(Val::Int),
                 _ => None,
             }),
@@ -954,8 +1623,9 @@ impl<'s> Engine<'s> {
             | E::Lambda(_)
             | E::DelegateCreation { .. }
             | E::InterpolatedString(_) => Abs::one(Val::Object),
-            E::Property { property, .. } if self.is_auto_property(*property) => {
-                self.read((frame, Atom::Field(*property)), assignment)
+            E::Property { property, receiver } if self.is_auto_property(*property) => {
+                let atom = field_atom(*property, receiver.as_deref());
+                self.read((frame, atom, version(at, &atom)), assignment)
             }
             _ => Abs::Top,
         }
@@ -970,6 +1640,14 @@ impl<'s> Engine<'s> {
 
     /// What an atom can be, and how that was found.
     fn atom(&mut self, key: Key) -> (Abs, Input) {
+        // What a value is does not depend on the receiver a field is read
+        // through, nor on which version of a variable, beyond whether a
+        // parameter has been written.
+        let key = match key.1 {
+            Atom::Param(_) => (key.0, key.1, u32::from(key.2 != 0)),
+            Atom::Field(field, _) => (key.0, Atom::Field(field, Recv::This), 0),
+            Atom::Local(_) => (key.0, key.1, 0),
+        };
         if let Some(found) = self.atoms.get(&key) {
             return found.clone();
         }
@@ -977,21 +1655,28 @@ impl<'s> Engine<'s> {
             let name = self.atom_name(key);
             return (Abs::Top, unknown_input(name));
         }
-        let (frame, atom) = key;
+        let (frame, atom, written) = key;
         let found = match atom {
-            Atom::Param(p) => match self.frames[frame].arguments.get(&p) {
-                Some(found) => found.clone(),
-                None => self.parameter(frame, p),
-            },
+            Atom::Param(p) => {
+                let entry = match self.frames[frame].arguments.get(&p) {
+                    Some(found) => found.clone(),
+                    None => self.parameter(frame, p),
+                };
+                if written == 0 {
+                    entry
+                } else {
+                    self.written_parameter(frame, p, entry)
+                }
+            }
             // A property with a body computes what it gives: not an atom.
-            Atom::Field(f)
+            Atom::Field(f, _)
                 if self.semantic.compilation.symbols().get(f).kind == SymbolKind::Property
                     && !self.is_auto_property(f) =>
             {
                 let name = self.atom_name(key);
                 (Abs::Top, unknown_input(name))
             }
-            Atom::Field(f) => self.field(f),
+            Atom::Field(f, _) => self.field(f),
             Atom::Local(l) => self.local(frame, l),
         };
         self.evaluating.remove(&key);
@@ -999,10 +1684,10 @@ impl<'s> Engine<'s> {
         found
     }
 
-    fn atom_name(&self, (frame, atom): Key) -> String {
+    fn atom_name(&self, (frame, atom, _): Key) -> String {
         let symbols = self.semantic.compilation.symbols();
         match atom {
-            Atom::Param(s) | Atom::Field(s) => symbols.get(s).name.clone(),
+            Atom::Param(s) | Atom::Field(s, _) => symbols.get(s).name.clone(),
             Atom::Local(l) => self.frames[frame]
                 .body
                 .locals
@@ -1083,11 +1768,12 @@ impl<'s> Engine<'s> {
             origin,
             places,
         };
-        let found = if self.escapes(member)
+        let escapes = self.escapes(member) || self.implements_interface(member);
+        let found = if escapes
             || self.caller_depth >= CALLER_DEPTH
             || !self.evaluating_params.insert(member)
         {
-            let origin = if self.escapes(member) {
+            let origin = if escapes {
                 Origin::Escapes
             } else {
                 Origin::Unknown
@@ -1119,7 +1805,7 @@ impl<'s> Engine<'s> {
                         }
                         let value = match arguments.get(index) {
                             Some(argument) => {
-                                self.eval(*frame, strip_ref(argument), &HashMap::new())
+                                self.eval(*frame, strip_ref(argument), &HashMap::new(), None)
                             }
                             None => Abs::Top,
                         };
@@ -1146,6 +1832,64 @@ impl<'s> Engine<'s> {
         };
         self.params.insert(parameter, found.clone());
         found
+    }
+
+    /// Whether a member implements one of an interface: calls through the
+    /// interface reach it without naming it.
+    fn implements_interface(&mut self, member: SymbolId) -> bool {
+        let semantic = self.semantic;
+        let symbols = semantic.compilation.symbols();
+        let symbol = symbols.get(member);
+        if symbol
+            .as_method()
+            .is_some_and(|m| m.method_kind != MethodKind::Ordinary)
+        {
+            return false;
+        }
+        // `void IShape.Draw()` is reached only through the interface.
+        if symbol.name.contains('.') {
+            return true;
+        }
+        let Some(container) = symbol.container else {
+            return false;
+        };
+        let name = symbol.name.clone();
+        let arity = symbol.as_method().map(|m| m.parameters.len());
+        let Some(tree) = symbols
+            .get(container)
+            .locations
+            .first()
+            .map(|location| location.tree)
+        else {
+            return false;
+        };
+        let Some(model) = self.model(tree) else {
+            return false;
+        };
+        let binder = model.binder();
+        let mut pending = vec![container];
+        let mut seen = HashSet::new();
+        while let Some(ty) = pending.pop() {
+            if !seen.insert(ty) {
+                continue;
+            }
+            for base in binder.base_types_of(ty) {
+                let Type::Named { symbol: base, .. } = base else {
+                    continue;
+                };
+                let declared = symbols.get(base);
+                if declared.type_kind() == Some(TypeKind::Interface)
+                    && declared.members.iter().any(|m| {
+                        let m = symbols.get(*m);
+                        m.name == name && m.as_method().map(|m| m.parameters.len()) == arity
+                    })
+                {
+                    return true;
+                }
+                pending.push(base);
+            }
+        }
+        false
     }
 
     /// Whether a member can be reached other than by the calls that name
@@ -1255,7 +1999,8 @@ impl<'s> Engine<'s> {
                 let frame = match self.caller_frames.get(&key) {
                     Some(&frame) => frame,
                     None => {
-                        let frame = self.push_frame(tree, body.clone(), caller, HashMap::new());
+                        let frame =
+                            self.push_frame(tree, body.clone(), caller, None, HashMap::new());
                         self.caller_frames.insert(key, frame);
                         frame
                     }
@@ -1404,14 +2149,14 @@ impl<'s> Engine<'s> {
             if has_initializer && let Some((tree, owner)) = &declarator {
                 let body = self.view(*tree).and_then(|view| view.body_for(owner));
                 if let Some(body) = body {
-                    let frame = self.push_frame(*tree, body.clone(), None, HashMap::new());
+                    let frame = self.push_frame(*tree, body.clone(), None, None, HashMap::new());
                     if let Some(BoundStatement {
                         kind: S::Return(Some(value)),
                         span,
                     }) = body.statements.first()
                     {
                         places.push((self.path(*tree), *span));
-                        let value = self.eval(frame, value, &HashMap::new());
+                        let value = self.eval(frame, value, &HashMap::new(), None);
                         values = values.union(value);
                     } else {
                         values = Abs::Top;
@@ -1488,13 +2233,14 @@ impl<'s> Engine<'s> {
                     };
                     in_constructor |= is_constructor_of_container
                         && assigned.iter().any(|(_, span)| !in_lambda(span));
-                    let frame = self.push_frame(tree, body.clone(), owner_symbol, HashMap::new());
+                    let frame =
+                        self.push_frame(tree, body.clone(), owner_symbol, None, HashMap::new());
                     for (value, span) in assigned {
                         writes += 1;
                         if places.len() < MAX_PLACES {
                             places.push((self.path(tree), span));
                         }
-                        let value = self.eval(frame, &value, &HashMap::new());
+                        let value = self.eval(frame, &value, &HashMap::new(), None);
                         values = values.union(value);
                     }
                     for span in opaque {
@@ -1507,8 +2253,15 @@ impl<'s> Engine<'s> {
                 }
             }
             // Without an initializer, the default is what is read until a
-            // write — unless a constructor writes it first.
-            if !has_initializer && !in_constructor && !required {
+            // write — unless a constructor writes it first. A struct comes
+            // without one too, as `default(S)` and as an array's elements.
+            let in_struct = container.is_some_and(|c| {
+                matches!(
+                    self.semantic.compilation.symbols().get(c).type_kind(),
+                    Some(TypeKind::Struct | TypeKind::RecordStruct)
+                )
+            });
+            if ((!has_initializer && !in_constructor) || in_struct) && !required {
                 let ty = declarator
                     .as_ref()
                     .and_then(|(tree, _)| self.model(*tree).map(|m| m.type_of_symbol(field)));
@@ -1567,39 +2320,15 @@ impl<'s> Engine<'s> {
             .get(local.0 as usize)
             .map(|l| l.name.clone())
             .unwrap_or_default();
-        let mut given: Vec<BoundExpression> = Vec::new();
-        let mut opaque = false;
-        walk_everything(&body, &mut |visited| match visited {
-            Visited::Statement(s) => match &s.kind {
-                S::LocalDeclaration {
-                    local: declared,
-                    initializer: Some(value),
-                } if *declared == local => given.push(value.clone()),
-                S::ForEach {
-                    local: declared, ..
-                } if *declared == local => opaque = true,
-                _ => {}
-            },
-            Visited::Expression(e) => match &e.kind {
-                E::Assignment { target, value } if is_local(target, local) => {
-                    given.push((**value).clone());
-                }
-                E::CompoundAssignment { target, .. } | E::Increment { target, .. }
-                    if is_local(target, local) =>
-                {
-                    opaque = true;
-                }
-                E::RefArgument { operand, .. } if is_local(operand, local) => opaque = true,
-                E::IsPattern { pattern, .. } if declares(pattern, local) => opaque = true,
-                _ => {}
-            },
-        });
-        let values = if opaque || given.is_empty() {
+        let scan = self.scan(frame);
+        let atom = Atom::Local(local);
+        let given: &[BoundExpression] = scan.assigned.get(&atom).map_or(&[], Vec::as_slice);
+        let values = if scan.opaque.contains(&atom) || given.is_empty() {
             Abs::Top
         } else {
             let mut values = Abs::Set(Vec::new());
-            for value in &given {
-                let value = self.eval(frame, value, &HashMap::new());
+            for value in given {
+                let value = self.eval(frame, value, &HashMap::new(), None);
                 values = values.union(value);
             }
             values
@@ -1620,6 +2349,82 @@ impl<'s> Engine<'s> {
         };
         (values, input)
     }
+
+    /// What a parameter can be once the body has written to it: what it was
+    /// given, and what the body gives it. A write whose value is not tracked
+    /// leaves it unknown.
+    fn written_parameter(
+        &mut self,
+        frame: usize,
+        parameter: SymbolId,
+        entry: (Abs, Input),
+    ) -> (Abs, Input) {
+        let scan = self.scan(frame);
+        let atom = Atom::Param(parameter);
+        let (mut values, mut input) = entry;
+        let symbol = self.semantic.compilation.symbols().get(parameter);
+        let name = symbol.name.clone();
+        let ref_kind = symbol.as_parameter().map_or(RefKind::None, |p| p.ref_kind);
+        // A reference is to a variable that what is called may write too.
+        if matches!(ref_kind, RefKind::Ref | RefKind::In) {
+            return (Abs::Top, unknown_input(name));
+        }
+        // What an `out` parameter had on the way in is nothing: it is
+        // written before it is read.
+        if ref_kind == RefKind::Out {
+            values = Abs::Set(Vec::new());
+        }
+        let given: &[BoundExpression] = scan.assigned.get(&atom).map_or(&[], Vec::as_slice);
+        if scan.opaque.contains(&atom) {
+            return (Abs::Top, unknown_input(name));
+        }
+        for value in given {
+            if input.places.len() < MAX_PLACES {
+                input
+                    .places
+                    .push((self.path(self.frames[frame].tree), value.span));
+            }
+            let value = self.eval(frame, value, &HashMap::new(), None);
+            values = values.union(value);
+        }
+        input.values = shown(&values);
+        (values, input)
+    }
+
+    /// Every variable the body of `frame` writes.
+    fn scan(&mut self, frame: usize) -> Arc<Scan> {
+        let body = self.frames[frame].body.clone();
+        let key = Arc::as_ptr(&body) as usize;
+        if let Some(scan) = self.scans.get(&key) {
+            return scan.clone();
+        }
+        let mut scan = Scan::default();
+        walk_everything(&body, &mut |visited| {
+            writes_of(visited, &mut |atom, value| match value {
+                Some(value) => scan.assigned.entry(atom).or_default().push(value.clone()),
+                None => {
+                    scan.opaque.insert(atom);
+                }
+            });
+        });
+        let mut closure = HashSet::new();
+        let closures = body
+            .lambdas
+            .iter()
+            .map(|lambda| &lambda.body)
+            .chain(body.local_functions.iter().map(|function| &function.body));
+        for inner in closures {
+            walk_statement(&body, inner, &mut |visited| {
+                writes_of(visited, &mut |atom, _| {
+                    closure.insert(atom);
+                });
+            });
+        }
+        scan.closure = closure;
+        let scan = Arc::new(scan);
+        self.scans.insert(key, scan.clone());
+        scan
+    }
 }
 
 /// A call of a member, found by [`Engine::call_sites`].
@@ -1636,6 +2441,58 @@ enum Site {
 
 // MARK: - the walk
 
+/// What the walk has seen change, as a version for each thing that can: two
+/// reads of something with the same version are of the same value.
+#[derive(Default)]
+struct State {
+    clock: u32,
+    /// Variables, by the last write to them.
+    written: HashMap<Atom, u32>,
+    /// Fields, by the last write to any object's.
+    fields: HashMap<SymbolId, u32>,
+    /// The last time code ran that may write fields: a call, an `await`.
+    heap: u32,
+    /// The last label: code can arrive there from anywhere.
+    all: u32,
+}
+
+impl State {
+    fn fresh(&mut self) -> u32 {
+        self.clock += 1;
+        self.clock
+    }
+}
+
+/// What evaluating some code changes of what a condition read before it.
+#[derive(Default)]
+struct Effects {
+    written: HashSet<Atom>,
+    fields: HashSet<SymbolId>,
+    /// It runs code that may write fields.
+    havoc: bool,
+}
+
+/// A `catch` clause around the walk.
+struct Catch {
+    exception: Type,
+    filter: Option<BoundExpression>,
+}
+
+/// A call as the walk meets it.
+struct CallSite<'a> {
+    method: SymbolId,
+    receiver: Option<&'a BoundExpression>,
+    /// Whether it goes through the receiver's run-time type.
+    virtual_call: bool,
+    arguments: &'a [BoundExpression],
+    span: TextSpan,
+    /// Whether the call is the operand of an `await`.
+    awaited: bool,
+    /// Whether the call has no value: for an `async` method, that makes
+    /// its failures the program's rather than a task's.
+    void: bool,
+}
+
 struct Walker<'e, 's> {
     engine: &'e mut Engine<'s>,
     frame: usize,
@@ -1643,29 +2500,198 @@ struct Walker<'e, 's> {
     stack: &'e mut Vec<SymbolId>,
     found: Vec<Found>,
     /// The `catch` clauses around where the walk is, innermost last.
-    catches: Vec<Vec<Type>>,
+    catches: Vec<Vec<Catch>>,
+    state: State,
+    /// What the body writes.
+    scan: Arc<Scan>,
+    /// Parameters that are references: whatever is called may write them.
+    by_ref: Vec<SymbolId>,
+    /// The calls that are awaited, by where they are.
+    awaited: HashSet<TextSpan>,
 }
 
 impl Walker<'_, '_> {
-    fn cond(&self, test: Test, holds: bool, span: TextSpan) -> Cond {
+    // MARK: versions
+
+    /// The version of an atom now.
+    fn ver(&mut self, atom: Atom) -> u32 {
+        let all = self.state.all;
+        match atom {
+            Atom::Local(_) | Atom::Param(_) => {
+                let mut at = self.state.written.get(&atom).copied().unwrap_or(0).max(all);
+                if self.is_volatile(atom) {
+                    at = at.max(self.state.heap);
+                }
+                at
+            }
+            Atom::Field(field, through) => {
+                let mut at = self.state.fields.get(&field).copied().unwrap_or(0).max(all);
+                if self.engine.volatile_field(field) {
+                    at = at.max(self.state.heap);
+                }
+                match through {
+                    Recv::Local(l) => at.max(self.ver(Atom::Local(l))),
+                    Recv::Param(p) => at.max(self.ver(Atom::Param(p))),
+                    Recv::This | Recv::Other(_) => at,
+                }
+            }
+        }
+    }
+
+    /// Whether code that runs elsewhere may change the atom.
+    fn is_volatile(&self, atom: Atom) -> bool {
+        match atom {
+            Atom::Param(p) if self.by_ref.contains(&p) => true,
+            Atom::Local(_) | Atom::Param(_) => self.scan.closure.contains(&atom),
+            Atom::Field(..) => true,
+        }
+    }
+
+    /// Whether `effects` change the atom.
+    fn affected(&mut self, effects: &Effects, atom: Atom) -> bool {
+        match atom {
+            Atom::Local(_) | Atom::Param(_) => {
+                effects.written.contains(&atom) || (effects.havoc && self.is_volatile(atom))
+            }
+            Atom::Field(field, through) => {
+                effects.fields.contains(&field)
+                    || (effects.havoc && self.engine.volatile_field(field))
+                    || match through {
+                        Recv::Local(l) => self.affected(effects, Atom::Local(l)),
+                        Recv::Param(p) => self.affected(effects, Atom::Param(p)),
+                        Recv::This | Recv::Other(_) => false,
+                    }
+            }
+        }
+    }
+
+    fn apply_effects(&mut self, effects: &Effects) {
+        for atom in &effects.written {
+            let at = self.state.fresh();
+            self.state.written.insert(*atom, at);
+        }
+        for field in &effects.fields {
+            let at = self.state.fresh();
+            self.state.fields.insert(*field, at);
+        }
+        if effects.havoc {
+            self.havoc();
+        }
+    }
+
+    /// Code that may write any field runs.
+    fn havoc(&mut self) {
+        self.state.heap = self.state.fresh();
+    }
+
+    /// What a loop does, which has happened by the time its next round
+    /// reads anything, and by the time the code after it does.
+    fn loop_effects(&mut self, statement: &BoundStatement) {
+        let mut effects = Effects::default();
+        self.engine
+            .statement_effects(self.frame, statement, &mut effects);
+        self.apply_effects(&effects);
+    }
+
+    /// Applies what evaluating an expression does, apart from what is in
+    /// the expressions it holds.
+    fn apply(&mut self, e: &BoundExpression) {
+        let mut effects = Effects::default();
+        self.engine.node_effects(e, &mut effects);
+        self.apply_effects(&effects);
+    }
+
+    /// Applies everything an expression does, for one the walk does not
+    /// go into.
+    fn apply_all(&mut self, e: &BoundExpression) {
+        let mut effects = Effects::default();
+        self.engine.effects_of(e, &mut effects);
+        self.apply_effects(&effects);
+    }
+
+    fn text(&self, span: TextSpan) -> String {
+        self.engine.text(self.engine.frames[self.frame].tree, span)
+    }
+
+    /// A condition on the way, with the version of each thing it reads as it
+    /// is here. What the condition itself changes, it reads before and
+    /// after: those reads are told apart from anything later.
+    fn cond(&mut self, test: Test, holds: bool, span: TextSpan) -> Cond {
+        let mut effects = Effects::default();
+        let mut atoms: Vec<Atom> = Vec::new();
+        for expression in test.expressions() {
+            self.engine.effects_of(expression, &mut effects);
+            atoms_of(expression, &mut |atom| {
+                if !atoms.contains(&atom) {
+                    atoms.push(atom);
+                }
+            });
+        }
+        let mut versions = HashMap::new();
+        for atom in atoms {
+            let at = if self.affected(&effects, atom) {
+                self.state.fresh()
+            } else {
+                self.ver(atom)
+            };
+            versions.insert(atom, at);
+        }
         Cond {
             frame: self.frame,
             test,
             holds,
             span,
+            versions: Arc::new(versions),
         }
     }
+
+    // MARK: statements
 
     /// Walks a list of statements; whether it always leaves.
     fn statements(&mut self, list: &[BoundStatement], conds: &mut Vec<Cond>) -> bool {
         let base = conds.len();
-        for statement in list {
-            if self.statement(statement, conds) {
-                conds.truncate(base);
-                return true;
-            }
-        }
+        let leaves = self.statements_in(list, conds);
         conds.truncate(base);
+        leaves
+    }
+
+    /// Walks a list of statements, leaving on `conds` what holds after them.
+    fn statements_in(&mut self, list: &[BoundStatement], conds: &mut Vec<Cond>) -> bool {
+        let base = conds.len();
+        let mut at = 0;
+        while at < list.len() {
+            // A `goto` arrives at a label from anywhere in the list, with
+            // what holds there: only what held before the list holds here.
+            if is_labeled(&list[at]) {
+                conds.truncate(base);
+                let words = "a jump or the code above reaches this label";
+                // The block a label is written in says so itself.
+                if !matches!(conds.last(), Some(Cond { test: Test::Reach(w), .. }) if w == words) {
+                    let reached = self.cond(Test::Reach(words.to_owned()), true, list[at].span);
+                    conds.push(reached);
+                }
+            }
+            if self.statement(&list[at], conds) {
+                conds.truncate(base);
+                // What follows a jump is reached only by a `goto`, to a label.
+                match list[at + 1..].iter().position(is_labeled) {
+                    Some(offset) => {
+                        at += 1 + offset;
+                        continue;
+                    }
+                    None => return true,
+                }
+            }
+            // A statement that may return or throw somewhere inside, and has
+            // not said so in a condition, makes what follows it reachable
+            // only where it did not.
+            if !matches!(list[at].kind, S::If { .. } | S::Block(_)) && contains_leave(&list[at]) {
+                let words = "the code above does not return or throw".to_owned();
+                let past = self.cond(Test::Reach(words), true, list[at].span);
+                conds.push(past);
+            }
+            at += 1;
+        }
         false
     }
 
@@ -1674,11 +2700,14 @@ impl Walker<'_, '_> {
     /// `conds` for the statements that follow.
     fn statement(&mut self, statement: &BoundStatement, conds: &mut Vec<Cond>) -> bool {
         match &statement.kind {
-            S::Block(list) => self.statements(list, conds),
-            S::LocalDeclaration { initializer, .. } => {
+            // What a block's guards leave holds after it, too.
+            S::Block(list) => self.statements_in(list, conds),
+            S::LocalDeclaration { local, initializer } => {
                 if let Some(value) = initializer {
                     self.expression(value, conds);
                 }
+                let at = self.state.fresh();
+                self.state.written.insert(Atom::Local(*local), at);
                 false
             }
             S::Expression(e) => {
@@ -1692,39 +2721,58 @@ impl Walker<'_, '_> {
             } => {
                 self.expression(condition, conds);
                 let base = conds.len();
-                conds.push(self.cond(Test::Truth(condition.clone()), true, condition.span));
+                let holds = self.cond(Test::Truth(condition.clone()), true, condition.span);
+                conds.push(holds);
                 let then_leaves = self.statement(consequence, conds);
                 conds.truncate(base);
-                conds.push(self.cond(Test::Truth(condition.clone()), false, condition.span));
+                let fails = self.cond(Test::Truth(condition.clone()), false, condition.span);
+                conds.push(fails);
                 let else_leaves = alternative
                     .as_deref()
                     .is_some_and(|alternative| self.statement(alternative, conds));
                 conds.truncate(base);
+                // A branch that leaves only some of the time says nothing of
+                // what holds after it.
+                let residual = (!then_leaves && contains_leave(consequence))
+                    || (!else_leaves && alternative.as_deref().is_some_and(contains_leave));
                 match (then_leaves, else_leaves) {
                     (true, true) => return true,
                     (true, false) => {
-                        conds.push(self.cond(Test::Truth(condition.clone()), false, condition.span))
+                        let fails =
+                            self.cond(Test::Truth(condition.clone()), false, condition.span);
+                        conds.push(fails);
                     }
                     (false, true) => {
-                        conds.push(self.cond(Test::Truth(condition.clone()), true, condition.span))
+                        let holds = self.cond(Test::Truth(condition.clone()), true, condition.span);
+                        conds.push(holds);
                     }
                     (false, false) => {}
+                }
+                if residual {
+                    let words = "the code above does not return or throw".to_owned();
+                    let past = self.cond(Test::Reach(words), true, statement.span);
+                    conds.push(past);
                 }
                 false
             }
             S::While { condition, body } => {
+                self.loop_effects(statement);
                 self.expression(condition, conds);
                 let base = conds.len();
-                conds.push(self.cond(Test::Truth(condition.clone()), true, condition.span));
+                let holds = self.cond(Test::Truth(condition.clone()), true, condition.span);
+                conds.push(holds);
                 self.statement(body, conds);
                 conds.truncate(base);
+                self.loop_effects(statement);
                 false
             }
             S::DoWhile { body, condition } => {
+                self.loop_effects(statement);
                 let base = conds.len();
                 self.statement(body, conds);
                 conds.truncate(base);
                 self.expression(condition, conds);
+                self.loop_effects(statement);
                 false
             }
             S::For {
@@ -1737,24 +2785,33 @@ impl Walker<'_, '_> {
                 for initializer in initializers {
                     self.statement(initializer, conds);
                 }
+                self.loop_effects(statement);
                 if let Some(condition) = condition {
                     self.expression(condition, conds);
-                    conds.push(self.cond(Test::Truth(condition.clone()), true, condition.span));
+                    let holds = self.cond(Test::Truth(condition.clone()), true, condition.span);
+                    conds.push(holds);
                 }
                 self.statement(body, conds);
                 for incrementor in incrementors {
                     self.expression(incrementor, conds);
                 }
                 conds.truncate(base);
+                self.loop_effects(statement);
                 false
             }
             S::ForEach {
                 collection, body, ..
             } => {
                 self.expression(collection, conds);
+                self.loop_effects(statement);
                 let base = conds.len();
+                // A collection with nothing in it never runs the body.
+                let words = format!("{} has elements", self.text(collection.span));
+                let walks = self.cond(Test::Reach(words), true, collection.span);
+                conds.push(walks);
                 self.statement(body, conds);
                 conds.truncate(base);
+                self.loop_effects(statement);
                 false
             }
             S::ConstructorInitializer {
@@ -1766,8 +2823,20 @@ impl Walker<'_, '_> {
                     self.expression(argument, conds);
                 }
                 if let Some(constructor) = constructor {
-                    self.call(*constructor, arguments, statement.span, conds);
+                    self.call(
+                        CallSite {
+                            method: *constructor,
+                            receiver: None,
+                            virtual_call: false,
+                            arguments,
+                            span: statement.span,
+                            awaited: false,
+                            void: true,
+                        },
+                        conds,
+                    );
                 }
+                self.havoc();
                 false
             }
             S::Switch {
@@ -1776,19 +2845,100 @@ impl Walker<'_, '_> {
             } => {
                 self.expression(governing, conds);
                 let base = conds.len();
+                // A `goto case` enters a section without matching its labels.
+                let body = self.engine.frames[self.frame].body.clone();
+                let mut jumps = false;
                 for section in sections {
-                    let label = match section.labels.as_slice() {
-                        [BoundSwitchLabel::Case(case)] if case.when.is_none() => {
-                            match &case.pattern.kind {
-                                BoundPatternKind::Constant(value) => Some(value.clone()),
-                                _ => None,
+                    for inner in &section.statements {
+                        walk_statement(&body, inner, &mut |visited| {
+                            if let Visited::Statement(s) = visited
+                                && matches!(s.kind, S::GotoCase(_))
+                            {
+                                jumps = true;
+                            }
+                        });
+                    }
+                }
+                let mut labels = Vec::new();
+                let mut own: Vec<Range<usize>> = Vec::new();
+                for section in sections {
+                    let start = labels.len();
+                    for label in &section.labels {
+                        if let BoundSwitchLabel::Case(case) = label {
+                            labels.push(Label {
+                                pattern: case.pattern.clone(),
+                                when: case.when.clone(),
+                            });
+                            // What a pattern binds and a `when` does runs
+                            // as the labels are tried.
+                            let mut effects = Effects::default();
+                            self.engine.pattern_effects(&case.pattern, &mut effects);
+                            if let Some(when) = &case.when {
+                                self.engine.effects_of(when, &mut effects);
+                            }
+                            self.apply_effects(&effects);
+                        }
+                    }
+                    own.push(start..labels.len());
+                }
+                let labels = Arc::new(labels);
+                let total = labels.len();
+                for (section, own) in sections.iter().zip(own) {
+                    let default = section
+                        .labels
+                        .iter()
+                        .any(|label| matches!(label, BoundSwitchLabel::Default));
+                    if jumps {
+                        let words = format!("{} reaches this case", self.text(governing.span));
+                        let reached = self.cond(Test::Opaque(words), true, governing.span);
+                        conds.push(reached);
+                    } else if default {
+                        // Where no label of another section matches.
+                        for others in [0..own.start, own.end..total] {
+                            if !others.is_empty() {
+                                let none = self.cond(
+                                    Test::Matches(governing.clone(), labels.clone(), others),
+                                    false,
+                                    governing.span,
+                                );
+                                conds.push(none);
                             }
                         }
-                        _ => None,
-                    };
-                    if let Some(value) = label {
-                        let span = value.span;
-                        conds.push(self.cond(Test::Equals(governing.clone(), value), true, span));
+                    } else {
+                        let constant = match &labels[own.clone()] {
+                            [
+                                Label {
+                                    pattern:
+                                        BoundPattern {
+                                            kind: P::Constant(value),
+                                            ..
+                                        },
+                                    when: None,
+                                },
+                            ] => Some(value.clone()),
+                            _ => None,
+                        };
+                        let matched = match constant {
+                            Some(value) => {
+                                let span = value.span;
+                                self.cond(Test::Equals(governing.clone(), value), true, span)
+                            }
+                            None => self.cond(
+                                Test::Matches(governing.clone(), labels.clone(), own.clone()),
+                                true,
+                                governing.span,
+                            ),
+                        };
+                        conds.push(matched);
+                        // An earlier label that matches takes the value first.
+                        if own.start > 0 {
+                            let earlier = self.cond(
+                                Test::Matches(governing.clone(), labels.clone(), 0..own.start),
+                                false,
+                                governing.span,
+                            );
+                            conds.push(earlier);
+                        }
                     }
                     self.statements(&section.statements, conds);
                     conds.truncate(base);
@@ -1800,10 +2950,12 @@ impl Walker<'_, '_> {
                 catches,
                 finally,
             } => {
-                let caught: Vec<Type> = catches
+                let caught: Vec<Catch> = catches
                     .iter()
-                    .filter(|c| c.filter.is_none())
-                    .map(|c| c.exception_type.clone())
+                    .map(|c| Catch {
+                        exception: c.exception_type.clone(),
+                        filter: c.filter.clone(),
+                    })
                     .collect();
                 self.catches.push(caught);
                 let base = conds.len();
@@ -1812,6 +2964,16 @@ impl Walker<'_, '_> {
                 self.catches.pop();
                 let mut all_leave = body_leaves;
                 for catch in catches {
+                    if let Some(filter) = &catch.filter {
+                        self.apply_all(filter);
+                    }
+                    // A `catch` runs only when the block it follows fails.
+                    let words = format!(
+                        "the try block throws {}",
+                        display_type(&self.engine.semantic.compilation, &catch.exception_type)
+                    );
+                    let runs = self.cond(Test::Reach(words), true, catch.body.span);
+                    conds.push(runs);
                     all_leave &= self.statement(&catch.body, conds);
                     conds.truncate(base);
                 }
@@ -1822,12 +2984,23 @@ impl Walker<'_, '_> {
                 all_leave && finally.is_none()
             }
             S::Using { resources, body } => {
-                let _ = resources;
-                self.statement(body, conds)
+                for resource in resources {
+                    self.expression(&resource.value, conds);
+                }
+                // The resource is disposed when the block is left.
+                self.havoc();
+                let leaves = self.statement(body, conds);
+                self.havoc();
+                leaves
             }
             S::Lock { value, body, .. } => {
                 self.expression(value, conds);
-                self.statement(body, conds)
+                // Another thread runs while this one waits for the lock, and
+                // while it holds it.
+                self.havoc();
+                let leaves = self.statement(body, conds);
+                self.havoc();
+                leaves
             }
             S::Fixed { body, .. } => self.statement(body, conds),
             S::Return(value) => {
@@ -1838,6 +3011,8 @@ impl Walker<'_, '_> {
             }
             S::YieldReturn(value) => {
                 self.expression(value, conds);
+                // The caller runs until it asks for the next one.
+                self.havoc();
                 false
             }
             S::Throw(value) => {
@@ -1848,7 +3023,26 @@ impl Walker<'_, '_> {
                 true
             }
             S::YieldBreak | S::Break(_) | S::Continue(_) | S::Goto(_) | S::GotoCase(_) => true,
-            S::Unsupported(_) | S::Label(_) | S::Empty => false,
+            S::Label(_) => {
+                self.state.all = self.state.fresh();
+                false
+            }
+            S::Unsupported(_) | S::Empty => false,
+        }
+    }
+
+    // MARK: expressions
+
+    /// Marks the calls an `await` waits for: the operand, and what it is
+    /// called on (`Run().ConfigureAwait(false)`).
+    fn mark_awaited(&mut self, operand: &BoundExpression) {
+        let mut at = strip(operand);
+        while let E::Call { receiver, .. } = &at.kind {
+            self.awaited.insert(at.span);
+            match receiver {
+                Some(receiver) => at = strip(receiver),
+                None => break,
+            }
         }
     }
 
@@ -1868,7 +3062,8 @@ impl Walker<'_, '_> {
             } => {
                 self.expression(left, conds);
                 let holds = *operator == BinaryOperator::LogicalAnd;
-                conds.push(self.cond(Test::Truth((**left).clone()), holds, left.span));
+                let on = self.cond(Test::Truth((**left).clone()), holds, left.span);
+                conds.push(on);
                 self.expression(right, conds);
             }
             E::Binary {
@@ -1877,8 +3072,20 @@ impl Walker<'_, '_> {
                 right,
             } => {
                 self.expression(left, conds);
-                conds.push(self.cond(Test::Null((**left).clone()), true, left.span));
+                let null = self.cond(Test::Null((**left).clone()), true, left.span);
+                conds.push(null);
                 self.expression(right, conds);
+            }
+            // `x ??= y` evaluates `y` only where `x` is null.
+            E::CompoundAssignment {
+                target,
+                operator: BinaryOperator::Coalesce,
+                value,
+            } => {
+                self.expression(target, conds);
+                let null = self.cond(Test::Null((**target).clone()), true, target.span);
+                conds.push(null);
+                self.expression(value, conds);
             }
             E::Binary {
                 operator: BinaryOperator::Divide | BinaryOperator::Modulo,
@@ -1897,7 +3104,8 @@ impl Walker<'_, '_> {
                 };
                 if integral && !nonzero {
                     let mut with = conds.clone();
-                    with.push(self.cond(Test::Zero((**right).clone()), true, right.span));
+                    let zero = self.cond(Test::Zero((**right).clone()), true, right.span);
+                    with.push(zero);
                     self.record(Found {
                         kind: FailureKind::DivideByZero,
                         exception: "DivideByZeroException".to_owned(),
@@ -1916,21 +3124,73 @@ impl Walker<'_, '_> {
                 alternative,
             } => {
                 self.expression(condition, conds);
-                conds.push(self.cond(Test::Truth((**condition).clone()), true, condition.span));
+                let holds = self.cond(Test::Truth((**condition).clone()), true, condition.span);
+                conds.push(holds);
                 self.expression(consequence, conds);
                 conds.truncate(base);
-                conds.push(self.cond(Test::Truth((**condition).clone()), false, condition.span));
+                let fails = self.cond(Test::Truth((**condition).clone()), false, condition.span);
+                conds.push(fails);
                 self.expression(alternative, conds);
             }
             E::ConditionalAccess { receiver, access } => {
                 self.expression(receiver, conds);
-                conds.push(self.cond(Test::Null((**receiver).clone()), false, receiver.span));
+                let some = self.cond(Test::Null((**receiver).clone()), false, receiver.span);
+                conds.push(some);
                 self.expression(access, conds);
+            }
+            E::Await { operand, .. } => {
+                self.mark_awaited(operand);
+                self.expression(operand, conds);
+            }
+            E::Switch { governing, arms } => {
+                self.expression(governing, conds);
+                let labels: Arc<Vec<Label>> = Arc::new(
+                    arms.iter()
+                        .map(|arm| Label {
+                            pattern: arm.pattern.clone(),
+                            when: arm.when.clone(),
+                        })
+                        .collect(),
+                );
+                for (at, arm) in arms.iter().enumerate() {
+                    let arm_base = conds.len();
+                    // An arm is taken where its pattern matches, its `when`
+                    // holds, and no arm before it was taken.
+                    if at > 0 {
+                        let earlier = self.cond(
+                            Test::Matches((**governing).clone(), labels.clone(), 0..at),
+                            false,
+                            governing.span,
+                        );
+                        conds.push(earlier);
+                    }
+                    let mut effects = Effects::default();
+                    self.engine.pattern_effects(&arm.pattern, &mut effects);
+                    self.apply_effects(&effects);
+                    let pattern_only: Arc<Vec<Label>> = Arc::new(vec![Label {
+                        pattern: arm.pattern.clone(),
+                        when: None,
+                    }]);
+                    let matched = self.cond(
+                        Test::Matches((**governing).clone(), pattern_only, 0..1),
+                        true,
+                        arm.pattern.span,
+                    );
+                    conds.push(matched);
+                    if let Some(when) = &arm.when {
+                        self.expression(when, conds);
+                        let holds = self.cond(Test::Truth(when.clone()), true, when.span);
+                        conds.push(holds);
+                    }
+                    self.expression(&arm.value, conds);
+                    conds.truncate(arm_base);
+                }
             }
             E::Call {
                 receiver,
                 method,
                 arguments,
+                virtual_call,
                 ..
             } => {
                 if let Some(receiver) = receiver {
@@ -1940,7 +3200,16 @@ impl Walker<'_, '_> {
                 for argument in arguments {
                     self.expression(argument, conds);
                 }
-                self.call(*method, arguments, e.span, conds);
+                let site = CallSite {
+                    method: *method,
+                    receiver: receiver.as_deref(),
+                    virtual_call: *virtual_call,
+                    arguments,
+                    span: e.span,
+                    awaited: self.awaited.contains(&e.span),
+                    void: e.ty == Type::Void,
+                };
+                self.call(site, conds);
             }
             E::ObjectCreation {
                 constructor,
@@ -1951,7 +3220,18 @@ impl Walker<'_, '_> {
                     self.expression(argument, conds);
                 }
                 if let Some(constructor) = constructor {
-                    self.call(*constructor, arguments, e.span, conds);
+                    self.call(
+                        CallSite {
+                            method: *constructor,
+                            receiver: None,
+                            virtual_call: false,
+                            arguments,
+                            span: e.span,
+                            awaited: false,
+                            void: false,
+                        },
+                        conds,
+                    );
                 }
                 for initializer in initializers {
                     self.expression(initializer, conds);
@@ -1969,7 +3249,18 @@ impl Walker<'_, '_> {
                     self.expression(receiver, conds);
                     self.dereference(receiver, conds);
                 }
-                self.call(*property, &[], e.span, conds);
+                self.call(
+                    CallSite {
+                        method: *property,
+                        receiver: receiver.as_deref(),
+                        virtual_call: true,
+                        arguments: &[],
+                        span: e.span,
+                        awaited: false,
+                        void: false,
+                    },
+                    conds,
+                );
             }
             E::ArrayLength { array } => {
                 self.expression(array, conds);
@@ -1983,11 +3274,12 @@ impl Walker<'_, '_> {
                 self.dereference(array, conds);
                 if let [index] = indices.as_slice() {
                     let mut with = conds.clone();
-                    with.push(self.cond(
+                    let outside = self.cond(
                         Test::OutOfRange((**array).clone(), index.clone()),
                         true,
                         index.span,
-                    ));
+                    );
+                    with.push(outside);
                     self.implicit(
                         FailureKind::IndexOutOfRange,
                         "IndexOutOfRangeException",
@@ -2020,6 +3312,7 @@ impl Walker<'_, '_> {
                 }
             }
         }
+        self.apply(e);
         conds.truncate(base);
     }
 
@@ -2121,7 +3414,18 @@ impl Walker<'_, '_> {
             || container.starts_with("System.Collections.Generic.IDictionary")
             || container.starts_with("System.Collections.Generic.IReadOnlyDictionary");
         if !dictionary {
-            self.call(indexer, arguments, span, conds);
+            self.call(
+                CallSite {
+                    method: indexer,
+                    receiver: Some(receiver),
+                    virtual_call: true,
+                    arguments,
+                    span,
+                    awaited: false,
+                    void: false,
+                },
+                conds,
+            );
             return;
         }
         let tree = self.engine.frames[self.frame].tree;
@@ -2205,6 +3509,103 @@ impl Walker<'_, '_> {
         })
     }
 
+    /// Whether a condition on the way says the sequence has an element:
+    /// `xs.Count > 0`, `xs.Length != 0`, `xs.Count() >= 1`.
+    fn counted(&self, conds: &[Cond], sequence: &str) -> bool {
+        let symbols = self.engine.semantic.compilation.symbols();
+        // What is counted: `xs` of `xs.Count`, `xs.Length`, `xs.Count()`.
+        let counted = |e: &BoundExpression| -> Option<String> {
+            let e = strip(e);
+            let tree = self.engine.frames[self.frame].tree;
+            let text = |e: &BoundExpression| self.engine.text(tree, strip(e).span);
+            match &e.kind {
+                E::ArrayLength { array } => Some(text(array)),
+                E::Property {
+                    receiver: Some(receiver),
+                    property,
+                } if matches!(symbols.get(*property).name.as_str(), "Count" | "Length") => {
+                    Some(text(receiver))
+                }
+                E::Call {
+                    receiver,
+                    method,
+                    arguments,
+                    ..
+                } if symbols.get(*method).name == "Count" => match (receiver, arguments.as_slice())
+                {
+                    (Some(receiver), []) => Some(text(receiver)),
+                    (None, [first]) => Some(text(first)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let number = |e: &BoundExpression| match &strip(e).kind {
+            E::Literal(value) => Val::from_constant(value).integer(),
+            _ => None,
+        };
+        conds.iter().any(|cond| {
+            let Test::Truth(test) = &cond.test else {
+                return false;
+            };
+            let mut test = strip(test);
+            let mut holds = cond.holds;
+            while let E::Unary {
+                operator: UnaryOperator::LogicalNot,
+                operand,
+            } = &test.kind
+            {
+                test = strip(operand);
+                holds = !holds;
+            }
+            let E::Binary {
+                operator,
+                left,
+                right,
+            } = &test.kind
+            else {
+                return false;
+            };
+            // `0 < xs.Count` is `xs.Count > 0`.
+            let (size, n, mut operator) =
+                match (counted(left), number(right), counted(right), number(left)) {
+                    (Some(size), Some(n), _, _) => (size, n, *operator),
+                    (_, _, Some(size), Some(n)) => {
+                        let mirrored = match operator {
+                            BinaryOperator::LessThan => BinaryOperator::GreaterThan,
+                            BinaryOperator::GreaterThan => BinaryOperator::LessThan,
+                            BinaryOperator::LessThanOrEqual => BinaryOperator::GreaterThanOrEqual,
+                            BinaryOperator::GreaterThanOrEqual => BinaryOperator::LessThanOrEqual,
+                            other => *other,
+                        };
+                        (size, n, mirrored)
+                    }
+                    _ => return false,
+                };
+            if size != sequence {
+                return false;
+            }
+            if !holds {
+                operator = match operator {
+                    BinaryOperator::LessThan => BinaryOperator::GreaterThanOrEqual,
+                    BinaryOperator::LessThanOrEqual => BinaryOperator::GreaterThan,
+                    BinaryOperator::GreaterThan => BinaryOperator::LessThanOrEqual,
+                    BinaryOperator::GreaterThanOrEqual => BinaryOperator::LessThan,
+                    BinaryOperator::Equality => BinaryOperator::Inequality,
+                    BinaryOperator::Inequality => BinaryOperator::Equality,
+                    other => other,
+                };
+            }
+            // A count is never negative.
+            match operator {
+                BinaryOperator::GreaterThan => n >= 0,
+                BinaryOperator::GreaterThanOrEqual | BinaryOperator::Equality => n >= 1,
+                BinaryOperator::Inequality => n == 0,
+                _ => false,
+            }
+        })
+    }
+
     /// A library member that throws on what it is given; whether `method`
     /// is one this knows.
     fn library(
@@ -2247,7 +3648,10 @@ impl Walker<'_, '_> {
                 return false;
             };
             let sequence_text = self.engine.text(tree, strip(sequence).span);
-            if words == "is empty" && self.guarded(conds, &sequence_text, &["Any"], None) {
+            if words == "is empty"
+                && (self.guarded(conds, &sequence_text, &["Any"], None)
+                    || self.counted(conds, &sequence_text))
+            {
                 return true;
             }
             let mut with = conds.to_vec();
@@ -2300,45 +3704,137 @@ impl Walker<'_, '_> {
         });
     }
 
-    /// Keeps a failure, unless a `catch` around it catches it.
-    fn record(&mut self, found: Found) {
-        if self.is_caught(&found) {
-            return;
+    /// Keeps a failure, unless a `catch` around it catches it; a `catch`
+    /// with a filter catches it only where the filter holds.
+    fn record(&mut self, mut found: Found) {
+        let clauses: Vec<(Type, Option<BoundExpression>)> = self
+            .catches
+            .iter()
+            .flatten()
+            .map(|c| (c.exception.clone(), c.filter.clone()))
+            .collect();
+        let mut filters = Vec::new();
+        for (caught, filter) in clauses {
+            if !self.catches_it(&found, &caught) {
+                continue;
+            }
+            match filter {
+                None => return,
+                Some(filter) => {
+                    let always = self
+                        .engine
+                        .eval(self.frame, &filter, &HashMap::new(), None)
+                        .truth();
+                    if always == Tri::True {
+                        return;
+                    }
+                    filters.push(filter);
+                }
+            }
+        }
+        // Past a filter that may be true the failure is only possible: it
+        // gets away where the filter does not hold.
+        for filter in filters {
+            let span = filter.span;
+            let escapes = self.cond(Test::Filter(filter), false, span);
+            found.conditions.push(escapes);
         }
         self.found.push(found);
     }
 
-    fn is_caught(&mut self, found: &Found) -> bool {
-        let catches: Vec<Type> = self.catches.iter().flatten().cloned().collect();
-        if catches.is_empty() {
+    /// Whether a `catch` of `caught` takes the failure.
+    fn catches_it(&mut self, found: &Found, caught: &Type) -> bool {
+        let semantic = self.engine.semantic;
+        let tree = self.engine.frames[self.frame].tree;
+        let name = display_type(&semantic.compilation, caught);
+        if name == "Exception" {
+            return true;
+        }
+        match &found.exception_type {
+            Some(thrown) => {
+                let Some(model) = self.engine.model(tree) else {
+                    return false;
+                };
+                thrown == caught || model.binder().inherits_from_public(thrown, caught)
+            }
+            None => name == found.exception || implicit_bases(&found.exception).contains(&&*name),
+        }
+    }
+
+    /// Whether the call may run a member other than the one it names: it is
+    /// made through the run-time type of a receiver that may be a subtype.
+    fn dispatch_unknown(
+        &mut self,
+        method: SymbolId,
+        receiver: Option<&BoundExpression>,
+        virtual_call: bool,
+    ) -> bool {
+        if !virtual_call {
             return false;
         }
         let semantic = self.engine.semantic;
-        let tree = self.engine.frames[self.frame].tree;
-        let Some(model) = self.engine.model(tree) else {
+        let symbols = semantic.compilation.symbols();
+        let symbol = symbols.get(method);
+        let in_interface = symbol
+            .container
+            .and_then(|c| symbols.get(c).as_named_type())
+            .is_some_and(|t| t.type_kind == Some(TypeKind::Interface));
+        let overridable = symbol.modifiers.contains(Modifiers::VIRTUAL)
+            || symbol.modifiers.contains(Modifiers::ABSTRACT)
+            || symbol.modifiers.contains(Modifiers::OVERRIDE)
+            || in_interface;
+        if !overridable || symbol.modifiers.contains(Modifiers::SEALED) {
             return false;
+        }
+        // A type nothing derives from has no other member to run.
+        let closed = |ty: SymbolId| {
+            let ty = symbols.get(ty);
+            ty.modifiers.contains(Modifiers::SEALED)
+                || ty.modifiers.contains(Modifiers::STATIC)
+                || matches!(
+                    ty.as_named_type().and_then(|t| t.type_kind),
+                    Some(TypeKind::Struct | TypeKind::RecordStruct | TypeKind::Enum)
+                )
         };
-        let binder = model.binder();
-        catches.iter().any(|caught| {
-            let is_exception = display_type(&semantic.compilation, caught) == "Exception";
-            is_exception
-                || found.exception_type.as_ref().is_some_and(|thrown| {
-                    thrown == caught || binder.inherits_from_public(thrown, caught)
-                })
-                || (found.exception_type.is_none()
-                    && display_type(&semantic.compilation, caught) == found.exception)
-        })
+        let container = symbol.container;
+        // The member the call names is the one that runs only where the
+        // object is exactly of the type that has it, and nothing derives
+        // from that type or the call names it through `base`.
+        let exact = |ty: Option<SymbolId>| ty.is_some() && ty == container;
+        let certain = match receiver.map(strip) {
+            Some(BoundExpression { kind: E::Base, .. }) => true,
+            Some(BoundExpression {
+                kind: E::ObjectCreation { .. },
+                ty: Type::Named { symbol, .. },
+                ..
+            }) => exact(Some(*symbol)),
+            Some(BoundExpression {
+                ty: Type::Named { symbol, .. },
+                ..
+            }) => exact(Some(*symbol)) && closed(*symbol),
+            Some(_) => false,
+            None => {
+                let current = self.engine.frames[self.frame]
+                    .member
+                    .and_then(|member| symbols.get(member).container);
+                exact(current) && current.is_some_and(closed)
+            }
+        };
+        !certain
     }
 
     /// Follows a call into a member of the project: what can fail in it can
     /// fail here, with its parameters being what this call passes.
-    fn call(
-        &mut self,
-        method: SymbolId,
-        arguments: &[BoundExpression],
-        span: TextSpan,
-        conds: &[Cond],
-    ) {
+    fn call(&mut self, site: CallSite<'_>, conds: &[Cond]) {
+        let CallSite {
+            method,
+            receiver,
+            virtual_call,
+            arguments,
+            span,
+            awaited,
+            void,
+        } = site;
         // What the library says about its own members comes first: the
         // body a reference assembly has is not the one that runs.
         if self.library(method, arguments, span, conds) {
@@ -2347,10 +3843,36 @@ impl Walker<'_, '_> {
         if self.stack.len() >= CALL_DEPTH || self.stack.contains(&method) {
             return;
         }
-        let Some((tree, body)) = self.engine.body_of(method) else {
-            return;
-        };
         let symbols = self.engine.semantic.compilation.symbols();
+        let is_local = symbols
+            .get(method)
+            .as_method()
+            .is_some_and(|m| m.method_kind == MethodKind::LocalFunction);
+        // A local function is a part of the body that holds it.
+        let (tree, body, local_function) = if is_local {
+            let body = self.engine.frames[self.frame].body.clone();
+            let Some(at) = body.local_functions.iter().position(|f| f.symbol == method) else {
+                return;
+            };
+            (self.engine.frames[self.frame].tree, body, Some(at))
+        } else {
+            let Some((tree, body)) = self.engine.body_of(method) else {
+                return;
+            };
+            (tree, body, None)
+        };
+        // An iterator's body runs when it is enumerated; what an `async`
+        // method fails with is kept in its task, and comes out at the
+        // `await`.
+        let iterator = match local_function {
+            Some(at) => body.local_functions[at].iterator.is_some(),
+            None => body.iterator.is_some(),
+        };
+        if iterator
+            || (symbols.get(method).modifiers.contains(Modifiers::ASYNC) && !void && !awaited)
+        {
+            return;
+        }
         let parameters = symbols
             .get(method)
             .as_method()
@@ -2361,7 +3883,9 @@ impl Walker<'_, '_> {
         let mut bound = HashMap::new();
         for (parameter, argument) in parameters.iter().zip(arguments) {
             let argument = strip_ref(argument);
-            let value = self.engine.eval(self.frame, argument, &HashMap::new());
+            let value = self
+                .engine
+                .eval(self.frame, argument, &HashMap::new(), None);
             let name = self
                 .engine
                 .semantic
@@ -2378,14 +3902,31 @@ impl Walker<'_, '_> {
             };
             bound.insert(*parameter, (value, input));
         }
-        let frame = self.engine.push_frame(tree, body, Some(method), bound);
+        let frame = self
+            .engine
+            .push_frame(tree, body, Some(method), local_function, bound);
         let mut chain = self.chain.clone();
         chain.push(CallStep {
             text: self.engine.text(caller_tree, span),
-            callee,
+            callee: callee.clone(),
             path: self.engine.path(caller_tree),
             span,
         });
+        // A member a subtype may override is not known to be the one that
+        // runs: what it does is at most possible.
+        let dispatched;
+        let conds = if self.dispatch_unknown(method, receiver, virtual_call) {
+            let words = match receiver {
+                Some(receiver) => format!("{} runs {callee}", self.text(receiver.span)),
+                None => format!("this runs {callee}"),
+            };
+            let mut with = conds.to_vec();
+            with.push(self.cond(Test::Opaque(words), true, span));
+            dispatched = with;
+            &dispatched[..]
+        } else {
+            conds
+        };
         self.stack.push(method);
         let mut inner = Vec::new();
         self.engine
@@ -2400,6 +3941,32 @@ impl Walker<'_, '_> {
 // MARK: - helpers
 
 /// Whether a symbol is declared in the project's own files.
+fn is_delegate(semantic: &Semantic, ty: &Type) -> bool {
+    match ty {
+        Type::Named { symbol, .. } => {
+            semantic.compilation.symbols().get(*symbol).type_kind() == Some(TypeKind::Delegate)
+        }
+        _ => false,
+    }
+}
+
+/// The exception types an exception the analysis names is caught as, besides
+/// its own and `Exception`.
+fn implicit_bases(exception: &str) -> &'static [&'static str] {
+    match exception {
+        "DivideByZeroException" => &["ArithmeticException", "SystemException"],
+        "ArgumentOutOfRangeException" | "ArgumentNullException" => {
+            &["ArgumentException", "SystemException"]
+        }
+        "KeyNotFoundException"
+        | "NullReferenceException"
+        | "IndexOutOfRangeException"
+        | "FormatException"
+        | "InvalidOperationException" => &["SystemException"],
+        _ => &[],
+    }
+}
+
 fn in_project(semantic: &Semantic, symbol: SymbolId) -> bool {
     semantic
         .compilation
@@ -2439,6 +4006,28 @@ fn walk_everything<'a>(body: &'a BoundBody, visit: &mut dyn FnMut(Visited<'a>)) 
                 visit(visited);
             });
         }
+    }
+}
+
+/// Whether a statement holds a `return`, a `throw` or a `goto` that is not in
+/// a lambda: where it may leave the body.
+fn contains_leave(statement: &BoundStatement) -> bool {
+    match &statement.kind {
+        S::Return(_) | S::Throw(_) | S::YieldBreak | S::Goto(_) => true,
+        S::Expression(e) if matches!(e.kind, E::Throw(_)) => true,
+        _ => statement_children(statement)
+            .0
+            .into_iter()
+            .any(contains_leave),
+    }
+}
+
+/// Whether a statement is one a `goto` can name: `Again: ...`.
+fn is_labeled(statement: &BoundStatement) -> bool {
+    match &statement.kind {
+        S::Label(_) => true,
+        S::Block(list) => list.first().is_some_and(is_labeled),
+        _ => false,
     }
 }
 
@@ -2532,20 +4121,101 @@ fn parsed_type(container: &str, name: &str) -> Option<SpecialType> {
     None
 }
 
-fn is_local(target: &BoundExpression, local: LocalId) -> bool {
-    matches!(&strip(target).kind, E::Local(l) if *l == local)
+/// The locals a pattern declares.
+fn pattern_locals(pattern: &BoundPattern, found: &mut Vec<LocalId>) {
+    match &pattern.kind {
+        P::Unsupported(_) | P::Discard | P::Type(_) | P::Constant(_) | P::Relational { .. } => {}
+        P::Var { local } | P::VarDeconstruct { local, .. } | P::SpanString { local, .. } => {
+            found.push(*local);
+        }
+        P::Declaration { local, .. } => found.extend(*local),
+        P::Recursive(recursive) => {
+            found.extend(recursive.local);
+            for (_, inner) in &recursive.properties {
+                pattern_locals(inner, found);
+            }
+            for inner in &recursive.positional {
+                pattern_locals(inner, found);
+            }
+        }
+        P::List(list) => {
+            found.extend(list.local);
+            for inner in list.patterns() {
+                pattern_locals(inner, found);
+            }
+        }
+        P::And(a, b) | P::Or(a, b) => {
+            pattern_locals(a, found);
+            pattern_locals(b, found);
+        }
+        P::Not(inner) | P::UnionCase { inner, .. } => pattern_locals(inner, found),
+    }
 }
 
-fn declares(pattern: &rustlyn_semantics::BoundPattern, local: LocalId) -> bool {
-    match &pattern.kind {
-        BoundPatternKind::Declaration {
-            local: declared, ..
-        } => *declared == Some(local),
-        BoundPatternKind::And(a, b) | BoundPatternKind::Or(a, b) => {
-            declares(a, local) || declares(b, local)
-        }
-        BoundPatternKind::Not(inner) => declares(inner, local),
-        _ => false,
+/// What a node of the tree writes to a variable of the body: each variable,
+/// and the value it is given where one is named.
+fn writes_of<'a>(visited: Visited<'a>, write: &mut dyn FnMut(Atom, Option<&'a BoundExpression>)) {
+    let mut declared = Vec::new();
+    match visited {
+        Visited::Statement(statement) => match &statement.kind {
+            S::LocalDeclaration {
+                local,
+                initializer: Some(value),
+            } => write(Atom::Local(*local), Some(value)),
+            S::ForEach { local, .. } => write(Atom::Local(*local), None),
+            S::Using { resources, .. } => {
+                for resource in resources {
+                    write(Atom::Local(resource.local), Some(&resource.value));
+                }
+            }
+            S::Try { catches, .. } => {
+                for local in catches.iter().filter_map(|c| c.local) {
+                    write(Atom::Local(local), None);
+                }
+            }
+            S::Switch { sections, .. } => {
+                for section in sections {
+                    for label in &section.labels {
+                        if let BoundSwitchLabel::Case(case) = label {
+                            pattern_locals(&case.pattern, &mut declared);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        },
+        Visited::Expression(e) => match &e.kind {
+            E::Assignment { target, value } => {
+                if let Some(atom @ (Atom::Local(_) | Atom::Param(_))) = place_atom(target) {
+                    write(atom, Some(value));
+                }
+            }
+            E::CompoundAssignment { target, .. } | E::Increment { target, .. } => {
+                if let Some(atom @ (Atom::Local(_) | Atom::Param(_))) = place_atom(target) {
+                    write(atom, None);
+                }
+            }
+            E::RefArgument { kind, operand } if *kind != RefKind::In => {
+                if let Some(atom @ (Atom::Local(_) | Atom::Param(_))) = place_atom(operand) {
+                    write(atom, None);
+                }
+            }
+            E::AddressOf { operand } | E::MakeRef(operand) => {
+                if let Some(atom @ (Atom::Local(_) | Atom::Param(_))) = place_atom(operand) {
+                    write(atom, None);
+                }
+            }
+            E::IsPattern { pattern, .. } => pattern_locals(pattern, &mut declared),
+            E::Switch { arms, .. } => {
+                for arm in arms {
+                    pattern_locals(&arm.pattern, &mut declared);
+                }
+            }
+            _ => {}
+        },
+    }
+    for local in declared {
+        write(Atom::Local(local), None);
     }
 }
 
@@ -2554,8 +4224,12 @@ fn atoms_of(e: &BoundExpression, add: &mut dyn FnMut(Atom)) {
     match &e.kind {
         E::Parameter(p) => add(Atom::Param(*p)),
         E::Local(l) => add(Atom::Local(*l)),
-        E::Field { field, .. } => add(Atom::Field(*field)),
-        E::Property { property, .. } => add(Atom::Field(*property)),
+        E::Field {
+            field, receiver, ..
+        } => add(field_atom(*field, receiver.as_deref())),
+        E::Property {
+            property, receiver, ..
+        } => add(field_atom(*property, receiver.as_deref())),
         _ => {}
     }
     for child in expression_children(e) {
@@ -2641,6 +4315,25 @@ fn is_reference(semantic: &Semantic, ty: &Type) -> bool {
         Type::Array { .. } => true,
         _ => false,
     }
+}
+
+/// Whether a value is one the integer type can hold; anything else is.
+fn fits(special: Option<SpecialType>, value: &Val) -> bool {
+    let (Some(special), Val::Int(v)) = (special, value) else {
+        return true;
+    };
+    let (low, high): (i128, i128) = match special {
+        SpecialType::SByte => (i128::from(i8::MIN), i128::from(i8::MAX)),
+        SpecialType::Byte => (0, i128::from(u8::MAX)),
+        SpecialType::Int16 => (i128::from(i16::MIN), i128::from(i16::MAX)),
+        SpecialType::UInt16 | SpecialType::Char => (0, i128::from(u16::MAX)),
+        SpecialType::Int32 => (i128::from(i32::MIN), i128::from(i32::MAX)),
+        SpecialType::UInt32 => (0, i128::from(u32::MAX)),
+        SpecialType::Int64 => (i128::from(i64::MIN), i128::from(i64::MAX)),
+        SpecialType::UInt64 => (0, i128::from(u64::MAX)),
+        _ => return true,
+    };
+    (low..=high).contains(v)
 }
 
 fn convert(value: &Val, to: Option<SpecialType>) -> Option<Val> {
