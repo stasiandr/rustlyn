@@ -136,6 +136,14 @@ impl BodyBinder<'_> {
         // the branch: `n > 8 ? new ArraySegment<byte>(…) : null` is an
         // `ArraySegment<byte>`, the null made by its operator from `byte[]`.
         let ty = match (&consequence.ty, &alternative.ty) {
+            // `dynamic` and any other type are `dynamic`, whichever comes
+            // first: `flag ? text : dyn` converts both ways, and the
+            // `dynamic` is the better of the two (§12.18).
+            (Type::Dynamic, other) | (other, Type::Dynamic)
+                if !other.is_error() && !typeless(&consequence) && !typeless(&alternative) =>
+            {
+                Type::Dynamic
+            }
             (Type::Null, other) | (other, Type::Null)
                 if !self.binder.held_by_reference(other)
                     && !matches!(other, Type::Null | Type::Error)

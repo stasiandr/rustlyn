@@ -327,3 +327,78 @@ fn a_constant_out_of_the_range_of_its_type_is_the_values_error() {
         ]
     );
 }
+
+#[test]
+fn the_complement_of_an_enum_constant_is_taken_in_the_width_of_its_type() {
+    // `~F.A` on an enum over `byte` folded in 32 bits and came to -2 where
+    // Roslyn has 254: a mask built from it compared unequal to the value it
+    // stands for, and a cast of it to `byte` was reported as out of range.
+    // `unchecked` arithmetic on such an enum wraps at the same width.
+    let source = "[System.Flags] enum B : byte { None = 0, A = 1, B = 2, Top = 255 }
+        [System.Flags] enum S : sbyte { None = 0, A = 1 }
+        [System.Flags] enum U : ushort { None = 0, A = 1, B = 2 }
+        [System.Flags] enum H : short { None = 0, A = 1 }
+        [System.Flags] enum W : uint { None = 0, A = 1 }
+        [System.Flags] enum L : ulong { None = 0, A = 1 }
+        [System.Flags] enum I : int { None = 0, A = 1 }
+        class C {
+            const B Mask = ~B.A;
+            const B Both = ~(B.A | B.B);
+            const U Wide = ~U.A;
+            const int AsInt = (int)~B.None;
+            const byte Narrow = (byte)~B.A;
+            const S Signed = ~S.A;
+            const H Short = ~H.A;
+            const W Unsigned = ~W.A;
+            const L Longest = ~L.None;
+            const I Plain = ~I.A;
+            const B Wrapped = unchecked(B.Top + 1);
+            const U Wrapped16 = unchecked(U.B - 3);
+        }";
+    assert_eq!(
+        values(
+            source,
+            &[
+                "C.Mask",
+                "C.Both",
+                "C.Wide",
+                "C.AsInt",
+                "C.Narrow",
+                "C.Signed",
+                "C.Short",
+                "C.Unsigned",
+                "C.Longest",
+                "C.Plain",
+                "C.Wrapped",
+                "C.Wrapped16"
+            ]
+        ),
+        [
+            "Int32(254)",
+            "Int32(252)",
+            "Int32(65534)",
+            "Int32(255)",
+            "Int32(254)",
+            "Int32(-2)",
+            "Int32(-2)",
+            "UInt32(4294967294)",
+            "UInt64(18446744073709551615)",
+            "Int32(-2)",
+            "Int32(0)",
+            "Int32(65535)",
+        ]
+    );
+    assert_eq!(
+        error_codes(
+            "[System.Flags] enum B : byte { None = 0, A = 1 }
+             [System.Flags] enum U : ushort { None = 0, A = 1 }
+             class C { void M() {
+                 byte a = (byte)~B.None;
+                 ushort b = (ushort)~U.A;
+                 const B mask = ~B.A;
+                 bool same = mask == (B)254;
+             } }"
+        ),
+        Vec::<String>::new()
+    );
+}

@@ -287,6 +287,19 @@ impl BodyBinder<'_> {
                     && self.delegate_signature(to).is_some()
                     && self.delegate_signature(&from.0) == self.delegate_signature(to))
         };
+        // `dynamic` and `object` convert to each other, so neither would win
+        // on conversions alone and the first written would be the answer.
+        // Every type converts to `dynamic` and `dynamic` is what the runtime
+        // binder then sees, so a `dynamic` among them is the best common type.
+        if let Some(dynamic) = candidates
+            .iter()
+            .find(|candidate| matches!(candidate.0, Type::Dynamic))
+            && candidates
+                .iter()
+                .all(|candidate| candidate.0 == dynamic.0 || converts(candidate, &dynamic.0))
+        {
+            return Some(Type::Dynamic);
+        }
         let mut best: Option<&(Type, bool)> = None;
         for candidate in &candidates {
             best = match best {
@@ -491,6 +504,17 @@ impl BodyBinder<'_> {
                 || self.binder.converts_implicitly(&from.0, &to.0)
                 || (from.1 && !to.1 && self.function_type_converts(&from.0, &to.0))
         };
+        // `dynamic` converts to everything and everything to it: it is the
+        // best of them whatever order they were returned in.
+        if let Some(dynamic) = candidates
+            .iter()
+            .find(|candidate| matches!(candidate.0, Type::Dynamic))
+            && candidates
+                .iter()
+                .all(|candidate| candidate.0 == dynamic.0 || converts(candidate, dynamic))
+        {
+            return self.wrapped_in_task(lambda, Type::Dynamic);
+        }
         let mut best = candidates[0];
         for candidate in &candidates[1..] {
             if best.0 != candidate.0 && converts(best, candidate) && !converts(candidate, best) {

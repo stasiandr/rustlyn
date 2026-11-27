@@ -2317,6 +2317,14 @@ impl BodyBinder<'_> {
         if !normal(candidate) && !normal(best) && mine.len() != other.len() {
             return mine.len() > other.len();
         }
+        // Two `params` collections of different types that take the same
+        // elements: a span beats the array and the interfaces it stands for.
+        if !normal(candidate)
+            && !normal(best)
+            && let Some(better) = self.better_params_collection(candidate, best)
+        {
+            return better;
+        }
         // One that needs no default filled in beats one that does.
         let has_all = |entry: &(Betterness, Vec<Type>, Resolved), declared: usize| {
             !normal(entry) || declared == arguments.len()
@@ -2333,6 +2341,86 @@ impl BodyBinder<'_> {
             return better;
         }
         self.prefers_value(arguments, candidate, &mine, best, &other) == Some(true)
+    }
+
+    /// Which of two candidates, both taking their `params` collection
+    /// expanded, has the better collection type for the same elements (C# 13):
+    /// `ReadOnlySpan<T>` beats `Span<T>`, either beats an array and the
+    /// interfaces an array stands for (`IEnumerable<T>`, `IReadOnlyCollection<T>`,
+    /// `IReadOnlyList<T>`, `ICollection<T>`, `IList<T>`), and otherwise the
+    /// type that converts to the other and not back does, as it would for a
+    /// collection expression. `None` where the types are the same, the elements
+    /// are not, or neither is better.
+    fn better_params_collection(
+        &self,
+        candidate: &(Betterness, Vec<Type>, Resolved),
+        best: &(Betterness, Vec<Type>, Resolved),
+    ) -> Option<bool> {
+        let collection = |resolved: &Resolved| -> Option<Type> {
+            let symbols = self.binder.compilation().symbols();
+            let last = super::member_parameters(symbols, resolved.method)?
+                .last()
+                .copied()?;
+            if !symbols.get(last).as_parameter()?.is_params {
+                return None;
+            }
+            let mut sink = Diagnostics::new();
+            Some(
+                self.binder
+                    .type_of(last, &mut sink)
+                    .substitute(&resolved.substitution),
+            )
+        };
+        self.better_collection_type(&collection(&candidate.2)?, &collection(&best.2)?)
+    }
+
+    /// Which of two collection types a collection expression (or the elements
+    /// of a `params` collection) reaches is the better, for the same
+    /// elements: see [`Self::better_params_collection`].
+    fn better_collection_type(&self, ours: &Type, theirs: &Type) -> Option<bool> {
+        if ours == theirs
+            || !self.identical(
+                &self.collection_element(ours)?,
+                &self.collection_element(theirs)?,
+            )
+        {
+            return None;
+        }
+        let compilation = self.binder.compilation();
+        let named = |ty: &Type, metadata: &str| {
+            matches!(ty, Type::Named { symbol, .. }
+                if compilation.type_by_metadata_name(metadata) == Some(*symbol))
+        };
+        let read_only = |ty: &Type| named(ty, "System.ReadOnlySpan`1");
+        let span = |ty: &Type| named(ty, "System.Span`1");
+        let array_like = |ty: &Type| {
+            matches!(ty, Type::Array { rank: 1, .. })
+                || [
+                    "System.Collections.Generic.IEnumerable`1",
+                    "System.Collections.Generic.IReadOnlyCollection`1",
+                    "System.Collections.Generic.IReadOnlyList`1",
+                    "System.Collections.Generic.ICollection`1",
+                    "System.Collections.Generic.IList`1",
+                ]
+                .iter()
+                .any(|metadata| named(ty, metadata))
+        };
+        if read_only(ours) && span(theirs) || (read_only(ours) || span(ours)) && array_like(theirs)
+        {
+            return Some(true);
+        }
+        if read_only(theirs) && span(ours)
+            || (read_only(theirs) || span(theirs)) && array_like(ours)
+        {
+            return Some(false);
+        }
+        let forward = self.binder.converts_implicitly(ours, theirs);
+        let backward = self.binder.converts_implicitly(theirs, ours);
+        match (forward, backward) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        }
     }
 
     /// Whether two types are one, as far as overload resolution cares:
@@ -2531,6 +2619,13 @@ impl BodyBinder<'_> {
             };
             let downgradable = better.is_some() && self.lambda_may_give_way(*span, first, second);
             return (better, downgradable);
+        }
+        // A collection expression goes to the better of two collection types
+        // the way the elements of a `params` collection do (C# 12).
+        if matches!(inference, Some(InferenceArgument::Collection(_)))
+            && let Some(better) = self.better_collection_type(first, second)
+        {
+            return (Some(better), false);
         }
         (self.better_target(argument, first, second), false)
     }

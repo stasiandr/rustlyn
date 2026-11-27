@@ -928,10 +928,13 @@ impl Binder<'_> {
                 // `~0xFFFFFFFFFFFFFFFF` turns bits over, whatever number
                 // they spell.
                 if *operator == UnaryOperator::BitwiseNot {
+                    // The complement is taken in the type's own width: `~F.A` on
+                    // an enum over `byte` is 254, not -2.
                     let ty = self
                         .enum_underlying(&expression.ty)
                         .unwrap_or_else(|| expression.ty.clone());
-                    return Some(integer_like(&ty, !as_bits(&folded)?, self));
+                    let flipped = integer_like(&ty, !as_bits(&folded)?, self);
+                    return Some(self.constant_as(flipped, &ty));
                 }
                 let value = as_integer(&folded)?;
                 let value = match operator {
@@ -1068,7 +1071,11 @@ impl Binder<'_> {
                     // Not a constant, and CS0020 where it was written.
                     Integers::DivisionByZero => return None,
                 };
-                Some(integer_like(&ty, exact as i64, self))
+                // An enum over `byte` or `short` wraps at its own width where
+                // `unchecked` lets the number past it: `unchecked(F.All + 1)`
+                // is 0.
+                let wrapped = integer_like(&ty, exact as i64, self);
+                Some(self.constant_as(wrapped, &ty))
             }
             _ => None,
         }

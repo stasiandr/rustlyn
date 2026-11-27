@@ -1661,7 +1661,9 @@ impl BodyBinder<'_> {
     /// undoes the binding.
     fn bind_to_probe(&mut self, lambda: &BoundExpression, target: &Type) -> Option<LambdaProbe> {
         let floor = self.speculation_floor();
+        let outer_relabelled = std::mem::take(&mut self.dynamic_relabelled);
         let bound = self.convert(lambda.clone(), target);
+        let relabelled = std::mem::replace(&mut self.dynamic_relabelled, outer_relabelled);
         // The lambda's own index, not where the list ended before it was
         // bound: a lambda inside its body is recorded first.
         // A return type the lambda wrote is what it returns, whatever the
@@ -1677,11 +1679,23 @@ impl BodyBinder<'_> {
             if let Some(bound) = self.body.lambdas.get(index) {
                 returned_types(&bound.body, &mut all_returns);
             }
+            // A value that was `dynamic` and went to an `object` return is
+            // still `dynamic` as far as the lambda's own type goes.
+            for (ty, span, _) in &mut all_returns {
+                if relabelled.contains(span) {
+                    *ty = Type::Dynamic;
+                }
+            }
             let (returns, yields_value) = match self.body.lambdas.get(index) {
                 Some(bound) => (
                     written
                         .clone()
-                        .or_else(|| returned_type(&bound.body))
+                        .or_else(|| {
+                            returned_type(&bound.body).map(|first| match all_returns.first() {
+                                Some((ty, _, _)) if matches!(ty, Type::Dynamic) => ty.clone(),
+                                _ => first,
+                            })
+                        })
                         .unwrap_or(Type::Void),
                     matches!(
                         &bound.body.kind,

@@ -296,6 +296,9 @@ impl BodyBinder<'_> {
                     || crate::conversions::contains_dynamic(target))
                     && self.binder.identity_converts(&value.ty, target)))
         {
+            if matches!(value.ty, Type::Dynamic) {
+                self.dynamic_relabelled.insert(value.span);
+            }
             return BoundExpression::new(value.kind, target.clone(), value.span);
         }
         // `null` into a struct union is a union conversion through the case

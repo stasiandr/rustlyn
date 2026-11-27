@@ -154,6 +154,11 @@ pub struct BodyBinder<'a> {
     /// What binding a lambda against a delegate showed, by the lambda, the
     /// delegate and the locals around it (see `probe_lambda`).
     lambda_probes: HashMap<LambdaKey, Option<LambdaProbe>>,
+    /// The expressions a conversion to `object` took the `dynamic` off, by
+    /// span, while a lambda is probed: the conversion changes nothing at run
+    /// time and leaves no node, and the lambda's return type is `dynamic`
+    /// all the same.
+    dynamic_relabelled: std::collections::HashSet<TextSpan>,
     /// The nodes `syntax_at` has found, by span.
     syntax_found: std::cell::RefCell<HashMap<TextSpan, Option<SyntaxNode>>>,
     /// The outermost of `lambda_answers` read since this was last reset, by
@@ -521,6 +526,7 @@ impl<'a> BodyBinder<'a> {
             typeless_holes: HashMap::new(),
             pending_receiver: None,
             lambda_probes: HashMap::new(),
+            dynamic_relabelled: std::collections::HashSet::new(),
             syntax_found: std::cell::RefCell::new(HashMap::new()),
             answers_read: std::cell::Cell::new(usize::MAX),
             recover_lambdas: false,

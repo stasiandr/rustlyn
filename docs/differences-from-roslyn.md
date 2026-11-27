@@ -81,7 +81,12 @@ implements the behaviour.
   reported for a declaration or an assignment, not for an element of an array
   initializer.
 * Definite assignment follows `goto`, through a `finally` too; a body the binder did not
-  fully understand gets no CS0165 at all.
+  fully understand gets no CS0165 at all. An `is` pattern is known to take every value
+  where it is `var`, `_`, a pattern and its `not`, `null` together with a type test the
+  input always passes (`ni is int or null`, `o is object or null`), or numeric ranges
+  that cover the input's type; a property or positional pattern is looked into only
+  where each part cannot fail. Anything else leaves the `else` reachable, which can be a
+  CS0165 where Roslyn proves the pattern exhaustive.
 
 ## Interpreter
 

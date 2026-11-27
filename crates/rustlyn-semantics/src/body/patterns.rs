@@ -1499,7 +1499,13 @@ impl BodyBinder<'_> {
                 if arm.value.ty.is_error() {
                     continue;
                 }
-                if ty.is_error() || self.binder.converts_implicitly(&ty, &arm.value.ty) {
+                // Once an arm is `dynamic` the arms are: every type converts
+                // to it, and it converts back to every one, so an arm after
+                // it would otherwise take its place.
+                if ty.is_error()
+                    || (!matches!(ty, Type::Dynamic)
+                        && self.binder.converts_implicitly(&ty, &arm.value.ty))
+                {
                     ty = arm.value.ty.clone();
                 }
             }

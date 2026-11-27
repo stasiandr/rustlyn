@@ -2410,15 +2410,21 @@ fn always_matches(
         ) {
             (Some(false), _) | (_, Some(false)) => Some(false),
             (Some(true), Some(true)) => Some(true),
-            _ => None,
+            // `b is >= 0 and <= 255` on a `byte`.
+            _ => takes_everything(pattern, input?, non_null, walk).then_some(true),
         },
+        BoundPatternKind::Relational { .. } => {
+            takes_everything(pattern, input?, non_null, walk).then_some(true)
+        }
         BoundPatternKind::Or(left, right) => match (
             always_matches(left, input, non_null, walk),
             always_matches(right, input, non_null, walk),
         ) {
             (Some(true), _) | (_, Some(true)) => Some(true),
             (Some(false), Some(false)) => Some(false),
-            _ => None,
+            // `o is string or not string`, `ni is int or null`: neither side
+            // takes everything, but together they take every value there is.
+            _ => takes_everything(pattern, input?, non_null, walk).then_some(true),
         },
         // `s is Assignment(int left, var right)` on a struct: nothing is
         // tested — there is no null, no type to check, and `Deconstruct`
@@ -2479,6 +2485,401 @@ fn always_matches(
                 .then_some(true)
         }
         _ => None,
+    }
+}
+
+/// Whether a pattern is known to take every value of its input: null as well,
+/// unless the input cannot be null or is known not to be.
+fn takes_everything(
+    pattern: &BoundPattern,
+    input: &Type,
+    non_null: bool,
+    walk: &Walk<'_, '_>,
+) -> bool {
+    let may_be_null = !non_null && walk.type_may_be_null(input);
+    let held = walk
+        .binder
+        .nullable_underlying(input)
+        .unwrap_or_else(|| input.clone());
+    // `nb is true or false or null` on a `bool?`.
+    if walk.is_bool(&held)
+        && let Some([yes, no, nothing]) = walk.bool_values(pattern)
+    {
+        return yes && no && (nothing || !may_be_null);
+    }
+    let reach = coverage(pattern, input, walk);
+    (reach.null == Reach::All || !may_be_null) && reach.value == Reach::All
+}
+
+/// How much of one kind of value a pattern is known to take.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Every value of the kind.
+    All,
+    /// No value of the kind.
+    Nothing,
+    /// Not known: some, or the analysis cannot tell.
+    Unknown,
+}
+
+impl Reach {
+    const fn negate(self) -> Self {
+        match self {
+            Self::All => Self::Nothing,
+            Self::Nothing => Self::All,
+            Self::Unknown => Self::Unknown,
+        }
+    }
+
+    /// What both of two patterns taking a value says, `and`.
+    const fn both(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Nothing, _) | (_, Self::Nothing) => Self::Nothing,
+            (Self::All, Self::All) => Self::All,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// What either of two patterns taking a value says, `or`.
+    const fn either(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::All, _) | (_, Self::All) => Self::All,
+            (Self::Nothing, Self::Nothing) => Self::Nothing,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// What a pattern takes of the two kinds of value its input can hold: null,
+/// and everything else.
+#[derive(Clone, Copy)]
+struct Coverage {
+    null: Reach,
+    value: Reach,
+}
+
+/// What `pattern` is known to take of an input of type `input`. Only what is
+/// certain is said: a type test that takes every non-null value is the input's
+/// own type or one it reaches by a reference or a boxing conversion, `null`
+/// takes null and nothing else, and everything the analysis cannot place is
+/// `Unknown`.
+fn coverage(pattern: &BoundPattern, input: &Type, walk: &Walk<'_, '_>) -> Coverage {
+    let unknown = Coverage {
+        null: Reach::Unknown,
+        value: Reach::Unknown,
+    };
+    match &pattern.kind {
+        BoundPatternKind::Var { .. } | BoundPatternKind::Discard => Coverage {
+            null: Reach::All,
+            value: Reach::All,
+        },
+        BoundPatternKind::Type(ty) | BoundPatternKind::Declaration { ty, .. } => Coverage {
+            null: Reach::Nothing,
+            value: if takes_every_value(input, ty, walk) {
+                Reach::All
+            } else {
+                Reach::Unknown
+            },
+        },
+        BoundPatternKind::Constant(value) => match walk.binder.folded(value) {
+            Some(ConstantValue::Null) => Coverage {
+                null: Reach::All,
+                value: Reach::Nothing,
+            },
+            Some(_) => Coverage {
+                null: Reach::Nothing,
+                value: Reach::Unknown,
+            },
+            None => unknown,
+        },
+        BoundPatternKind::Relational { .. } => Coverage {
+            null: Reach::Nothing,
+            value: takes_every_number(pattern, input, walk).unwrap_or(Reach::Unknown),
+        },
+        // `{ }` and a property pattern whose parts cannot fail take what is
+        // not null, and `ni is { }` on an `int?` looks at the `int`.
+        BoundPatternKind::Recursive(_) => {
+            let held = walk
+                .binder
+                .nullable_underlying(input)
+                .unwrap_or_else(|| input.clone());
+            Coverage {
+                null: Reach::Nothing,
+                value: if always_matches(pattern, Some(&held), true, walk) == Some(true) {
+                    Reach::All
+                } else {
+                    Reach::Unknown
+                },
+            }
+        }
+        BoundPatternKind::Not(inner) => {
+            let inner = coverage(inner, input, walk);
+            Coverage {
+                null: inner.null.negate(),
+                value: takes_every_number(pattern, input, walk).unwrap_or(inner.value.negate()),
+            }
+        }
+        BoundPatternKind::And(left, right) => {
+            let (left, right) = (coverage(left, input, walk), coverage(right, input, walk));
+            Coverage {
+                null: left.null.both(right.null),
+                value: takes_every_number(pattern, input, walk)
+                    .unwrap_or(left.value.both(right.value)),
+            }
+        }
+        BoundPatternKind::Or(left, right) => {
+            // A pattern and its negation take everything between them.
+            let complement = |pattern: &BoundPattern, other: &BoundPattern| matches!(&pattern.kind, BoundPatternKind::Not(inner) if same_pattern(inner, other, walk));
+            if complement(left, right) || complement(right, left) {
+                return Coverage {
+                    null: Reach::All,
+                    value: Reach::All,
+                };
+            }
+            // `{ Next: null } or { Next: not null }`: one property read, and
+            // what is found in it taken whole by the two patterns together.
+            if splits_a_property(left, right, input, walk) {
+                return Coverage {
+                    null: Reach::Nothing,
+                    value: Reach::All,
+                };
+            }
+            let (left, right) = (coverage(left, input, walk), coverage(right, input, walk));
+            Coverage {
+                null: left.null.either(right.null),
+                value: takes_every_number(pattern, input, walk)
+                    .unwrap_or(left.value.either(right.value)),
+            }
+        }
+        _ => unknown,
+    }
+}
+
+/// `All` where the numbers a pattern takes of an integral input cover its
+/// whole range, as in `n is < 0 or >= 0` or `b is not (> 0 and < 255)`:
+/// the patterns are sets of ranges, which are worked out exactly. `None` where
+/// that does not settle it, and so says nothing against what is known
+/// otherwise.
+fn takes_every_number(pattern: &BoundPattern, input: &Type, walk: &Walk<'_, '_>) -> Option<Reach> {
+    let held = walk
+        .binder
+        .nullable_underlying(input)
+        .unwrap_or_else(|| input.clone());
+    let range = match walk.binder.special_of(&held)? {
+        SpecialType::SByte => (i128::from(i8::MIN), i128::from(i8::MAX)),
+        SpecialType::Byte => (0, i128::from(u8::MAX)),
+        SpecialType::Int16 => (i128::from(i16::MIN), i128::from(i16::MAX)),
+        SpecialType::UInt16 | SpecialType::Char => (0, i128::from(u16::MAX)),
+        SpecialType::Int32 => (i128::from(i32::MIN), i128::from(i32::MAX)),
+        SpecialType::UInt32 => (0, i128::from(u32::MAX)),
+        SpecialType::Int64 => (i128::from(i64::MIN), i128::from(i64::MAX)),
+        SpecialType::UInt64 => (0, i128::from(u64::MAX)),
+        _ => return None,
+    };
+    let taken = numbers_taken(pattern, &held, range, walk)?;
+    (taken == [range]).then_some(Reach::All)
+}
+
+/// The ranges of numbers, in order and apart, that a pattern takes of the
+/// values of `held` between `range.0` and `range.1`.
+fn numbers_taken(
+    pattern: &BoundPattern,
+    held: &Type,
+    range: (i128, i128),
+    walk: &Walk<'_, '_>,
+) -> Option<Vec<(i128, i128)>> {
+    let number = |value: &BoundExpression| crate::constant::as_exact(&walk.binder.folded(value)?);
+    let (low, high) = range;
+    Some(match &pattern.kind {
+        BoundPatternKind::Var { .. } | BoundPatternKind::Discard => vec![range],
+        BoundPatternKind::Type(ty) | BoundPatternKind::Declaration { ty, .. } if ty == held => {
+            vec![range]
+        }
+        BoundPatternKind::Constant(value) => match walk.binder.folded(value)? {
+            ConstantValue::Null => Vec::new(),
+            other => {
+                let at = crate::constant::as_exact(&other)?;
+                if (low..=high).contains(&at) {
+                    vec![(at, at)]
+                } else {
+                    Vec::new()
+                }
+            }
+        },
+        BoundPatternKind::Relational { operator, value } => {
+            let at = number(value)?;
+            let (from, to) = match operator {
+                BinaryOperator::LessThan => (low, at.checked_sub(1)?),
+                BinaryOperator::LessThanOrEqual => (low, at),
+                BinaryOperator::GreaterThan => (at.checked_add(1)?, high),
+                BinaryOperator::GreaterThanOrEqual => (at, high),
+                _ => return None,
+            };
+            let (from, to) = (from.max(low), to.min(high));
+            if from <= to {
+                vec![(from, to)]
+            } else {
+                Vec::new()
+            }
+        }
+        BoundPatternKind::Not(inner) => {
+            let taken = numbers_taken(inner, held, range, walk)?;
+            let mut rest = Vec::new();
+            let mut next = low;
+            for (from, to) in taken {
+                if from > next {
+                    rest.push((next, from - 1));
+                }
+                next = to + 1;
+            }
+            if next <= high {
+                rest.push((next, high));
+            }
+            rest
+        }
+        BoundPatternKind::Or(left, right) => {
+            let mut all = numbers_taken(left, held, range, walk)?;
+            all.extend(numbers_taken(right, held, range, walk)?);
+            all.sort_unstable();
+            let mut merged: Vec<(i128, i128)> = Vec::new();
+            for (from, to) in all {
+                match merged.last_mut() {
+                    Some(last) if from <= last.1 + 1 => last.1 = last.1.max(to),
+                    _ => merged.push((from, to)),
+                }
+            }
+            merged
+        }
+        BoundPatternKind::And(left, right) => {
+            let (left, right) = (
+                numbers_taken(left, held, range, walk)?,
+                numbers_taken(right, held, range, walk)?,
+            );
+            let mut both = Vec::new();
+            for (a, b) in &left {
+                for (c, d) in &right {
+                    let (from, to) = ((*a).max(*c), (*b).min(*d));
+                    if from <= to {
+                        both.push((from, to));
+                    }
+                }
+            }
+            both.sort_unstable();
+            both
+        }
+        _ => return None,
+    })
+}
+
+/// Whether two property patterns read the same one property, and between them
+/// take every value it has.
+fn splits_a_property(
+    first: &BoundPattern,
+    second: &BoundPattern,
+    input: &Type,
+    walk: &Walk<'_, '_>,
+) -> bool {
+    let (BoundPatternKind::Recursive(first), BoundPatternKind::Recursive(second)) =
+        (&first.kind, &second.kind)
+    else {
+        return false;
+    };
+    let held = walk
+        .binder
+        .nullable_underlying(input)
+        .unwrap_or_else(|| input.clone());
+    let plain = |pattern: &crate::bound::BoundRecursivePattern| {
+        pattern.positional.is_empty()
+            && pattern.deconstruct.is_none()
+            && pattern.properties.len() == 1
+            && pattern.ty.as_ref().is_none_or(|ty| *ty == held)
+    };
+    if !plain(first) || !plain(second) || first.properties[0].0 != second.properties[0].0 {
+        return false;
+    }
+    let member = first.properties[0].0;
+    let symbols = walk.binder.compilation().symbols();
+    if symbols.get(member).kind == crate::symbol::SymbolKind::Method {
+        return false;
+    }
+    let mut sink = crate::binder::Diagnostics::new();
+    let ty = walk.binder.type_of(member, &mut sink);
+    let either = BoundPattern::new(
+        BoundPatternKind::Or(
+            Box::new(first.properties[0].1.clone()),
+            Box::new(second.properties[0].1.clone()),
+        ),
+        first.properties[0].1.span,
+    );
+    takes_everything(&either, &ty, false, walk)
+}
+
+/// Whether a test for `tested` is passed by every value of `input` that is not
+/// null: the type itself, the type under a `T?`, or a base class or interface
+/// of it, `object` among them. A number widening or an operator is no such
+/// conversion, and `int?` as a pattern is not the type under it.
+fn takes_every_value(input: &Type, tested: &Type, walk: &Walk<'_, '_>) -> bool {
+    if walk.binder.nullable_underlying(tested).is_some() {
+        return false;
+    }
+    let held = walk
+        .binder
+        .nullable_underlying(input)
+        .unwrap_or_else(|| input.clone());
+    if held.is_error() || tested.is_error() {
+        return false;
+    }
+    if held == *tested {
+        return true;
+    }
+    // A base class or an interface of the type, as written: a conversion an
+    // operator makes is no such thing, and neither is a number widening.
+    matches!(tested, Type::Named { .. })
+        && !matches!(
+            held,
+            Type::TypeParameter(_) | Type::Pointer(_) | Type::Dynamic
+        )
+        && tested.symbol().is_some_and(|symbol| {
+            walk.binder.constructed_from(&held, symbol).as_ref() == Some(tested)
+        })
+}
+
+/// Whether two patterns test for the same thing, as far as they can be told
+/// apart without looking inside a property or positional pattern.
+fn same_pattern(first: &BoundPattern, second: &BoundPattern, walk: &Walk<'_, '_>) -> bool {
+    match (&first.kind, &second.kind) {
+        (
+            BoundPatternKind::Type(a) | BoundPatternKind::Declaration { ty: a, .. },
+            BoundPatternKind::Type(b) | BoundPatternKind::Declaration { ty: b, .. },
+        ) => a == b && !a.is_error(),
+        (BoundPatternKind::Constant(a), BoundPatternKind::Constant(b)) => {
+            match (walk.binder.folded(a), walk.binder.folded(b)) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            }
+        }
+        (
+            BoundPatternKind::Relational {
+                operator: a,
+                value: x,
+            },
+            BoundPatternKind::Relational {
+                operator: b,
+                value: y,
+            },
+        ) => {
+            a == b
+                && match (walk.binder.folded(x), walk.binder.folded(y)) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => false,
+                }
+        }
+        (BoundPatternKind::Not(a), BoundPatternKind::Not(b)) => same_pattern(a, b, walk),
+        (BoundPatternKind::And(a, b), BoundPatternKind::And(c, d))
+        | (BoundPatternKind::Or(a, b), BoundPatternKind::Or(c, d)) => {
+            same_pattern(a, c, walk) && same_pattern(b, d, walk)
+        }
+        _ => false,
     }
 }
 

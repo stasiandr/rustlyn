@@ -423,3 +423,195 @@ fn an_event_may_have_an_empty_nested_initializer() {
 fn an_out_variable_of_with_is_in_scope_in_the_elements() {
     clean("class C { void M() { int[] a = [with(out var x), x, x + 1]; } }");
 }
+
+// MARK: - `dynamic` beside another type
+
+#[test]
+fn a_conditional_with_a_dynamic_branch_is_dynamic_whichever_comes_first() {
+    // The type was the first branch's where that converted to the other's,
+    // so `flag ? text : dyn` was a `string` and the call on it was bound at
+    // compile time (and failed at run time); `flag ? dyn : text` was right.
+    clean(
+        "class C {
+             void M(bool flag, object o, string s, dynamic d, int i) {
+                 var a = flag ? o : d; int a1 = a.Length;
+                 var b = flag ? d : o; int b1 = b.Length;
+                 var c = flag ? s : d; int c1 = c.Missing();
+                 var e = flag ? i : d; int e1 = e.Missing;
+                 var f = flag ? null : d; int f1 = f.Missing;
+             }
+         }",
+    );
+}
+
+#[test]
+fn the_best_common_type_with_a_dynamic_among_the_elements_is_dynamic() {
+    clean(
+        "class C {
+             void M(bool flag, object o, string s, dynamic d, int i) {
+                 var a = new[] { o, d }; int a1 = a[0].Length;
+                 var b = new[] { d, o }; int b1 = b[0].Length;
+                 var c = new[] { s, d }; int c1 = c[1].Missing;
+                 var e = new[] { i, d }; int e1 = e[0].Missing;
+                 var f = flag switch { true => o, _ => d }; int f1 = f.Length;
+                 var g = flag switch { true => d, _ => o }; int g1 = g.Length;
+             }
+         }",
+    );
+}
+
+#[test]
+fn a_lambda_that_gives_back_a_dynamic_value_has_that_type_to_inference() {
+    // The conversion of the body to the `object` the probe asks for took the
+    // `dynamic` with it, so `T` was inferred as `object` and `a.Length` was
+    // reported as missing.
+    clean(
+        "class C {
+             static T Make<T>(System.Func<T> f) => f();
+             static T Apply<A, T>(A a, System.Func<A, T> f) => f(a);
+             void M(dynamic d, object o, bool flag) {
+                 var a = Make(() => (dynamic)\"abc\"); int a1 = a.Length;
+                 var b = Make(() => d); int b1 = b.Length;
+                 var c = Apply(1, x => (dynamic)x); int c1 = c.Missing;
+                 var e = Make(() => { if (flag) return o; return d; }); int e1 = e.Length;
+                 var f = Make(() => { if (flag) return d; return o; }); int f1 = f.Length;
+                 var g = Make(() => flag ? o : d); int g1 = g.Length;
+             }
+         }",
+    );
+}
+
+#[test]
+fn a_lambda_that_gives_back_an_object_stays_an_object() {
+    assert_eq!(
+        errors(
+            "class C {
+                 static T Make<T>(System.Func<T> f) => f();
+                 void M(object o) {
+                     var a = Make(() => o); int a1 = a.Length;
+                     var b = Make(() => (object)\"abc\"); int b1 = b.Length;
+                 }
+             }"
+        ),
+        ["CS1061", "CS1061"]
+    );
+}
+
+// MARK: - `+` and `-` on delegates
+
+#[test]
+fn a_delegate_combined_with_a_lambda_or_a_method_group_takes_the_delegates_type() {
+    clean(
+        "class C {
+             static void Log(int x) { }
+             static int One() => 1;
+             void M() {
+                 System.Action<int> a = x => { };
+                 System.Action<int> b = a + (x => Log(x));
+                 System.Action<int> c = (x => Log(x)) + a;
+                 System.Action<int> d = a + Log;
+                 System.Action<int> e = Log + a;
+                 System.Action<int> f = a - Log;
+                 System.Action<int> g = a + delegate (int x) { };
+                 System.Func<int> h = One;
+                 System.Func<int> i = h + (() => 2);
+                 var j = a + (x => Log(x));
+                 object k = a - (x => { });
+                 a += x => Log(x);
+                 a -= Log;
+             }
+         }",
+    );
+}
+
+#[test]
+fn a_delegate_combined_with_what_cannot_be_it_is_an_operator_error() {
+    // Two functions say nothing to each other, and a lambda with another
+    // number of parameters than the delegate cannot be the delegate.
+    assert_eq!(
+        errors(
+            "class C {
+                 static void Log(int x) { }
+                 void M() {
+                     System.Action<int> a = x => { };
+                     var b = (x => { }) + (y => { });
+                     var c = a + (() => { });
+                     var d = Log + Log;
+                     var e = a + ((x, y) => { });
+                 }
+             }"
+        ),
+        ["CS0019", "CS0019", "CS0019", "CS0019"]
+    );
+}
+
+// MARK: - `is` patterns that take every value
+
+#[test]
+fn a_pattern_that_takes_every_value_leaves_nothing_unassigned() {
+    // `or` of what does not match and what does covers the input, which
+    // Roslyn knows, and the `else` it implies is never taken.
+    clean(
+        "class C {
+             void M(object o, int? ni, string s, int n, bool? nb, byte by, N link) {
+                 int a; if (ni is int or null) a = 1; Use(a);
+                 int b; if (o is string or not string) b = 1; Use(b);
+                 int c; if (s is null or not null) c = 1; Use(c);
+                 int d; if (o is object or null) d = 1; Use(d);
+                 int e; if (o is not null or null) e = 1; Use(e);
+                 int f; if (ni is { } or null) f = 1; Use(f);
+                 int g; if (ni is null or int) g = 1; Use(g);
+                 int h; if (s is object or null) h = 1; Use(h);
+                 int i; if (o is not object or object) i = 1; Use(i);
+                 int j; if ((o is string or not string) && true) j = 1; Use(j);
+                 int k; if (ni is int or not int) k = 1; Use(k);
+                 int l; if (nb is true or false or null) l = 1; Use(l);
+                 int m; if (n is < 0 or >= 0) m = 1; Use(m);
+                 int p; if (ni is (< 0 or >= 0) or null) p = 1; Use(p);
+                 int q; if (by is >= 0 and <= 255) q = 1; Use(q);
+                 int r; if (n is (> 0 and < 10) or not (> 0 and < 10)) r = 1; Use(r);
+                 int t; if (link is { Next: null } or { Next: not null } or null) t = 1; Use(t);
+             }
+             static void Use(int x) { }
+         }
+         class N { public N Next; }",
+    );
+}
+
+#[test]
+fn a_pattern_that_may_miss_a_value_still_leaves_a_variable_unassigned() {
+    // Each of these takes everything but one kind of value, and the use after
+    // it is CS0165 in Roslyn.
+    for pattern in [
+        "ni is int",
+        "ni is null",
+        "ni is not null",
+        "o is string",
+        "o is string or int",
+        "o is not null",
+        "s is object",
+        "s is string",
+        "s is not null or \"a\"",
+        "o is not int and not null or null",
+        "ni is int or not null",
+        "ni is (> 0 or < 0) or null",
+        "ni is (> 0 or < 0)",
+        "by is >= 0 and < 255",
+        "link is { Next: null } or { Next: not null }",
+        "link is { Next: null } or null",
+    ] {
+        assert_eq!(
+            errors(&format!(
+                "class C {{
+                     void M(object o, int? ni, string s, byte by, N link) {{
+                         int r; if ({pattern}) r = 1; Use(r);
+                     }}
+                     static void Use(int x) {{ }}
+                 }}
+                 class N {{ public N Next; }}"
+            )),
+            ["CS0165"],
+            "{pattern}"
+        );
+    }
+}

@@ -18892,6 +18892,71 @@ Cat Cat (2, u) d
     );
 }
 
+#[test]
+fn an_enum_constant_complement_is_taken_in_the_width_of_its_type() {
+    // The complement of an enum constant folds in the enum's underlying type: `~F.A` on an
+    // enum over `byte` is 254, and the same over `ushort`, `uint`, `sbyte`, `short` and the
+    // 64-bit types. It used to fold in 32 bits, so a `const` mask was -2, `~F.A == (F)254`
+    // was false and `(byte)~F.None` was reported as out of range.
+    check(
+        "enum_complement_widths",
+        r#"using System;
+[Flags] enum SB : sbyte { None = 0, A = 1, B = 2, All = ~None, NotA = ~A }
+[Flags] enum B8 : byte { None = 0, A = 1, B = 2 }
+[Flags] enum S16 : short { None = 0, A = 1, NotA = ~A }
+[Flags] enum U16 : ushort { None = 0, A = 1, B = 2 }
+[Flags] enum I32 : int { None = 0, A = 1, NotA = ~A }
+[Flags] enum U32 : uint { None = 0, A = 1, All = ~None, NotA = ~A }
+[Flags] enum I64 : long { None = 0, A = 1, NotA = ~A }
+[Flags] enum U64 : ulong { None = 0, A = 1, All = ~None, NotA = ~A }
+class Attr : Attribute { public Attr(B8 b) { B = b; } public B8 B; }
+[Attr(~B8.A)]
+class P {
+  const B8 Mask = ~B8.A;
+  const U16 M2 = ~(U16.A | U16.B);
+  static void D(B8 b = ~B8.B) { Console.WriteLine((int)b); }
+  static void Main() {
+    Console.WriteLine((int)SB.All + " " + (int)SB.NotA);
+    Console.WriteLine((int)(~B8.None) + " " + (int)(~B8.A) + " " + (int)(~(B8.A | B8.B)));
+    Console.WriteLine((int)S16.NotA);
+    Console.WriteLine((int)(~U16.None) + " " + (int)(~U16.A) + " " + (int)M2);
+    Console.WriteLine((int)I32.NotA + " " + (long)U32.All + " " + (long)U32.NotA);
+    Console.WriteLine((long)I64.NotA + " " + (ulong)U64.All + " " + (ulong)U64.NotA);
+    Console.WriteLine((int)Mask + " " + (Mask == (B8)254) + " " + (~B8.A == (B8)254));
+    Console.WriteLine((byte)~B8.None + " " + (ushort)~U16.A + " " + (uint)~U32.None);
+    Console.WriteLine((int)(typeof(P).GetCustomAttributes(typeof(Attr), false)[0] as Attr).B);
+    D();
+    switch ((B8)254) { case ~B8.A: Console.WriteLine("case"); break; default: Console.WriteLine("default"); break; }
+    switch ((U16)65534) { case ~U16.A: Console.WriteLine("case"); break; default: Console.WriteLine("default"); break; }
+    const int x = (int)~B8.A; Console.WriteLine(x);
+    Console.WriteLine(~B8.A);
+    Console.WriteLine(~U32.A);
+    Console.WriteLine(~SB.A);
+    Console.WriteLine((B8)(~B8.A | B8.B));
+  }
+}
+"#,
+        "-1 -2
+255 254 252
+-2
+65535 65534 65532
+-2 4294967295 4294967294
+-2 18446744073709551615 18446744073709551614
+254 True True
+255 65534 4294967295
+254
+253
+case
+case
+254
+254
+NotA
+NotA
+254
+",
+    );
+}
+
 /// The name of a call passes over what cannot be called (§12.8.10.2): an
 /// `int Baz` the type inherits does not hide the `Baz(int)` or the delegate
 /// `Cb` of a type further out, and binding it reported CS0120 in a static
@@ -19525,5 +19590,380 @@ class P {
 <Outer:Tag(l3)|ret=|p=a=Tag(l3p)
 <Outer:Tag(l4)|ret=|p=a=;b=Tag(l4b)
 "#,
+    );
+}
+
+#[test]
+fn dynamic_beside_another_type_is_dynamic_whichever_comes_first() {
+    // A conditional, a `??`, an array, a switch and the return of a lambda give `dynamic` where
+    // one of the values is `dynamic`, whatever the order: `flag ? o : d` was `object`, and
+    // `Make(() => d)` inferred `object`, so the member access that follows failed at run time
+    // or was reported as missing.
+    check(
+        "dynamic_meets_object",
+        r#"using System;
+using System.Collections.Generic;
+using System.Linq;
+class P {
+  static string Name<T>(T x) => typeof(T).Name;
+  static string N<T>(T[] x) => typeof(T).Name + "[]";
+  static T Make<T>(Func<T> f) => f();
+  static string Of<T>(Func<T> f) => typeof(T).Name;
+  static string Of2<T>(Func<int, T> f) => typeof(T).Name;
+  static string Arg<T>(IEnumerable<T> e) => typeof(T).Name;
+  static void Main() {
+    dynamic d = 5; string s = "str"; object o = "obj"; int i = 3;
+    bool t = true, f = false;
+    Console.WriteLine(Name(t ? o : d));
+    Console.WriteLine(Name(t ? d : o));
+    Console.WriteLine(Name(f ? s : d));
+    Console.WriteLine(Name(f ? d : s));
+    Console.WriteLine(Name(t ? i : d));
+    Console.WriteLine(Name(t ? d : i));
+    Console.WriteLine(Name(t ? d : d));
+    var r = false ? s : d; Console.WriteLine(r);
+    var r2 = true ? i : d; Console.WriteLine(r2 + 1);
+    Console.WriteLine(Name(d ?? o));
+    Console.WriteLine(Name(o ?? d));
+    Console.WriteLine(Name(s ?? d));
+    Console.WriteLine(N(new[] { o, d }));
+    Console.WriteLine(N(new[] { d, o }));
+    Console.WriteLine(N(new[] { s, d }));
+    Console.WriteLine(N(new[] { i, d }));
+    Console.WriteLine(N(new[] { o, o }));
+    Console.WriteLine(Name(t switch { true => o, _ => d }));
+    Console.WriteLine(Name(t switch { true => d, _ => o }));
+    Console.WriteLine(Name(t switch { true => s, _ => d }));
+    Console.WriteLine(Name(t switch { true => o, _ => s }));
+    Console.WriteLine(Of(() => d));
+    Console.WriteLine(Of(() => (dynamic)"abc"));
+    Console.WriteLine(Of(() => (object)d));
+    Console.WriteLine(Of(() => t ? o : d));
+    Console.WriteLine(Of(() => { if (t) return o; return d; }));
+    Console.WriteLine(Of(() => { if (t) return d; return o; }));
+    Console.WriteLine(Of(() => { if (t) return s; return d; }));
+    Console.WriteLine(Of(() => { if (t) return i; return d; }));
+    Console.WriteLine(Of2(x => d));
+    Console.WriteLine(Of2(x => (dynamic)x));
+    Console.WriteLine(Of2(x => (object)x));
+    Console.WriteLine(Of2(x => x));
+    var a = Make(() => (dynamic)"abc"); Console.WriteLine(a.Length);
+    var q = new[] { "a", "bb" }.Select(x => (dynamic)x);
+    Console.WriteLine(Arg(q));
+    Console.WriteLine(q.First().Length);
+    Console.WriteLine(Arg(new[] { 1, 2 }.Select(x => (object)x)));
+    Console.WriteLine(Arg(new[] { 1, 2 }.Select(x => d)));
+    var l = new[] { 1, 2 }.Select(x => (dynamic)x).ToList(); Console.WriteLine(l[1] + 1);
+    Console.WriteLine(Name(new[] { 1, 2 }.Select(x => (dynamic)x).ToList()));
+    Console.WriteLine(Name(new[] { 1, 2 }.Select(x => (dynamic)x).ToArray()));
+    Console.WriteLine(Name(new[] { 1, 2 }.Select(x => x > 1 ? (object)x : d).First()));
+    Console.WriteLine(Name(new[] { 1, 2 }.Select(x => x > 1 ? d : (object)x).First()));
+    Func<object> fo = () => d; Console.WriteLine(Name(fo()));
+    Func<dynamic> fd = () => o; Console.WriteLine(Name(fd()));
+  }
+}
+"#,
+        "String
+Int32
+Int32
+String
+Int32
+Int32
+Int32
+5
+4
+Int32
+String
+String
+Object[]
+Object[]
+Object[]
+Object[]
+Object[]
+String
+Int32
+String
+Object
+Object
+Object
+Object
+Object
+Object
+Object
+Object
+Object
+Object
+Object
+Object
+Int32
+3
+Object
+1
+Object
+Object
+3
+List`1
+Object[]
+Int32
+Int32
+Object
+String
+",
+    );
+}
+
+#[test]
+fn a_delegate_plus_a_lambda_or_a_method_group_combines_them() {
+    // `+` and `-` take a lambda, an anonymous method or a method group on either side of a
+    // delegate, which then is a value of the delegate's type. It used to reach the emitter
+    // as a lambda with no type.
+    check(
+        "delegate_operators",
+        r#"using System;
+class P {
+  static void M(int x) { Console.Write("M" + x + ";"); }
+  static int G() => 2;
+  static void Main() {
+    Action<int> ai = x => Console.Write("a" + x + ";");
+    Action<int> a1 = ai + (x => Console.Write("b" + x + ";"));
+    Action<int> a2 = ai + M;
+    Action<int> a3 = (x => Console.Write("c" + x + ";")) + ai;
+    Action<int> a4 = ai + delegate (int x) { Console.Write("d" + x + ";"); };
+    Action<int> a5 = ai - M;
+    Action<int> a6 = M + ai;
+    Action<int> a7 = ai; a7 += x => Console.Write("e" + x + ";");
+    a7 += M; a7 -= M;
+    Func<int> f = () => 1;
+    Func<int> f2 = f + (() => 2);
+    Func<int> f3 = f + G;
+    var v = ai + (x => Console.Write("v" + x + ";"));
+    Console.WriteLine();
+    a1(1); a2(1); a3(1); a4(1); a5(1); a6(1); a7(1); Console.WriteLine(f2() + f3());
+  }
+}
+"#,
+        "
+a1;b1;a1;M1;c1;a1;a1;d1;a1;M1;a1;a1;e1;4
+",
+    );
+}
+
+#[test]
+fn params_collections_of_one_element_type_prefer_the_span() {
+    // Of two `params` collections taking the same elements in the expanded form, a span beats an
+    // array and the interfaces an array stands for, and `ReadOnlySpan<T>` beats `Span<T>`;
+    // an array passed as itself still takes the overload with the array.
+    check(
+        "params_collection_betterness",
+        r#"using System;
+using System.Collections.Generic;
+class A {
+  public static void Pm(int x, params ReadOnlySpan<int> a) { Console.Write("A-span-more;"); }
+  public static void Pm(params int[] a) { Console.Write("A-array;"); }
+  public static void T() { Pm(1, 2); Pm(1, 2, 3); Console.WriteLine(); }
+}
+class B {
+  public static void Pm(params ReadOnlySpan<int> a) { Console.Write("B-span;"); }
+  public static void Pm(int x, params int[] a) { Console.Write("B-array-more;"); }
+  public static void T() { Pm(1, 2); Pm(1, 2, 3); Console.WriteLine(); }
+}
+class C {
+  public static void Pm<T>(params ReadOnlySpan<T> a) { Console.Write("C-generic-span;"); }
+  public static void Pm(params int[] a) { Console.Write("C-array;"); }
+  public static void T() { Pm(1, 2); Pm(1); Pm(); Console.WriteLine(); }
+}
+class D {
+  public static void Pm<T>(params T[] a) { Console.Write("D-generic-array;"); }
+  public static void Pm(params ReadOnlySpan<int> a) { Console.Write("D-span;"); }
+  public static void T() { Pm(1, 2); Pm(1); Console.WriteLine(); }
+}
+class E {
+  public static void Pm<T>(params T[] a) { Console.Write("E-array;"); }
+  public static void Pm<T>(params ReadOnlySpan<T> a) { Console.Write("E-span;"); }
+  public static void T() { Pm(1, 2); Pm("a"); Console.WriteLine(); }
+}
+class F {
+  public static void Pm(params int[] a) { Console.Write("F-array;"); }
+  public static void Pm(params ReadOnlySpan<int> a) { Console.Write("F-span;"); }
+  public static void T() { Pm(new[] { 1 }); Pm(new int[0]); int[] x = { 1 }; Pm(x); Pm(1, 2); Pm(); Pm(1); Pm((ReadOnlySpan<int>)x); Pm(x.AsSpan()); Console.WriteLine(); }
+}
+class G {
+  public static void Pm(string s, params int[] a) { Console.Write("G-array;"); }
+  public static void Pm(object s, params ReadOnlySpan<int> a) { Console.Write("G-span;"); }
+  public static void T() { Pm("s", 1); Pm(1, 2); Console.WriteLine(); }
+}
+class H {
+  public static void Pm(params IEnumerable<int> a) { Console.Write("H-ienum;"); }
+  public static void Pm(params ReadOnlySpan<int> a) { Console.Write("H-span;"); }
+  public static void Pm(params IReadOnlyList<int> a) { Console.Write("H-irl;"); }
+  public static void T() { Pm(1, 2); Console.WriteLine(); }
+}
+class I {
+  public static void Pm(params Span<int> a) { Console.Write("I-span;"); }
+  public static void Pm(params ReadOnlySpan<int> a) { Console.Write("I-rospan;"); }
+  public static void T() { Pm(1, 2); Pm(); Pm(1); Span<int> s = stackalloc int[2]; Pm(s); Pm((ReadOnlySpan<int>)s); Console.WriteLine(); }
+}
+class J {
+  public static void Pm(params int[] a) { Console.Write("J-array;"); }
+  public static void Pm(params ReadOnlySpan<long> a) { Console.Write("J-rospan-long;"); }
+  public static void T() { Pm(1, 2); Pm((byte)1); Console.WriteLine(); }
+}
+class K {
+  public static void Pm(params long[] a) { Console.Write("K-array-long;"); }
+  public static void Pm(params ReadOnlySpan<int> a) { Console.Write("K-rospan-int;"); }
+  public static void T() { Pm(1, 2); Console.WriteLine(); }
+}
+class L {
+  public static void Pm(params object[] a) { Console.Write("L-array;"); }
+  public static void Pm(params ReadOnlySpan<string> a) { Console.Write("L-rospan-str;"); }
+  public static void T() { Pm("a", "b"); Pm("a", 1); Console.WriteLine(); }
+}
+class Q {
+  static void Main() { A.T(); B.T(); C.T(); D.T(); E.T(); F.T(); G.T(); H.T(); I.T(); J.T(); K.T(); L.T(); }
+}
+"#,
+        "A-span-more;A-span-more;
+B-array-more;B-array-more;
+C-array;C-array;C-array;
+D-span;D-span;
+E-span;E-span;
+F-array;F-array;F-array;F-span;F-span;F-span;F-span;F-span;
+G-array;G-span;
+H-span;
+I-rospan;I-rospan;I-rospan;I-span;I-rospan;
+J-array;J-array;
+K-rospan-int;
+L-rospan-str;L-array;
+",
+    );
+}
+
+#[test]
+fn enum_constants_wrap_at_the_width_of_their_underlying_type() {
+    // Arithmetic on enum constants happens in the underlying type: `unchecked(F.All + 1)` on an
+    // enum over `byte` is 0 and `~U16.Top` is 0, where the 32-bit result used to be kept.
+    check(
+        "enum_constant_arithmetic",
+        r#"using System;
+[Flags] enum B8 : byte { None = 0, A = 1, B = 2, C = 128, All = 255 }
+[Flags] enum S8 : sbyte { None = 0, A = 1, Min = -128 }
+[Flags] enum U16 : ushort { None = 0, A = 1, Top = 65535 }
+[Flags] enum S16 : short { None = 0, A = 1, Min = -32768 }
+[Flags] enum U32 : uint { None = 0, A = 1, Top = 4294967295 }
+[Flags] enum U64 : ulong { None = 0, A = 1, Top = 18446744073709551615 }
+class P {
+  const B8 D1 = B8.All - 1;
+  const B8 D2 = B8.A | B8.C;
+  const B8 D3 = B8.All ^ B8.A;
+  const B8 D4 = B8.All & ~B8.A;
+  const B8 D5 = B8.A + 2;
+  const B8 D6 = 3 + B8.A;
+  const int D7 = (int)(B8.All - B8.A);
+  const U16 D8 = U16.Top - 1;
+  const S8 D9 = S8.Min + 1;
+  const S16 D10 = ~S16.Min;
+  const U32 D11 = ~U32.Top;
+  const U64 D12 = ~U64.A;
+  const B8 D13 = unchecked(B8.All + 1);
+  const S8 D14 = unchecked(S8.Min - 1);
+  const U16 D15 = unchecked(U16.Top + 1);
+  const bool D16 = (B8.All & ~B8.C) == (B8)127;
+  const B8 D17 = (B8)(~B8.A & B8.All);
+  static void Main() {
+    Console.WriteLine((int)D1 + " " + (int)D2 + " " + (int)D3 + " " + (int)D4 + " " + (int)D5 + " " + (int)D6 + " " + D7);
+    Console.WriteLine((int)D8 + " " + (int)D9 + " " + (int)D10 + " " + (long)D11 + " " + (ulong)D12);
+    Console.WriteLine((int)D13 + " " + (int)D14 + " " + (int)D15 + " " + D16 + " " + (int)D17);
+    B8 b = B8.All; b = ~b; Console.WriteLine(b);
+    B8 c = B8.A; c = ~c; Console.WriteLine((int)c);
+    Console.WriteLine(~(B8.A | B8.B));
+    Console.WriteLine((int)(~(B8.A | B8.B)) + " " + (int)~S8.None + " " + (int)~U16.Top);
+    var e = ~B8.A; Console.WriteLine(e.GetType().Name + " " + (int)e);
+    switch ((B8)253) { case ~(B8.B): Console.WriteLine("hit"); break; }
+    Console.WriteLine(((B8)254).HasFlag(~B8.A));
+  }
+}
+"#,
+        "254 129 254 254 3 4 254
+65534 -127 32767 0 18446744073709551614
+0 127 0 True 254
+None
+254
+252
+252 -1 0
+B8 254
+hit
+True
+",
+    );
+}
+
+#[test]
+fn an_is_pattern_that_takes_every_value_leaves_nothing_unassigned() {
+    // Where the patterns of an `or` take every value between them (a type and `null`, a pattern
+    // and its `not`, ranges that cover the type) the `else` of the `is` cannot be reached, so
+    // what the `then` assigns is assigned: this program compiled with CS0165 on each of them.
+    check(
+        "exhaustive_is_patterns",
+        r#"#pragma warning disable
+using System;
+class P {
+  static string Describe(object o, int? ni, string s, int n) {
+    int a; if (ni is int or null) a = 1;
+    int b; if (o is string or not string) b = 2;
+    int c; if (s is null or not null) c = 3;
+    int d; if (o is object or null) d = 4;
+    int e; if (o is not null or null) e = 5;
+    int f; if (ni is { } or null) f = 6;
+    int g; if (ni is null or int) g = 7;
+    int h; if (n is < 0 or >= 0) h = 8;
+    int i; if (n is (> 0 and < 10) or not (> 0 and < 10)) i = 9;
+    int j; if (ni is (< 0 or >= 0) or null) j = 10;
+    int k; if (!(o is string or not string)) { k = 0; } else k = 11;
+    return $"{a} {b} {c} {d} {e} {f} {g} {h} {i} {j} {k}";
+  }
+  static void Main() {
+    Console.WriteLine(Describe("x", 5, "s", 3));
+    Console.WriteLine(Describe(null, null, null, -3));
+    Console.WriteLine(Describe(4, 0, "", 0));
+  }
+}
+"#,
+        "1 2 3 4 5 6 7 8 9 10 11
+1 2 3 4 5 6 7 8 9 10 11
+1 2 3 4 5 6 7 8 9 10 11
+",
+    );
+}
+
+#[test]
+fn a_collection_expression_goes_to_the_better_collection_type() {
+    // A collection expression given to one of two parameters of different collection types takes
+    // the span over the array and the interfaces, `ReadOnlySpan<T>` over `Span<T>`, and otherwise
+    // the type that converts to the other and not back: it used to take the first declared.
+    check(
+        "collection_expressions_prefer_the_span",
+        r#"using System;
+using System.Collections.Generic;
+class A {
+  static void F(int[] a) { Console.Write("array;"); }
+  static void F(Span<int> a) { Console.Write("span;"); }
+  static void G(Span<int> a) { Console.Write("span;"); }
+  static void G(ReadOnlySpan<int> a) { Console.Write("rospan;"); }
+  static void H(IEnumerable<int> a) { Console.Write("ienumerable;"); }
+  static void H(ReadOnlySpan<int> a) { Console.Write("rospan;"); }
+  static void I(IList<int> a) { Console.Write("ilist;"); }
+  static void I(List<int> a) { Console.Write("list;"); }
+  static void J(IEnumerable<int> a) { Console.Write("ienumerable;"); }
+  static void J(IReadOnlyList<int> a) { Console.Write("ireadonlylist;"); }
+  static void K(Span<int> x, params int[] y) { Console.Write("span-array;"); }
+  static void K(int[] x, params ReadOnlySpan<int> y) { Console.Write("array-rospan;"); }
+  static void Main() {
+    F([1, 2]); G([1]); H([1, 2, 3]); I([1]); J([1]); F([]); G([]); K([1], 2);
+    Console.WriteLine();
+  }
+}
+"#,
+        "span;rospan;rospan;list;ireadonlylist;span;rospan;span-array;
+",
     );
 }

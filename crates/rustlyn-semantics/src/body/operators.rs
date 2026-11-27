@@ -1274,6 +1274,83 @@ impl BodyBinder<'_> {
         } else {
             (left, right)
         };
+        // `handlers + (x => Log(x))` and `handlers - Remove` combine a
+        // delegate with a lambda or a method group, which is a value of the
+        // delegate's type there (§12.12.9): the one operand with a type
+        // says what the other is. Two such operands say nothing to each
+        // other, and a lambda that takes another number of parameters than
+        // the delegate cannot be it.
+        let (left, right) = if matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract) {
+            let function = |value: &BoundExpression| {
+                matches!(
+                    value.kind,
+                    BoundExpressionKind::UnboundLambda(_) | BoundExpressionKind::MethodGroup { .. }
+                )
+            };
+            let delegate = |this: &Self, value: &BoundExpression| {
+                !value.ty.is_error()
+                    && value.ty.symbol().is_some_and(|symbol| {
+                        this.binder.compilation().symbols().get(symbol).type_kind()
+                            == Some(crate::TypeKind::Delegate)
+                    })
+            };
+            // Roslyn names an operand that has no type by what it is.
+            let described = |this: &Self, value: &BoundExpression| match &value.kind {
+                BoundExpressionKind::MethodGroup { .. } => "method group".to_string(),
+                BoundExpressionKind::UnboundLambda(at)
+                    if this.syntax_at(*at).is_some_and(|node| {
+                        node.kind() == SyntaxKind::AnonymousMethodExpression
+                    }) =>
+                {
+                    "anonymous method".to_string()
+                }
+                BoundExpressionKind::UnboundLambda(_) => "lambda expression".to_string(),
+                _ => this.display(&value.ty),
+            };
+            let (at_left, at_right) = (function(&left), function(&right));
+            let takes_the_other =
+                at_left != at_right && delegate(self, if at_left { &right } else { &left });
+            let unfit = if at_left && at_right {
+                true
+            } else if takes_the_other {
+                let (value, other) = if at_left {
+                    (&left, &right)
+                } else {
+                    (&right, &left)
+                };
+                matches!(value.kind, BoundExpressionKind::UnboundLambda(_))
+                    && !self.lambda_fits(value, &other.ty)
+            } else {
+                false
+            };
+            if unfit {
+                let text = operator_token_text(operator).to_string();
+                let (shown_left, shown_right) = (described(self, &left), described(self, &right));
+                self.report(
+                    ErrorCode::ErrBadBinaryOps,
+                    span,
+                    &[&text, &shown_left, &shown_right],
+                );
+                return BoundExpression::error(span);
+            }
+            if takes_the_other {
+                let (value, other) = if at_left {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                let converted = self.convert(value, &other.ty);
+                if at_left {
+                    (converted, other)
+                } else {
+                    (other, converted)
+                }
+            } else {
+                (left, right)
+            }
+        } else {
+            (left, right)
+        };
         if matches!(left.ty, Type::Dynamic) || matches!(right.ty, Type::Dynamic) {
             return self.bind_dynamic_binary(operator, left, right, span);
         }
