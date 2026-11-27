@@ -125,6 +125,9 @@ pub struct BodyBinder<'a> {
     /// Whether the expression being bound is a `nameof`'s argument, which is
     /// never evaluated: an outer type's instance member is a name there.
     pub(super) in_nameof: bool,
+    /// Set while the name of a call is bound: what cannot be called does
+    /// not hide what can.
+    pub(super) invoked: bool,
     /// What the lambdas of the overload resolutions under way were found
     /// to return, innermost resolution last (see [`inference`]).
     lambda_answers: std::cell::RefCell<Vec<inference::LambdaAnswers>>,
@@ -512,6 +515,7 @@ impl<'a> BodyBinder<'a> {
             in_initializer,
             in_attribute: false,
             in_nameof: false,
+            invoked: false,
             lambda_answers: std::cell::RefCell::default(),
             argument_names: std::cell::RefCell::default(),
             typeless_holes: HashMap::new(),

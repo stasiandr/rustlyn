@@ -543,26 +543,29 @@ impl BodyBinder<'_> {
         None
     }
 
+    /// Whether a member can be what `Name(...)` calls: a method, or
+    /// something that may hold a delegate.
+    pub(super) fn is_callable_member(&self, id: SymbolId) -> bool {
+        match self.kind_of(id) {
+            SymbolKind::NamedType => false,
+            SymbolKind::Field | SymbolKind::Property | SymbolKind::Event => {
+                let ty = self.binder.type_of(id, &mut Diagnostics::new());
+                let ty = ty.value();
+                ty.is_error()
+                    || matches!(ty, Type::Dynamic | Type::TypeParameter(_))
+                    || self.is_invocable(ty)
+            }
+            _ => true,
+        }
+    }
+
     /// [`Self::declaring_enclosing`] for the name of a call: a member that
     /// cannot be called — a constant, a nested type, a field that holds no
     /// delegate — does not hide the method of that name in a type further
     /// out (§12.8.10.2). Where no type has anything callable, it is the
     /// one that has anything.
     pub(super) fn declaring_enclosing_callable(&self, name: &str) -> Option<SymbolId> {
-        let callable = |id: SymbolId| {
-            let kind = self.kind_of(id);
-            match kind {
-                SymbolKind::NamedType => false,
-                SymbolKind::Field | SymbolKind::Property | SymbolKind::Event => {
-                    let ty = self.binder.type_of(id, &mut Diagnostics::new());
-                    let ty = ty.value();
-                    ty.is_error()
-                        || matches!(ty, Type::Dynamic | Type::TypeParameter(_))
-                        || self.is_invocable(ty)
-                }
-                _ => true,
-            }
-        };
+        let callable = |id: SymbolId| self.is_callable_member(id);
         for (depth, ty) in self.context.enclosing_types().into_iter().enumerate() {
             let found = self.binder.lookup_member(ty, name);
             if !found.iter().any(|id| callable(*id)) {
@@ -1037,8 +1040,23 @@ impl BodyBinder<'_> {
         // but it is not read like a member: `Collection<TKey>` is a
         // *construction*, and taking it as a member here would lose the
         // `TKey`. The type path below knows how to keep it.
-        if let Some(enclosing) = self.declaring_enclosing(&name)
-            && let Some(found) = self.binder.lookup_member(enclosing, &name).first().copied()
+        // The name of a call passes over what cannot be called: `Cb(1)` is
+        // the delegate a type further out holds, whatever `int Cb` this one
+        // inherits (§12.8.10.2).
+        let declaring = if self.invoked {
+            self.declaring_enclosing_callable(&name)
+        } else {
+            self.declaring_enclosing(&name)
+        };
+        if let Some(enclosing) = declaring
+            && let Some(found) = {
+                let members = self.binder.lookup_member(enclosing, &name);
+                members
+                    .iter()
+                    .copied()
+                    .find(|member| self.invoked && self.is_callable_member(*member))
+                    .or_else(|| members.first().copied())
+            }
             && self.kind_of(found) != SymbolKind::NamedType
         {
             self.body

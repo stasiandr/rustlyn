@@ -1711,12 +1711,19 @@ impl BodyBinder<'_> {
             // will do; a method will not, being a method group and not a value.
             // A nested type sees what the types around it declare: `F1()` in
             // a class nested in an interface raises the interface's event.
+            // What cannot be called is passed over for what a type further
+            // out declares: an `int Baz` this type inherits is not what
+            // `Baz(2)` names.
             let found = self
                 .context
                 .enclosing_types()
                 .into_iter()
                 .find_map(|enclosing| {
-                    self.binder.lookup_member(enclosing, &name).first().copied()
+                    let members = self.binder.lookup_member(enclosing, &name);
+                    members
+                        .iter()
+                        .copied()
+                        .find(|member| self.is_callable_member(*member))
                 })?;
             // A field-like event is its field inside the type declaring
             // it, and `E()` there calls what it holds.
@@ -1728,8 +1735,18 @@ impl BodyBinder<'_> {
         if !holds_a_delegate {
             return None;
         }
+        // What binding the name reports is about a value that is called
+        // only if it can be.
+        let floor = self.body.diagnostics.len();
+        let outer = std::mem::replace(&mut self.invoked, true);
         let holder = self.bind_expression(node);
-        (self.is_invocable(&holder.ty) || matches!(holder.ty, Type::Dynamic)).then_some(holder)
+        self.invoked = outer;
+        if self.is_invocable(&holder.ty) || matches!(holder.ty, Type::Dynamic) {
+            Some(holder)
+        } else {
+            self.body.diagnostics.truncate(floor);
+            None
+        }
     }
 
     /// Whether a value of the type is called by writing `(...)` after it: a

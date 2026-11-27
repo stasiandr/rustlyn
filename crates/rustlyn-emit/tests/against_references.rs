@@ -18838,3 +18838,106 @@ exm exs
 ",
     );
 }
+
+/// The base's return type is compared as the overriding class sees it: `T
+/// Get()` of a `GB<T>` is an `A Get()` to `GD : GB<A>`, so `B Get()` there
+/// is narrower and needs its own slot, while `X Get()` of a `GF<X> : GB<X>`
+/// is the same method. Taking any type parameter for a match left the
+/// override out of the base's slot.
+#[test]
+fn a_narrower_return_over_a_generic_base_answers_the_base_slot() {
+    check(
+        "CovariantGenericReturns",
+        r#"
+using System;
+using System.Collections.Generic;
+class A { public override string ToString() => "A"; }
+class B : A { public override string ToString() => "B"; }
+class GB<T> { public virtual T Get() => default; public virtual T P => default; public virtual T Same() => default; public virtual U Gen<U>(U u) => u; public virtual object Obj<U>(U u) => "gbobj"; public virtual T this[int i] => default; }
+class GD : GB<A> { public override B Get() => new B(); public override B P => new B(); public override A Same() => new A(); public override U Gen<U>(U u) => u; public override string Obj<V>(V u) => "gdobj" + u; public override B this[int i] => new B(); }
+class GE : GD { public override B Get() => null; public override B P => null; }
+class GF<X> : GB<X> where X : class { public override X Get() => null; public override X Same() => null; }
+class GG<X> : GB<IEnumerable<X>> { public override List<X> Get() => new List<X> { default }; public override IEnumerable<X> Same() => new X[2]; }
+class Animal { public virtual Animal Self() => this; public virtual Animal Prop => this; public virtual (int a, object b) Tup() => (1, "t"); public virtual object Dyn() => "o"; }
+class Cat : Animal { public override string ToString() => "cat"; }
+class Gen2<T> : Animal where T : Animal, new() { public override T Self() => new T(); public override T Prop => new T(); public override (int a, object b) Tup() => (2, "u"); public override dynamic Dyn() => "d"; }
+abstract class Rep<T> { public abstract IReadOnlyList<T> All(); }
+class IntRep : Rep<int> { public override int[] All() => new[] { 1, 2 }; }
+class P
+{
+    static void Main()
+    {
+        GB<A> gb = new GD();
+        Console.WriteLine("[" + gb.Get() + "] [" + gb.P + "] [" + new GD().Get() + "] [" + gb.Same() + "] " + gb.Gen(5) + gb.Obj(7) + new GD().Obj(8).Length + " [" + gb[0] + "]");
+        gb = new GE();
+        Console.WriteLine((gb.Get() == null) + " " + (gb.P == null) + " " + gb.Same());
+        GB<string> gs = new GF<string>();
+        Console.WriteLine((gs.Get() == null) + " " + (gs.Same() == null));
+        GB<IEnumerable<int>> gi = new GG<int>();
+        Console.WriteLine(string.Join(",", gi.Get()) + " " + new GG<int>().Get().Count + " " + string.Join(",", gi.Same()));
+        Animal a = new Gen2<Cat>();
+        Console.WriteLine(a.Self().GetType().Name + " " + a.Prop.GetType().Name + " " + a.Tup() + " " + a.Dyn());
+        Rep<int> r = new IntRep();
+        Console.WriteLine(r.All().Count + " " + new IntRep().All().Length);
+    }
+}
+"#,
+        "[B] [B] [B] [A] 5gdobj76 [B]
+True True A
+True True
+0 1 0,0
+Cat Cat (2, u) d
+2 2
+",
+    );
+}
+
+/// The name of a call passes over what cannot be called (§12.8.10.2): an
+/// `int Baz` the type inherits does not hide the `Baz(int)` or the delegate
+/// `Cb` of a type further out, and binding it reported CS0120 in a static
+/// member. What can be called — a delegate, a `dynamic` — still hides.
+#[test]
+fn the_name_of_a_call_passes_over_members_that_cannot_be_called() {
+    check(
+        "CallNamePassesOver",
+        r#"
+using System;
+class Base { public int Baz = 3; public Func<int, string> Del = i => "base.Del" + i; public string Txt = "t"; protected event Action Ev; public void Fire() => Ev?.Invoke(); }
+class Outer
+{
+    public static string Baz(int i) => "outer.Baz" + i;
+    public static Func<int, string> Cb = i => "outer.Cb" + i;
+    public static string Del(int i) => "outer.Del-method" + i;
+    public static string Txt(int i) => "outer.Txt" + i;
+    public static Action<int> Act = i => Console.Write("outer.Act" + i + " ");
+    public static dynamic Dyn = (Func<int, string>)(i => "outer.Dyn" + i);
+    public static string Dyn2(int i) => "outer.Dyn2-method" + i;
+    public class Inner : Base
+    {
+        public int Cb = 3;
+        public string Act = "s";
+        public dynamic Dyn2 = (Func<int, string>)(i => "inner.Dyn2" + i);
+        public string Run1() => Baz(1) + " " + Cb(1) + " " + Del(1) + " " + Txt(1) + " " + Dyn2(1) + " " + Dyn(1);
+        public static string Run2() => Baz(2) + " " + Cb(2) + " " + Txt(2) + " " + Dyn(2);
+        public void Run3() { Act(3); Func<int, string> Baz = i => "local.Baz" + i; Console.WriteLine(Baz(3)); Console.WriteLine(Cb + Act + this.Baz); }
+        int Baz => base.Baz;
+    }
+    public class Gen<T> where T : Delegate { public T Cb; public string Run() => Cb == null ? "null" : "set"; }
+}
+class P
+{
+    static void Main()
+    {
+        Console.WriteLine(new Outer.Inner().Run1());
+        Console.WriteLine(Outer.Inner.Run2());
+        new Outer.Inner().Run3();
+    }
+}
+"#,
+        "outer.Baz1 outer.Cb1 base.Del1 outer.Txt1 inner.Dyn21 outer.Dyn1
+outer.Baz2 outer.Cb2 outer.Txt2 outer.Dyn2
+outer.Act3 local.Baz3
+3s3
+",
+    );
+}

@@ -9913,17 +9913,34 @@ impl Emitter<'_> {
             return false;
         };
         let symbols = self.compilation.symbols();
-        if symbols.get(overridden).kind != symbols.get(member).kind
-            || same_return(&self.type_of(member), &self.type_of(overridden))
-        {
-            return false;
-        }
         let (Some(container), Some(owner)) = (
             symbols.get(member).container,
             symbols.get(overridden).container,
         ) else {
             return false;
         };
+        if symbols.get(overridden).kind != symbols.get(member).kind {
+            return false;
+        }
+        // What the base returns as this class derives from it: `T Get()` of
+        // a `GB<T>` is an `A Get()` to `GD : GB<A>`, and of a generic method
+        // with this one's type parameters in place of its own.
+        let mut theirs = self.member_type(overridden, &self.binder.self_type(container));
+        if let (Some(base), Some(own)) = (
+            symbols.get(overridden).as_method(),
+            symbols.get(member).as_method(),
+        ) {
+            let renamed: HashMap<SymbolId, Type> = base
+                .type_parameters
+                .iter()
+                .zip(&own.type_parameters)
+                .map(|(theirs, ours)| (*theirs, Type::TypeParameter(*ours)))
+                .collect();
+            theirs = theirs.substitute(&renamed);
+        }
+        if same_return(&self.type_of(member), &theirs) {
+            return false;
+        }
         let Some(class) = self.types.get(&container).copied() else {
             return false;
         };
@@ -13385,12 +13402,10 @@ fn unify(pattern: &Type, actual: &Type, out: &mut HashMap<SymbolId, Type>) {
 }
 
 /// Whether an override returns what the method it overrides does, as far as
-/// the runtime can tell: a type parameter stands for whatever a construction
-/// put there and matches anything, `dynamic` is `object`, and a tuple is its
-/// elements whatever they are called.
+/// the runtime can tell: `dynamic` is `object`, and a tuple is its elements
+/// whatever they are called.
 fn same_return(left: &Type, right: &Type) -> bool {
     match (left, right) {
-        (Type::TypeParameter(_), _) | (_, Type::TypeParameter(_)) => true,
         (Type::Dynamic, Type::Named { type_arguments, .. })
         | (Type::Named { type_arguments, .. }, Type::Dynamic) => type_arguments.is_empty(),
         (
