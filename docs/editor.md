@@ -176,9 +176,13 @@ table format is not stable between builds.
   `Result`, `Join`, `WaitAll`, `WhenAll`, a gate such as `ManualResetEventSlim` or a
   `TaskCompletionSource`) orders what follows it; a lock held on both sides excludes
   (`lock`, `Monitor`, `SemaphoreSlim`, `Mutex`, `SpinLock`, `ReaderWriterLockSlim`);
-  `arr[i]` with the loop's own index is an element of its own. What the analysis cannot
-  tell, such as a lock a caller holds or an ordering a protocol between methods gives, it
-  does not report.
+  `arr[i]` with the loop's own index (or `arr[2 * i + 1]`, `int j = i; arr[j]`) is an
+  element of its own. A wait for a task a method of the file returns, or for tasks put
+  into a local list or array and waited for whole, orders what follows it. The delegates
+  of one `Parallel.Invoke`, and the tasks a loop starts without waiting for them in the
+  loop, overlap each other. What the analysis cannot tell, such as a lock a caller holds
+  or an ordering a protocol between methods gives (a `Barrier`, a flag a loop spins on),
+  it does not report.
 * `rln_signatures`: overloads of the call being typed, the matching one and the
   parameter under the cursor, including for a call that does not bind yet (then the
   methods are asked of the type left of the dot).

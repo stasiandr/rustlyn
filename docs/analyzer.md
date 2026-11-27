@@ -34,17 +34,32 @@ The thread diagnostics report a pair of accesses only where nothing can be shown
 order or exclude them. Two accesses overlap when one is in code started and not waited
 for (`Task.Run`, `Task.Factory.StartNew`, a `Thread`, the thread pool, a timer, an
 `async void` method or an async call that is a statement of its own, a `ContinueWith`
-body) and the other is outside it, or when both are in the body of a `Parallel` call.
+body) and the other is outside it, or when both are in the body of a `Parallel` call,
+or in two delegates of one `Parallel.Invoke`, or in the task of a loop that starts one
+for each iteration and waits for none inside the loop (`for (...) Task.Run(() => x++)`).
 They do not overlap when the code before and after an `await` is one flow, when the
 thread was waited for first (`await`, `Wait`, `Result`, `GetAwaiter().GetResult()`,
-`Join`, `Task.WaitAll`, `Task.WhenAll` awaited or waited, a signalled gate), when a
+`Join`, `Task.WaitAll`, `Task.WhenAll` awaited or waited, a signalled gate, the wait
+handle of a cancellation token whose source is cancelled, `RunSynchronously()`), when a
 `ContinueWith` body follows its antecedent, or when both hold the same lock (`lock`,
-`Monitor`, `SemaphoreSlim`, `Mutex`, `SpinLock`, `ReaderWriterLockSlim`). A lock on one
+`Monitor`, `SemaphoreSlim`, `Mutex`, `SpinLock`, `ReaderWriterLockSlim`). The wait may be
+for a task a method of the file returns (`await Start()`, `Start().Wait()`, `var t =
+Start(); t.Wait()`, where every `return` of the method is the task it started, or the
+method is `async` and awaits what it started), or for tasks put into a local collection
+that nothing else changes (`tasks.Add(Task.Run(..))`, `new[] { Task.Run(..) }`, then
+`Task.WaitAll(tasks.ToArray())` or `await Task.WhenAll(tasks)`). A lock on one
 side only, or two different locks, is still reported ("under different locks"). The
 operand of `lock` is not an access of the field. `arr[i]` in a `Parallel.For` body with
-the loop's own index is not a shared write; `arr[0]` and `arr[i % 2]` are. A lock held
-by a caller, and a protocol between methods (a flag set before a start message), are not
-judged. The module docs of `crates/rustlyn-ide/src/semantic/analyzers/threads.rs` list
+the loop's own index is not a shared write, and neither are `arr[2 * i + 1]` and `int j
+= i; arr[j]`, an index that is the loop's index moved or scaled by a constant and never
+shared with another write to the same array in the body; `arr[0]`, `arr[i / 2]` and
+`arr[i % 2]` are. A local that a local function writes is written by every iteration of
+a `Parallel` body that calls the function. A lock held by a caller, and a protocol
+between methods (a flag set before a start message, a volatile flag a loop spins on, a
+`Barrier`), are not judged. Elements of an array that tasks of a loop write are not
+reported, as which element each takes is not known, and neither is what those tasks
+reach by calling a method, which may be the state of a different object in each
+iteration. The module docs of `crates/rustlyn-ide/src/semantic/analyzers/threads.rs` list
 each rule.
 
 ## Command-line tools

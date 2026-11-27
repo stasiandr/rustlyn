@@ -5,8 +5,22 @@
 //! That is what makes IDE0051 and IDE0052 cheap enough to run as the user
 //! types, and why they are limited to private members: an internal one
 //! would need the whole project searched.
+//!
+//! A private member is also used by a construct of the language that looks it
+//! up by name and writes none: `await this` runs `GetAwaiter`, `var (a, b) =
+//! this` runs `Deconstruct`, a collection initializer `Add`, a query
+//! `Select`, `this[^1]` and `this[1..2]` `Length` or `Count` and `Slice`. The
+//! binder says which member such a construct runs; where it does not resolve
+//! the construct (queries, ranges, interpolated string handlers, `fixed`) or
+//! the body did not bind, a member with one of those names is taken to be
+//! used if the file holds the construct at all.
+//!
+//! IDE0044 does not offer `readonly` for a field whose value is a struct that
+//! is not `readonly`, a tuple, or a type parameter that may be a struct, where
+//! a member is called or written on it outside a constructor: on a `readonly`
+//! field that acts on a copy, or does not compile (CS1648).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rustlyn_diagnostics::Severity;
 use rustlyn_semantics::{
@@ -122,6 +136,131 @@ fn uses_of(view: &View<'_>, facts: &Facts, symbol: SymbolId) -> Vec<Use> {
     found
 }
 
+/// The constructs of the language that look a member up by its name in the
+/// type of what they are given, which then runs it without the program
+/// writing the name: `await x` finds `GetAwaiter`, `from a in x select a`
+/// finds `Select`, `var (a, b) = x` `Deconstruct`.
+fn constructs_looking_for(name: &str) -> &'static [SyntaxKind] {
+    match name {
+        "Deconstruct" => &[
+            SyntaxKind::DeclarationExpression,
+            SyntaxKind::TupleExpression,
+            SyntaxKind::ParenthesizedVariableDesignation,
+            SyntaxKind::PositionalPatternClause,
+            SyntaxKind::ForEachVariableStatement,
+        ],
+        "Add" => &[
+            SyntaxKind::CollectionInitializerExpression,
+            SyntaxKind::ComplexElementInitializerExpression,
+            SyntaxKind::CollectionExpression,
+        ],
+        "GetAwaiter" | "IsCompleted" | "GetResult" | "OnCompleted" | "UnsafeOnCompleted" => {
+            &[SyntaxKind::AwaitExpression]
+        }
+        "Select" | "SelectMany" | "Where" | "OrderBy" | "OrderByDescending" | "ThenBy"
+        | "ThenByDescending" | "GroupBy" | "Join" | "GroupJoin" | "Cast" | "OfType" => {
+            &[SyntaxKind::QueryExpression]
+        }
+        "Slice" => &[SyntaxKind::RangeExpression, SyntaxKind::SlicePattern],
+        "Length" | "Count" => &[
+            SyntaxKind::RangeExpression,
+            SyntaxKind::IndexExpression,
+            SyntaxKind::ListPattern,
+            SyntaxKind::SlicePattern,
+        ],
+        "GetEnumerator" | "MoveNext" | "Current" | "GetAsyncEnumerator" | "MoveNextAsync" => &[
+            SyntaxKind::ForEachStatement,
+            SyntaxKind::ForEachVariableStatement,
+        ],
+        "Dispose" | "DisposeAsync" => &[
+            SyntaxKind::UsingStatement,
+            SyntaxKind::LocalDeclarationStatement,
+            SyntaxKind::ForEachStatement,
+            SyntaxKind::ForEachVariableStatement,
+        ],
+        "GetPinnableReference" => &[SyntaxKind::FixedStatement],
+        "AppendLiteral" | "AppendFormatted" | "ToStringAndClear" => {
+            &[SyntaxKind::InterpolatedStringExpression]
+        }
+        _ => &[],
+    }
+}
+
+/// The members the file's bodies run through a construct that writes no name
+/// for them, as the binder resolved the construct.
+fn run_by_constructs(view: &View<'_>, facts: &Facts) -> HashSet<SymbolId> {
+    let text = view.root.full_text();
+    let mut reached = HashSet::new();
+    for body in facts.bodies.iter().filter(|body| !body.broken) {
+        for (_, symbol, _, _) in
+            view.semantic
+                .implicit_symbols(&view.model, &body.bound, &body.owner, &text)
+        {
+            reached.insert(symbol);
+        }
+    }
+    reached
+}
+
+/// Whether the file holds a construct that may run `member` by its name
+/// where the binder's answer cannot be trusted or the construct is one the
+/// binder does not resolve: a body that did not bind cleanly, or a query, an
+/// interpolated string, a `fixed`, a collection expression. A member of a
+/// partial type may be run from the parts in other files.
+fn may_be_run_by_a_construct(view: &View<'_>, facts: &Facts, member: &Declared) -> bool {
+    let symbols = view.compilation().symbols();
+    let name = symbols.get(member.symbol).name.as_str();
+    let kinds = constructs_looking_for(name);
+    if kinds.is_empty() {
+        return false;
+    }
+    let partial = symbols
+        .get(member.symbol)
+        .container
+        .is_some_and(|container| {
+            let mut trees: Vec<usize> = symbols
+                .get(container)
+                .locations
+                .iter()
+                .map(|location| location.tree)
+                .collect();
+            trees.sort_unstable();
+            trees.dedup();
+            trees.len() > 1
+        });
+    if partial {
+        return true;
+    }
+    let unresolved_kind = matches!(
+        name,
+        "Select"
+            | "SelectMany"
+            | "Where"
+            | "OrderBy"
+            | "OrderByDescending"
+            | "ThenBy"
+            | "ThenByDescending"
+            | "GroupBy"
+            | "Join"
+            | "GroupJoin"
+            | "Cast"
+            | "OfType"
+            | "Slice"
+            | "Length"
+            | "Count"
+            | "GetPinnableReference"
+            | "AppendLiteral"
+            | "AppendFormatted"
+            | "ToStringAndClear"
+    );
+    if !unresolved_kind && !facts.bodies.iter().any(|body| body.broken) {
+        return false;
+    }
+    view.root
+        .descendants()
+        .any(|node| kinds.contains(&node.kind()))
+}
+
 /// A member as a message names it: `Player.health`, `Player.Heal(int)`.
 fn member_name(view: &View<'_>, symbol: SymbolId) -> String {
     let symbols = view.compilation().symbols();
@@ -226,6 +365,7 @@ pub(super) fn unused_members(
     facts: &Facts,
     found: &mut Vec<AnalyzerDiagnostic>,
 ) {
+    let mut reached: Option<HashSet<SymbolId>> = None;
     for member in declared_members(view) {
         if !is_candidate(view, facts, &member) {
             continue;
@@ -235,6 +375,15 @@ pub(super) fn unused_members(
         let constructed = facts.constructed.contains(&member.symbol);
         let name = member_name(view, member.symbol);
         if uses.is_empty() && !constructed {
+            // A construct of the language may run it without the name.
+            if !constructs_looking_for(&symbols.get(member.symbol).name).is_empty() {
+                let reached = reached.get_or_insert_with(|| run_by_constructs(view, facts));
+                if reached.contains(&member.symbol)
+                    || may_be_run_by_a_construct(view, facts, &member)
+                {
+                    continue;
+                }
+            }
             // Written only where it is declared, with a constant: CS0414 to
             // the compiler (the initializer is an assignment), beside the
             // IDE's "unused".
@@ -393,9 +542,7 @@ pub(super) fn readonly_fields(
         let Some(container) = field.container else {
             continue;
         };
-        if is_mutable_struct(view, &view.model.type_of_symbol(member.symbol)) {
-            continue;
-        }
+        let may_change = may_be_mutable_value(view, &view.model.type_of_symbol(member.symbol));
         // Said already: a field nobody reads is better removed than frozen.
         if already.iter().any(|&(start, id)| {
             start == member.name.span().start() && matches!(id, "IDE0051" | "IDE0052")
@@ -404,10 +551,18 @@ pub(super) fn readonly_fields(
         }
         let is_static = field.modifiers.contains(Modifiers::STATIC);
         let uses = uses_of(view, facts, member.symbol);
-        let frozen = uses
+        let mut frozen = uses
             .iter()
             .filter(|found| found.access != Access::Read)
             .all(|found| written_while_constructing(view, &found.token, container, is_static));
+        // A member called or written on a value type that is not `readonly`
+        // would act on a copy of a `readonly` field, or not compile.
+        if frozen && may_change {
+            frozen = uses.iter().all(|found| {
+                copied_only(&found.token)
+                    || written_while_constructing(view, &found.token, container, is_static)
+            });
+        }
         if frozen {
             found.push(AnalyzerDiagnostic::new(
                 "IDE0044",
@@ -421,23 +576,72 @@ pub(super) fn readonly_fields(
 
 /// Whether a value of `ty` could be changed through a `readonly` field
 /// without anyone noticing: a struct that is not `readonly`, other than the
-/// language's own and enums.
-fn is_mutable_struct(view: &View<'_>, ty: &Type) -> bool {
-    let Type::Named { symbol, .. } = ty else {
-        return false;
-    };
+/// language's own and enums and `Nullable`; a tuple; a type parameter that
+/// is not known to be a reference type, which may be such a struct. An array
+/// is a reference: its elements are not the field.
+fn may_be_mutable_value(view: &View<'_>, ty: &Type) -> bool {
     let symbols = view.compilation().symbols();
-    let found = symbols.get(*symbol);
-    if !matches!(
-        found.type_kind(),
-        Some(TypeKind::Struct | TypeKind::RecordStruct)
-    ) {
-        return false;
+    match ty {
+        Type::Named { symbol, .. } => {
+            let found = symbols.get(*symbol);
+            if !matches!(
+                found.type_kind(),
+                Some(TypeKind::Struct | TypeKind::RecordStruct)
+            ) {
+                return false;
+            }
+            let special = SpecialType::ALL
+                .iter()
+                .any(|&special| view.compilation().special_type(special) == Some(*symbol));
+            // `Nullable<T>` has no member that changes it: what is inside
+            // is read through a copy.
+            let nullable = symbols
+                .qualified_name(*symbol)
+                .starts_with("System.Nullable");
+            !special && !nullable && !found.modifiers.contains(Modifiers::READONLY)
+        }
+        Type::Tuple(_) => true,
+        Type::TypeParameter(parameter) => {
+            !view.model.binder().is_reference_type_parameter(*parameter)
+        }
+        _ => false,
     }
-    let special = SpecialType::ALL
-        .iter()
-        .any(|&special| view.compilation().special_type(special) == Some(*symbol));
-    !special && !found.modifiers.contains(Modifiers::READONLY)
+}
+
+/// Whether the field named by `token` is only copied where it is used: handed
+/// over as an argument, returned, assigned to something, used as an
+/// initializer. Anything else — `t.Inc()`, `t.Item1 = 5`, `t[0]`, `foreach`
+/// over it — works on the field itself.
+fn copied_only(token: &SyntaxToken) -> bool {
+    let mut node = token.parent().clone();
+    // `this.t`.
+    if let Some(access) = node
+        .parent()
+        .filter(|access| access.kind() == SyntaxKind::SimpleMemberAccessExpression)
+        && access.children().last().as_ref() == Some(&node)
+        && access
+            .children()
+            .next()
+            .is_some_and(|receiver| receiver.kind() == SyntaxKind::ThisExpression)
+    {
+        node = access.clone();
+    }
+    loop {
+        let Some(parent) = node.parent().cloned() else {
+            return false;
+        };
+        match parent.kind() {
+            SyntaxKind::ParenthesizedExpression => node = parent,
+            SyntaxKind::Argument
+            | SyntaxKind::ReturnStatement
+            | SyntaxKind::ArrowExpressionClause
+            | SyntaxKind::EqualsValueClause => return true,
+            SyntaxKind::SimpleAssignmentExpression => {
+                return parent.children().next().as_ref() != Some(&node);
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// Whether a write of a field happens while its object is being made: in a
@@ -1037,5 +1241,142 @@ mod tests {
                       public int Read() => fixedOne;\n\
                     }\n";
         assert_eq!(found_with(text, "IDE0044"), vec!["fixedOne"]);
+    }
+
+    /// A member called or written on a copy would not do what it does on the
+    /// field, or not compile: a `readonly` tuple, struct or type parameter
+    /// that may be one (CS1648 and a counter that stays 0).
+    #[test]
+    fn a_field_of_a_value_type_a_member_changes_cannot_be_readonly() {
+        let none = |code: &str| {
+            let text = format!(
+                "interface IInc {{ void Inc(); int V {{ get; }} }}\n\
+                 struct MS : IInc {{ int v; public void Inc() {{ v++; }} public int V => v; }}\n{code}"
+            );
+            assert!(
+                found_with(&text, "IDE0044").is_empty(),
+                "{:?} in\n{code}",
+                found_with(&text, "IDE0044")
+            );
+        };
+        none(
+            "class Y { private (int, int) t; public Y() { t = (1, 2); } public void G() { t.Item1 = 5; } }",
+        );
+        none(
+            "class Y { private (int a, int b) t; public Y() { t = (1, 2); } public void G() { t.a = 5; } }",
+        );
+        none(
+            "class Y<T> where T : struct, IInc { private T t; public Y() { t = default; } public int G() { t.Inc(); t.Inc(); return t.V; } }",
+        );
+        none(
+            "class Y<T> where T : IInc { private T t; public Y(T x) { t = x; } public int G() { t.Inc(); t.Inc(); return t.V; } }",
+        );
+        none(
+            "class Y { private MS m; public Y() { m = new MS(); } public int G() { m.Inc(); return m.V; } }",
+        );
+        none(
+            "struct W<A> { public int n; public void Bump() { n++; } } class Y { private W<int> w; public Y() { w = new W<int>(); } public int G() { w.Bump(); return w.n; } }",
+        );
+        none(
+            "class Y<T> { private T t; public Y(T x) { t = x; } public int G() { return this.t.GetHashCode(); } }",
+        );
+    }
+
+    /// What is only copied, or a reference, or changed where the object is
+    /// made, is the same `readonly`.
+    #[test]
+    fn a_field_of_a_value_type_that_is_only_copied_can_be_readonly() {
+        let all = |code: &str, names: &[&str]| {
+            let text = format!(
+                "interface IInc {{ void Inc(); int V {{ get; }} }}\n\
+                 struct MS : IInc {{ int v; public void Inc() {{ v++; }} public int V => v; }}\n\
+                 class Base : IInc {{ int v; public void Inc() {{ v++; }} public int V => v; }}\n{code}"
+            );
+            assert_eq!(found_with(&text, "IDE0044"), names, "in\n{code}");
+        };
+        all(
+            "class Y { private (int, int) t; public Y() { t = (1, 2); } public (int, int) G() { return t; } }",
+            &["t"],
+        );
+        all(
+            "class Y { private (int, int) t; public Y() { t = (1, 2); } static int F((int, int) p) => p.Item1; public int G() => F(t); }",
+            &["t"],
+        );
+        all(
+            "class Y<T> { private T t; public Y(T x) { t = x; } public T G() => t; }",
+            &["t"],
+        );
+        all(
+            "class Y<T> where T : class, IInc { private T t; public Y(T x) { t = x; } public int G() { t.Inc(); return t.V; } }",
+            &["t"],
+        );
+        all(
+            "class Y<T> where T : Base { private T t; public Y(T x) { t = x; } public int G() { t.Inc(); return t.V; } }",
+            &["t"],
+        );
+        all(
+            "class Y { private int? n; public Y() { n = 3; } public int G() { return n.Value + 1; } }",
+            &["n"],
+        );
+        all(
+            "class Y { private MS[] arr; public Y() { arr = new MS[2]; } public int G() { arr[0].Inc(); return arr[0].V; } }",
+            &["arr"],
+        );
+        all(
+            "class Y { private MS m; public Y() { m = new MS(); m.Inc(); } public int G() { return Take(m); } static int Take(MS x) => x.V; }",
+            &["m"],
+        );
+        all(
+            "class Y { private (int, int) t; public Y() { t = (1, 2); t.Item1 = 7; } public (int, int) G() { return this.t; } }",
+            &["t"],
+        );
+    }
+
+    /// A construct of the language runs a member by its name in the type of
+    /// what it is given: removing the member breaks the build.
+    #[test]
+    fn a_member_a_language_construct_runs_is_used() {
+        let code = "using System; using System.Collections; using System.Threading.Tasks; using System.Runtime.CompilerServices;\n\
+            class A { private void Deconstruct(out int a, out int b) { a = 1; b = 2; } public int G() { var (x, y) = this; return x + y; } }\n\
+            class B { private void Deconstruct(out int a, out int b) { a = 1; b = 2; } public int G() { int x, y; (x, y) = this; return x + y; } }\n\
+            class C { private void Deconstruct(out int a, out int b) { a = 1; b = 2; } public int G() => this is (1, var q) ? q : 0; }\n\
+            class D : IEnumerable { private void Add(int x) { } public IEnumerator GetEnumerator() => null; public static D Make() => new D { 1, 2 }; }\n\
+            class E { private Aw GetAwaiter() => new Aw(); public async Task G() { await this; } public struct Aw : INotifyCompletion { public bool IsCompleted => true; public void GetResult() { } public void OnCompleted(Action a) { } } }\n\
+            class F { private F Select(Func<int, int> f) => this; public F G() => from x in this select x; }\n\
+            class H { private H Where(Func<int, bool> f) => this; private H Select(Func<int, int> f) => this; public H G() => from x in this where x > 0 select x; }\n\
+            class I { public int Length => 3; private int this[int i] => i; public int G() => this[^1]; }\n\
+            class J { public int Length => 3; private int Slice(int a, int b) => 0; public int this[int i] => i; public int G() => this[1..2]; }\n\
+            class K { private int Length => 3; public int this[int i] => i; public int G() => this[^1]; }\n\
+            class L { private int Count => 3; public int this[int i] => i; public int G() => this[^1]; }\n\
+            class M { public int Count => 3; private int this[int i] => i; public int G() => this is [1, ..] ? 1 : 0; }\n\
+            class N { private int this[int i] { set { } } public static N Make() => new N { [1] = 2 }; }\n\
+            ref struct O { private void Dispose() { } public static void G() { using (var u = new O()) { } } }\n";
+        assert!(
+            found_with(code, "IDE0051").is_empty(),
+            "{:?}",
+            found_with(code, "IDE0051")
+        );
+    }
+
+    /// The same names where no construct reaches them are as unused as any
+    /// other.
+    #[test]
+    fn a_member_with_a_pattern_name_that_no_construct_runs_is_unused() {
+        let code = "using System.Collections;\n\
+            class A { private void Deconstruct(out int a) { a = 0; } }\n\
+            class B : IEnumerable { private void Add(int x) { } public IEnumerator GetEnumerator() => null; }\n\
+            class C { private int Count => 3; private int Length => 4; private int Slice(int a, int b) => 0; }\n\
+            class E { private System.Threading.Tasks.Task GetAwaiter() => null; }\n";
+        assert_eq!(
+            found_with(code, "IDE0051"),
+            vec![
+                "Deconstruct",
+                "Add",
+                "Count",
+                "Length",
+                "Slice",
+                "GetAwaiter"
+            ]
+        );
     }
 }

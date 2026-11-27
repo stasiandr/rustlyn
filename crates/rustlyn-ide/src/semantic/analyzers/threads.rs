@@ -27,7 +27,18 @@
 //!   `GetComponent`, `Instantiate`, `Time`, `Input`, `Physics` — reached from
 //!   a background thread, where Unity throws.
 //! * RLN1003: a local the body of `Parallel.For` writes, which every
-//!   iteration writes at once.
+//!   iteration writes at once; a local function that writes a local of the
+//!   method around does the same for every iteration that calls it. Two
+//!   delegates of one `Parallel.Invoke` that write the same local do too.
+//!
+//! The delegates of one `Parallel.Invoke` call run at the same time as each
+//! other, and the call returns when all are done. A thread started in the
+//! body of a loop runs at the same time as the thread of the next iteration,
+//! unless something in the loop waits: a wait for it, an `await`, a lock or a
+//! semaphore taken, or a scheduler of the program's own is given. An element
+//! of an array those threads write is not judged, as which one each takes is
+//! not known, and neither is what they reach by calling a method, which may
+//! be the state of a different object in each iteration (`worker.Run()`).
 //!
 //! What orders two accesses:
 //!
@@ -37,10 +48,24 @@
 //!   `GetAwaiter().GetResult()`, `Join`, `Task.WaitAll`, `Task.WhenAll`
 //!   awaited or waited, whether the call or a local or field that holds the
 //!   task is what is waited; a `ContinueWith` body after its antecedent; a
-//!   task started after another was waited for;
+//!   task started after another was waited for; `RunSynchronously()`, which
+//!   returns when the task is done;
+//! * a method of the file, called where its task is waited for: every
+//!   `return` of the method is the task it started on that path, or on all
+//!   paths; or the method is `async` and waits for what it started, in code
+//!   that no branch and no earlier `return` can skip. A call whose result is
+//!   not waited for, or a method that returns another task on some path,
+//!   orders nothing;
+//! * tasks put into a local `List` with `Add(Task.Run(..))`, or made into a
+//!   local array, that is then waited for whole (`Task.WaitAll(tasks.ToArray())`,
+//!   `await Task.WhenAll(tasks)`): those started before the wait are done
+//!   after it, as long as nothing else touches the collection — removing,
+//!   replacing an element, handing it on, copying it;
 //! * a gate: waiting on a `ManualResetEventSlim`, `SemaphoreSlim`,
-//!   `CountdownEvent` or a `TaskCompletionSource` that the thread signals
-//!   orders what follows the wait after the whole thread;
+//!   `CountdownEvent`, a `TaskCompletionSource`, or the `WaitHandle` of the
+//!   token of a `CancellationTokenSource` that the thread signals (`Set`,
+//!   `Release`, `SetResult`, `Cancel`) orders what follows the wait after the
+//!   whole thread;
 //! * a `ContinueWith` handed `TaskScheduler.FromCurrentSynchronizationContext()`
 //!   runs on the thread that made it, after its antecedent;
 //! * what an object's setup does before it is sent off, and a constructor;
@@ -62,26 +87,34 @@
 //!
 //! `arr[i] = x` in the body of `Parallel.For`, with `i` the loop's own
 //! index, writes an element of its own to each iteration, and is no shared
-//! write.
+//! write. So is an index that is `k * i + c` for constants (`2 * i + 1`), or
+//! a local made of one that nothing assigns again, as long as no other write
+//! to the same array in the body can reach the element of another iteration
+//! (`arr[i]` beside `arr[i + 1]`, `arr[2 * i]` beside `arr[2 * i + 2]`).
 //!
 //! What is not judged: that a lock is held by a caller of the method, that
-//! a wait happens on every path, that two flows of the same object may be
-//! called at once by different callers, element indexes other than the
-//! plain loop index. Where the code cannot say, the analysis says nothing.
+//! a wait happens on every path (a `Wait` in an `if` still orders what
+//! follows it), that two flows of the same object may be called at once by
+//! different callers, element indexes other than those above, a `Barrier`,
+//! a `volatile` flag a loop spins on, a semaphore used as a lock, a start
+//! made in a static constructor, an event raised from a task. Where the code
+//! cannot say, the analysis says nothing.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rustlyn_diagnostics::Severity;
 use rustlyn_semantics::{
-    BoundBody, BoundExpression, BoundExpressionKind as E, BoundStatement, BoundStatementKind as S,
-    ConstantValue, LocalId, MethodKind, Modifiers, RefKind, SymbolId, SymbolKind, Symbols, Type,
-    TypeKind,
+    BinaryOperator, BoundBody, BoundExpression, BoundExpressionKind as E, BoundStatement,
+    BoundStatementKind as S, ConstantValue, LocalId, MethodKind, Modifiers, RefKind, SymbolId,
+    SymbolKind, Symbols, Type, TypeKind, UnaryOperator,
 };
 use rustlyn_syntax::{SyntaxKind, SyntaxNode};
 use rustlyn_text::TextSpan;
 
 use super::super::View;
-use super::super::walk::{Visited, expression_children, statement_children, walk_body};
+use super::super::walk::{
+    Visited, expression_children, statement_children, walk_body, walk_statement,
+};
 use super::{AnalyzerDiagnostic, Facts};
 
 /// Where a piece of code runs, before the threads of what calls a method are
@@ -116,11 +149,14 @@ enum Held {
 }
 
 /// A place after which the code of a thread is known to be done.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Join {
     unit: SymbolId,
     lambda: Option<TextSpan>,
     at: u32,
+    /// Nothing before it in its code can skip it: not inside a branch or a
+    /// loop, and no `return`, `break` or `throw` earlier.
+    unconditional: bool,
     /// The wait is for a handle the type hands out — a property that returns
     /// the task — so it is for whoever calls, and what the other methods of
     /// the type do is theirs to order.
@@ -142,6 +178,17 @@ struct Site {
     /// Its body runs on several threads at once, and the call returns when
     /// they are all done: to everything else it is the thread that called.
     parallel: bool,
+    /// Its body runs on the thread that calls and the call returns when it
+    /// is done: `RunSynchronously`, or one delegate of `Parallel.Invoke`.
+    inline: bool,
+    /// The delegates of one `Parallel.Invoke` call share a group: they run
+    /// at the same time as each other.
+    group: Option<usize>,
+    /// Started in the body of a loop, with nothing in the loop that could
+    /// wait for it: the iterations' threads overlap each other.
+    repeats: bool,
+    /// The loop it was started in, and whether anything in that loop waited.
+    looped: Option<TextSpan>,
     /// Where the code that started it runs.
     parent: Ctx,
     /// Started inside the body of a `Parallel` call, which runs many times.
@@ -199,6 +246,9 @@ struct Access {
     /// _socket;`: the code goes on with what it read, checks that, and a
     /// write afterwards does not reach it.
     snapshot: bool,
+    /// A write to an element of an array or an indexer, where which element
+    /// is not known.
+    element: bool,
 }
 
 /// A use of what only Unity's main thread may touch.
@@ -220,6 +270,16 @@ struct Gathered {
     unity: Vec<UnityUse>,
     /// RLN1003: span, name of the local, the `Parallel` site.
     parallel_writes: Vec<(TextSpan, String, usize)>,
+    /// Writes of a local of the method around, made in a delegate of
+    /// `Parallel.Invoke`: span, local, name, site. Reported where another
+    /// delegate of the same call writes it too.
+    group_writes: Vec<(TextSpan, (SymbolId, LocalId), String, usize)>,
+    /// Writes of a local the method around declares, made in a local
+    /// function: the function, span, name.
+    function_writes: Vec<(SymbolId, TextSpan, String, TextSpan)>,
+    /// Calls of a local function made in the body of a `Parallel` call with
+    /// no lock held: the function, the site.
+    parallel_calls: Vec<(SymbolId, TextSpan, usize)>,
     /// Methods that end in `return this`: a builder's.
     fluent: HashSet<SymbolId>,
     /// Methods that are `async void`, or `async UniTaskVoid`: nothing waits
@@ -240,6 +300,24 @@ struct Gathered {
     joins: Vec<(Vec<Target>, Join)>,
     /// Calls that are statements of their own.
     discarded: HashSet<TextSpan>,
+    /// What each method of the file returns, one entry for each `return`
+    /// outside a lambda: where, and the tasks it stands for.
+    returns: HashMap<SymbolId, Vec<(TextSpan, Vec<Target>)>>,
+    /// The `async` methods of the file.
+    asynchronous: HashSet<SymbolId>,
+    /// What a local holds that is not one thread started on the spot: the
+    /// task a call returns, the task that waits for others.
+    bound_targets: HashMap<Key, Vec<Target>>,
+    /// The tasks an array or a collection was made of, by the local that
+    /// holds it. Only an untainted local holds them still.
+    held_arrays: HashMap<Key, Vec<Target>>,
+    /// The threads started as the argument of `Add` to a local collection.
+    collected: HashMap<Key, Vec<usize>>,
+    /// Locals something other than a plain use could change or keep.
+    tainted: HashSet<Key>,
+    /// Waits that could throttle a loop: awaits and calls to waiting
+    /// methods, with where.
+    sync_points: Vec<(SymbolId, Option<TextSpan>, u32)>,
 }
 
 /// What a wait waits for.
@@ -251,6 +329,8 @@ enum Target {
     Key(Key),
     /// The same, through a property of the type that returns it.
     Exposed(Key),
+    /// What the call of a method of the file hands back.
+    Returned(SymbolId),
 }
 
 /// Types whose members may be used from any thread: what holds them is
@@ -409,7 +489,11 @@ pub(in super::super) fn threads(
                 )
             });
         units.push(owner);
+        for local in tainted_locals(symbols, &body.bound) {
+            gathered.tainted.insert(Key::Local(owner, local));
+        }
         if owner_symbol.modifiers.contains(Modifiers::ASYNC) {
+            gathered.asynchronous.insert(owner);
             let nothing_waits = match view.model.type_of_symbol(owner) {
                 Type::Void => true,
                 Type::Named { symbol, .. } => {
@@ -438,6 +522,14 @@ pub(in super::super) fn threads(
             lambda: None,
             body_of: None,
             after: Vec::new(),
+            branch_depth: 0,
+            exited: false,
+            loops: Vec::new(),
+            parallel_reassigned: HashSet::new(),
+            own_locals: HashMap::new(),
+            own_writes: Vec::new(),
+            element_write: false,
+            function_span: None,
             body_owner: owner,
             aliases: &aliases,
             here: 0,
@@ -453,11 +545,23 @@ pub(in super::super) fn threads(
         }
         for function in &body.bound.local_functions {
             units.push(function.symbol);
+            if symbols
+                .get(function.symbol)
+                .modifiers
+                .contains(Modifiers::ASYNC)
+            {
+                walk.out.asynchronous.insert(function.symbol);
+            }
             walk.unit = function.symbol;
             walk.ctx = Ctx::Entry(function.symbol);
             walk.constructing = false;
             walk.held.clear();
+            walk.branch_depth = 0;
+            walk.exited = false;
+            walk.loops.clear();
+            walk.function_span = Some(function.span);
             walk.statement(&function.body);
+            walk.function_span = None;
         }
     }
 
@@ -495,6 +599,28 @@ pub(in super::super) fn threads(
         }
     }
     resolve_joins(&mut gathered);
+    // A thread started in a loop that nothing in the loop waits for runs at
+    // the same time as the thread of the next iteration.
+    let repeats: Vec<bool> = gathered
+        .sites
+        .iter()
+        .map(|site| {
+            let Some(looped) = site.looped else {
+                return false;
+            };
+            let inside = |at: u32| looped.start() <= at && at <= looped.end();
+            !site.in_parallel
+                && !site.joins.iter().any(|join| {
+                    join.unit == site.unit && join.lambda == site.lambda && inside(join.at)
+                })
+                && !gathered.sync_points.iter().any(|&(unit, lambda, at)| {
+                    unit == site.unit && lambda == site.lambda && inside(at)
+                })
+        })
+        .collect();
+    for (site, repeats) in gathered.sites.iter_mut().zip(repeats) {
+        site.repeats = repeats;
+    }
     let concrete = |ctx: Ctx| concretize(&threads, &gathered.sites, &detached, ctx, 0);
     let setup: HashSet<SymbolId> = units
         .iter()
@@ -558,6 +684,21 @@ pub(in super::super) fn threads(
                         && second.write
                         && first.constant.is_some()
                         && first.constant == second.constant)
+                    // Elements of an array that tasks of a loop write: which
+                    // one each task takes is not known.
+                    && !(first.element
+                        && second.element
+                        && ca == cb
+                        && matches!(ca, Ctx::Worker(site)
+                            if gathered.sites[site].repeats && !gathered.sites[site].parallel))
+                    // What the tasks of a loop reach through a call may be
+                    // the state of a different object in each iteration
+                    // (`worker.Run()`): only what their own code touches is
+                    // one field.
+                    && !(ca == cb
+                        && matches!(ca, Ctx::Worker(site)
+                            if gathered.sites[site].repeats && !gathered.sites[site].parallel)
+                        && (first.ctx != ca || second.ctx != cb))
                     && order.concurrent(ca, cb)
                     && !excluded(&first.held, &second.held)
                     && !order.ordered(first, ca, second, cb)
@@ -597,7 +738,7 @@ pub(in super::super) fn threads(
     for used in &gathered.unity {
         let Some(Ctx::Worker(site)) = raw(used.ctx)
             .into_iter()
-            .find(|ctx| matches!(ctx, Ctx::Worker(_)))
+            .find(|ctx| matches!(ctx, Ctx::Worker(site) if !gathered.sites[*site].inline))
         else {
             continue;
         };
@@ -612,8 +753,47 @@ pub(in super::super) fn threads(
         ));
     }
 
+    // RLN1003: a local the method around declares, written by a local
+    // function that the body of a `Parallel` call calls.
+    let mut writes: Vec<(TextSpan, String, usize)> = gathered.parallel_writes.clone();
+    for &(callee, lambda, site) in &gathered.parallel_calls {
+        for (unit, span, name, declared) in &gathered.function_writes {
+            if *unit == callee
+                && !lambda.contains_span(*declared)
+                && !writes.iter().any(|(at, _, _)| at == span)
+            {
+                writes.push((*span, name.clone(), site));
+            }
+        }
+    }
+    // And a local two delegates of one `Parallel.Invoke` write.
+    let mut grouped: Vec<(TextSpan, String, usize)> = Vec::new();
+    for (span, local, name, site) in &gathered.group_writes {
+        let group = gathered.sites[*site].group;
+        if gathered
+            .group_writes
+            .iter()
+            .any(|(_, other, _, other_site)| {
+                other == local && other_site != site && gathered.sites[*other_site].group == group
+            })
+            && !grouped.iter().any(|(at, _, _)| at == span)
+        {
+            grouped.push((*span, name.clone(), *site));
+        }
+    }
+    for (span, name, site) in &grouped {
+        found.push(AnalyzerDiagnostic::new(
+            "RLN1003",
+            Severity::Warning,
+            *span,
+            format!(
+                "'{name}' is written by more than one delegate of {} at once, with no lock",
+                gathered.sites[*site].label
+            ),
+        ));
+    }
     // RLN1003.
-    for (span, name, site) in &gathered.parallel_writes {
+    for (span, name, site) in &writes {
         found.push(AnalyzerDiagnostic::new(
             "RLN1003",
             Severity::Warning,
@@ -802,6 +982,61 @@ fn getter_aliases(
     found
 }
 
+/// The locals of a body that something other than a plain use could change
+/// or keep: assigned after the declaration, an element of them written, handed
+/// to code that may keep it, returned or copied. A collection of tasks that
+/// is none of that holds what was added to it.
+fn tainted_locals(symbols: &Symbols, body: &BoundBody) -> HashSet<LocalId> {
+    let mut safe: HashSet<*const BoundExpression> = HashSet::new();
+    let mut tainted: HashSet<LocalId> = HashSet::new();
+    fn mark(safe: &mut HashSet<*const BoundExpression>, expression: &BoundExpression) {
+        let inner = unconverted(expression);
+        if matches!(inner.kind, E::Local(_)) {
+            safe.insert(std::ptr::from_ref(inner));
+        }
+    }
+    walk_body(body, &mut |visited| match visited {
+        Visited::Statement(statement) => {
+            if let S::ForEach { collection, .. } = &statement.kind {
+                mark(&mut safe, collection);
+            }
+        }
+        Visited::Expression(expression) => match &expression.kind {
+            E::Call {
+                receiver,
+                method,
+                arguments,
+                ..
+            } => {
+                let name = symbols.get(*method).name.as_str();
+                if let Some(receiver) = receiver
+                    && matches!(name, "Add" | "ToArray" | "ToList" | "Contains" | "Any")
+                {
+                    mark(&mut safe, receiver);
+                }
+                if matches!(
+                    name,
+                    "WaitAll" | "WhenAll" | "WaitAny" | "WhenAny" | "ToArray" | "ToList" | "Any"
+                ) {
+                    for argument in arguments {
+                        mark(&mut safe, argument);
+                    }
+                }
+            }
+            E::Property {
+                receiver: Some(receiver),
+                property,
+            } if symbols.get(*property).name == "Count" => mark(&mut safe, receiver),
+            E::ArrayLength { array } => mark(&mut safe, array),
+            E::Local(local) if !safe.contains(&std::ptr::from_ref(expression)) => {
+                tainted.insert(*local);
+            }
+            _ => {}
+        },
+    });
+    tainted
+}
+
 /// What an expression is under the conversions the binder put around it.
 fn unconverted(expression: &BoundExpression) -> &BoundExpression {
     match &expression.kind {
@@ -854,34 +1089,151 @@ fn concretize(
 
 /// Gives each site the waits that were for it, and for what it continues.
 fn resolve_joins(gathered: &mut Gathered) {
-    for (targets, join) in std::mem::take(&mut gathered.joins) {
-        let mut done: Vec<usize> = Vec::new();
-        for target in &targets {
-            match target {
-                Target::Sites(list) => done.extend(list),
-                Target::Key(key) | Target::Exposed(key) => {
-                    done.extend(gathered.bound.get(key).into_iter().flatten());
-                    done.extend(gathered.signalled.get(key).into_iter().flatten());
+    let pending = std::mem::take(&mut gathered.joins);
+    // What a method finished before it returned is known from the waits
+    // inside it, which another wait may be what settles: go round until
+    // nothing is added.
+    for _ in 0..4 {
+        let mut changed = false;
+        for (targets, join) in &pending {
+            let mut done: Vec<usize> = Vec::new();
+            for target in targets {
+                sites_of(gathered, target, join, 0, &mut done);
+            }
+            let chain: Vec<usize> = done
+                .iter()
+                .flat_map(|&site| gathered.sites[site].after.clone())
+                .collect();
+            done.extend(chain);
+            done.sort_unstable();
+            done.dedup();
+            let exposed = targets
+                .iter()
+                .any(|target| matches!(target, Target::Exposed(_)));
+            for site in done {
+                let made = Join {
+                    exposed,
+                    ..join.clone()
+                };
+                if !gathered.sites[site].joins.contains(&made) {
+                    gathered.sites[site].joins.push(made);
+                    changed = true;
                 }
             }
         }
-        let chain: Vec<usize> = done
-            .iter()
-            .flat_map(|&site| gathered.sites[site].after.clone())
-            .collect();
-        done.extend(chain);
-        done.sort_unstable();
-        done.dedup();
-        let exposed = targets
-            .iter()
-            .any(|target| matches!(target, Target::Exposed(_)));
-        for site in done {
-            gathered.sites[site].joins.push(Join {
-                exposed,
-                ..join.clone()
-            });
+        if !changed {
+            break;
         }
     }
+}
+
+/// The sites a wait that is `join` waits for when it waits for `target`.
+fn sites_of(gathered: &Gathered, target: &Target, join: &Join, depth: usize, out: &mut Vec<usize>) {
+    if depth > 6 {
+        return;
+    }
+    match target {
+        Target::Sites(list) => out.extend(list),
+        Target::Key(key) | Target::Exposed(key) => {
+            out.extend(gathered.bound.get(key).into_iter().flatten());
+            out.extend(gathered.signalled.get(key).into_iter().flatten());
+            for held in gathered.bound_targets.get(key).into_iter().flatten() {
+                sites_of(gathered, held, join, depth + 1, out);
+            }
+            // A collection holds what was put into it, if nothing took it
+            // out or swapped it: its tasks started before the wait are done
+            // after it.
+            if !gathered.tainted.contains(key) {
+                for held in gathered.held_arrays.get(key).into_iter().flatten() {
+                    sites_of(gathered, held, join, depth + 1, out);
+                }
+                for &site in gathered.collected.get(key).into_iter().flatten() {
+                    let made = &gathered.sites[site];
+                    if made.unit == join.unit
+                        && made.lambda == join.lambda
+                        && made.at < join.at
+                        && !made.in_parallel
+                    {
+                        out.push(site);
+                    }
+                }
+            }
+        }
+        Target::Returned(method) => returned_by(gathered, *method, depth + 1, out),
+    }
+}
+
+/// The sites that are done when a call of `method` has been waited for: the
+/// task it returns, which is the one it started on every path, and what it
+/// waited for itself before it returned.
+fn returned_by(gathered: &Gathered, method: SymbolId, depth: usize, out: &mut Vec<usize>) {
+    if depth > 6 {
+        return;
+    }
+    for (index, site) in gathered.sites.iter().enumerate() {
+        if site.unit == method
+            && site.lambda.is_none()
+            && !site.in_parallel
+            && site.flow.is_none()
+            && site.joins.iter().any(|join| {
+                join.unit == method
+                    && join.lambda.is_none()
+                    && join.unconditional
+                    && join.at > site.at
+            })
+        {
+            out.push(index);
+        }
+    }
+    // An `async` method returns the value of its task, not a task.
+    if gathered.asynchronous.contains(&method) {
+        return;
+    }
+    let Some(returns) = gathered.returns.get(&method) else {
+        return;
+    };
+    // For each `return`: every site it stands for, and those that only that
+    // path started.
+    let mut every: Vec<Vec<usize>> = Vec::new();
+    let mut here: Vec<usize> = Vec::new();
+    for (span, targets) in returns {
+        let join = Join {
+            unit: method,
+            lambda: None,
+            at: span.start(),
+            unconditional: true,
+            exposed: false,
+        };
+        let mut all: Vec<usize> = Vec::new();
+        for target in targets {
+            let mut found = Vec::new();
+            sites_of(gathered, target, &join, depth, &mut found);
+            if matches!(target, Target::Returned(_)) {
+                here.extend(&found);
+            }
+            all.extend(found);
+        }
+        all.sort_unstable();
+        all.dedup();
+        if all.is_empty() {
+            return;
+        }
+        here.extend(all.iter().copied().filter(|&site| {
+            let made = &gathered.sites[site];
+            made.unit == method && span.start() <= made.at && made.at <= span.end()
+        }));
+        every.push(all);
+    }
+    let Some((first, rest)) = every.split_first() else {
+        return;
+    };
+    out.extend(
+        first
+            .iter()
+            .copied()
+            .filter(|site| rest.iter().all(|other| other.contains(site))),
+    );
+    out.extend(here);
 }
 
 /// Whether the locks held at two accesses are one the two share. Where one
@@ -908,7 +1260,9 @@ impl Order<'_> {
     /// `Parallel` call is, to them, the thread that waits for it.
     fn effective(&self, ctx: Ctx, out: &mut Vec<Ctx>, depth: usize) {
         match ctx {
-            Ctx::Worker(index) if self.sites[index].parallel && depth < 16 => {
+            Ctx::Worker(index)
+                if (self.sites[index].parallel || self.sites[index].inline) && depth < 16 =>
+            {
                 for parent in (self.concrete)(self.sites[index].parent) {
                     self.effective(parent, out, depth + 1);
                 }
@@ -919,10 +1273,14 @@ impl Order<'_> {
 
     /// Whether code on `a` and code on `b` can run at the same time.
     fn concurrent(&self, a: Ctx, b: Ctx) -> bool {
-        if let (Ctx::Worker(x), Ctx::Worker(y)) = (a, b)
-            && x == y
-        {
-            return self.sites[x].parallel;
+        if let (Ctx::Worker(x), Ctx::Worker(y)) = (a, b) {
+            if x == y {
+                return self.sites[x].parallel || self.sites[x].repeats;
+            }
+            // The delegates of one `Parallel.Invoke` run at the same time.
+            if self.sites[x].group.is_some() && self.sites[x].group == self.sites[y].group {
+                return true;
+            }
         }
         let (mut left, mut right) = (Vec::new(), Vec::new());
         self.effective(a, &mut left, 0);
@@ -952,7 +1310,11 @@ impl Order<'_> {
     /// is set up. And whether they are one flow, or one continues the other.
     fn ordered(&self, a: &Access, ca: Ctx, b: &Access, cb: Ctx) -> bool {
         let one_flow = |worker: Ctx, other: &Access| match worker {
-            Ctx::Worker(index) => other.body_of == Some(index) && !self.sites[index].parallel,
+            Ctx::Worker(index) => {
+                other.body_of == Some(index)
+                    && !self.sites[index].parallel
+                    && !self.sites[index].repeats
+            }
             _ => false,
         };
         let continues = |worker: Ctx, other: &Access| match worker {
@@ -1125,6 +1487,27 @@ struct Walk<'w, 'v> {
     parallel_loop: Option<usize>,
     /// The sites that are done before what is being walked runs.
     after: Vec<usize>,
+    /// How many branches the walk is inside, in the code of the unit or
+    /// lambda it is in.
+    branch_depth: u32,
+    /// A `return`, `break`, `continue` or `throw` was passed: what follows
+    /// may not be reached.
+    exited: bool,
+    /// The loops around the walk, innermost last, in the code of the unit or
+    /// lambda it is in.
+    loops: Vec<TextSpan>,
+    /// The locals the body of the `Parallel` call being walked assigns.
+    parallel_reassigned: HashSet<LocalId>,
+    /// Locals of that body that hold a value no other iteration holds, each
+    /// as `k * index + c`.
+    own_locals: HashMap<LocalId, (i64, i64)>,
+    /// The elements of an array the iterations write, each in the same form:
+    /// the array, the dimension, `k` and `c`.
+    own_writes: Vec<(Option<Key>, usize, i64, i64)>,
+    /// Set the write being walked is to an element, not to the field itself.
+    element_write: bool,
+    /// The local function whose body is being walked: where it was written.
+    function_span: Option<TextSpan>,
     /// The owner of the body whose locals are named.
     body_owner: SymbolId,
     /// Where the expression being walked starts.
@@ -1144,20 +1527,185 @@ struct Walk<'w, 'v> {
 impl Walk<'_, '_> {
     fn statement(&mut self, statement: &BoundStatement) {
         self.statement_inner(statement);
-        // `var t = Task.Run(..);` names the thread `t` stands for.
-        if let S::LocalDeclaration {
-            local,
-            initializer: Some(value),
-        } = &statement.kind
-        {
-            self.bind(Key::Local(self.body_owner, *local), value);
+        match &statement.kind {
+            // `var t = Task.Run(..);` names the thread `t` stands for.
+            S::LocalDeclaration {
+                local,
+                initializer: Some(value),
+            } => {
+                self.bind(Key::Local(self.body_owner, *local), value);
+                // `int j = i;` in a `Parallel.For` body is an index of the
+                // iteration's own.
+                if self.parallel_index.is_some()
+                    && !self.parallel_reassigned.contains(local)
+                    && let Some(form) = self.affine(value)
+                {
+                    self.own_locals.insert(*local, form);
+                }
+            }
+            // What each `return` hands back, for whoever waits for the call.
+            S::Return(value) if !self.in_lambda => {
+                let mut found = Vec::new();
+                if let Some(value) = value {
+                    self.targets(value, &mut found);
+                }
+                let at = value.as_ref().map_or(statement.span, |value| value.span);
+                self.out
+                    .returns
+                    .entry(self.unit)
+                    .or_default()
+                    .push((at, found));
+            }
+            _ => {}
         }
+        if matches!(
+            statement.kind,
+            S::Return(_)
+                | S::Break(_)
+                | S::Continue(_)
+                | S::Goto(_)
+                | S::GotoCase(_)
+                | S::Throw(_)
+                | S::YieldBreak
+        ) {
+            self.exited = true;
+        }
+    }
+
+    /// Whether a join made here cannot be skipped by the code around it.
+    fn unconditional(&self) -> bool {
+        self.branch_depth == 0 && !self.exited
+    }
+
+    /// `expression` as `k * index + c`, where the index is the one of the
+    /// `Parallel.For` body and `k` is not zero: an index that no two
+    /// iterations share. It is the loop's index, a local made of it, and
+    /// either one moved or scaled by a constant.
+    fn affine(&self, expression: &BoundExpression) -> Option<(i64, i64)> {
+        fn constant(expression: &BoundExpression) -> Option<i64> {
+            match unconverted(expression).kind {
+                E::Literal(ConstantValue::Int32(value)) => Some(i64::from(value)),
+                E::Literal(ConstantValue::Int64(value)) => Some(value),
+                _ => None,
+            }
+        }
+        match &unconverted(expression).kind {
+            E::Local(local) => {
+                if self.parallel_index == Some(*local) && !self.parallel_reassigned.contains(local)
+                {
+                    Some((1, 0))
+                } else {
+                    self.own_locals.get(local).copied()
+                }
+            }
+            E::Binary {
+                operator,
+                left,
+                right,
+            } => match operator {
+                BinaryOperator::Add => match (self.affine(left), constant(right)) {
+                    (Some((k, c)), Some(value)) => Some((k, c.checked_add(value)?)),
+                    _ => {
+                        let (k, c) = self.affine(right)?;
+                        Some((k, c.checked_add(constant(left)?)?))
+                    }
+                },
+                BinaryOperator::Subtract => match (self.affine(left), constant(right)) {
+                    (Some((k, c)), Some(value)) => Some((k, c.checked_sub(value)?)),
+                    _ => {
+                        let (k, c) = self.affine(right)?;
+                        Some((k.checked_neg()?, constant(left)?.checked_sub(c)?))
+                    }
+                },
+                BinaryOperator::Multiply => {
+                    let (form, factor) = match (self.affine(left), constant(right)) {
+                        (Some(form), Some(factor)) => (form, factor),
+                        _ => (self.affine(right)?, constant(left)?),
+                    };
+                    if factor == 0 {
+                        return None;
+                    }
+                    Some((form.0.checked_mul(factor)?, form.1.checked_mul(factor)?))
+                }
+                _ => None,
+            },
+            E::Unary {
+                operator: UnaryOperator::Minus,
+                operand,
+            } => {
+                let (k, c) = self.affine(operand)?;
+                Some((k.checked_neg()?, c.checked_neg()?))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether writing `array[indices]` takes an element of the iteration's
+    /// own: one index is `k * index + c`, and no write the body made before
+    /// to the same array can reach the element of another iteration.
+    fn own_element(&mut self, array: &BoundExpression, indices: &[BoundExpression]) -> bool {
+        if self.parallel_index.is_none() {
+            return false;
+        }
+        let Some((position, (k, c))) = indices
+            .iter()
+            .enumerate()
+            .find_map(|(position, index)| Some((position, self.affine(index)?)))
+        else {
+            return false;
+        };
+        let key = self.key_of(array);
+        let collides = self
+            .own_writes
+            .iter()
+            .any(|&(other, at, other_k, other_c)| {
+                other == key
+                    && (at != position || other_k != k || (other_c != c && (other_c - c) % k == 0))
+            });
+        self.own_writes.push((key, position, k, c));
+        !collides
     }
 
     /// `key` holds the thread or task `value` started, if it started one.
     fn bind(&mut self, key: Key, value: &BoundExpression) {
-        if let Some(&site) = self.out.call_sites.get(&unconverted(value).span) {
+        let value = unconverted(value);
+        if let Some(&site) = self.out.call_sites.get(&value.span) {
             self.out.bound.entry(key).or_default().push(site);
+            return;
+        }
+        match &value.kind {
+            // `new[] { Task.Run(..) }`: the array holds exactly these.
+            E::ArrayCreation { elements, .. } => {
+                let mut found = Vec::new();
+                for element in elements {
+                    self.targets(element, &mut found);
+                }
+                if !found.is_empty() {
+                    self.out.held_arrays.entry(key).or_default().extend(found);
+                }
+            }
+            // `new List<Task> { Task.Run(..) }`.
+            E::ObjectCreation { initializers, .. } => {
+                for initializer in initializers {
+                    if let E::Call {
+                        method, arguments, ..
+                    } = &initializer.kind
+                        && self.symbols.get(*method).name == "Add"
+                        && let [argument] = arguments.as_slice()
+                        && let Some(&site) = self.out.call_sites.get(&unconverted(argument).span)
+                    {
+                        self.out.collected.entry(key).or_default().push(site);
+                    }
+                }
+            }
+            _ => {
+                let mut found = Vec::new();
+                self.targets(value, &mut found);
+                found.retain(|target| !matches!(target, Target::Sites(_)));
+                if !found.is_empty() {
+                    self.out.bound_targets.entry(key).or_default().extend(found);
+                }
+            }
         }
     }
 
@@ -1181,6 +1729,7 @@ impl Walk<'_, '_> {
     }
 
     fn acquire(&mut self, operand: Option<&BoundExpression>) {
+        self.sync_point(self.here);
         let held = match operand.and_then(|operand| self.key_of(operand)) {
             Some(key) => Held::Key(key),
             None => Held::Unknown,
@@ -1200,12 +1749,21 @@ impl Walk<'_, '_> {
     /// since it may not have run, and what it acquires stays held.
     fn branch(&mut self, statement: &BoundStatement) {
         let before = self.held.clone();
+        self.branch_depth += 1;
         self.statement(statement);
+        self.branch_depth -= 1;
         for held in before {
             if !self.held.contains(&held) {
                 self.held.push(held);
             }
         }
+    }
+
+    /// The body of a loop: a branch that runs again.
+    fn loop_body(&mut self, span: TextSpan, body: &BoundStatement) {
+        self.loops.push(span);
+        self.branch(body);
+        self.loops.pop();
     }
 
     fn statement_inner(&mut self, statement: &BoundStatement) {
@@ -1253,11 +1811,11 @@ impl Walk<'_, '_> {
             }
             S::While { condition, body } => {
                 self.expression(condition);
-                self.branch(body);
+                self.loop_body(statement.span, body);
                 return;
             }
             S::DoWhile { body, condition } => {
-                self.branch(body);
+                self.loop_body(statement.span, body);
                 self.expression(condition);
                 return;
             }
@@ -1273,14 +1831,14 @@ impl Walk<'_, '_> {
                 for expression in condition.iter().chain(incrementors) {
                     self.expression(expression);
                 }
-                self.branch(body);
+                self.loop_body(statement.span, body);
                 return;
             }
             S::ForEach {
                 collection, body, ..
             } => {
                 self.expression(collection);
-                self.branch(body);
+                self.loop_body(statement.span, body);
                 return;
             }
             S::Try {
@@ -1326,8 +1884,16 @@ impl Walk<'_, '_> {
         for child in expressions {
             self.expression(child);
         }
+        // The sections of a `switch` are branches.
+        let switch = matches!(statement.kind, S::Switch { .. });
+        if switch {
+            self.branch_depth += 1;
+        }
         for child in statements {
             self.statement(child);
+        }
+        if switch {
+            self.branch_depth -= 1;
         }
     }
 
@@ -1352,6 +1918,10 @@ impl Walk<'_, '_> {
             at,
             joins: Vec::new(),
             parallel,
+            inline: false,
+            group: None,
+            repeats: false,
+            looped: None,
             parent: self.ctx,
             in_parallel: self.parallel.is_some(),
             after: self.after.clone(),
@@ -1386,7 +1956,7 @@ impl Walk<'_, '_> {
                 ..
             } => match self.symbols.get(*method).name.as_str() {
                 "ConfigureAwait" | "GetAwaiter" | "ContinueWith" | "Unwrap" | "AsTask"
-                | "WaitAsync" => {
+                | "WaitAsync" | "ToArray" | "ToList" => {
                     if let Some(receiver) = receiver {
                         self.targets(receiver, found);
                     }
@@ -1397,8 +1967,32 @@ impl Walk<'_, '_> {
                         self.targets(argument, found);
                     }
                 }
+                // A method of the file that hands a task back.
+                _ if self.returns_task(*method) => found.push(Target::Returned(*method)),
                 _ => {}
             },
+            // The wait handle of a cancellation token opens when its source
+            // is cancelled.
+            E::Property {
+                receiver: Some(receiver),
+                property,
+            } if matches!(
+                self.symbols.get(*property).name.as_str(),
+                "WaitHandle" | "Token"
+            ) && self
+                .symbols
+                .get(*property)
+                .container
+                .is_some_and(|container| {
+                    matches!(
+                        self.qualified(container).as_str(),
+                        "System.Threading.CancellationToken"
+                            | "System.Threading.CancellationTokenSource"
+                    )
+                }) =>
+            {
+                self.targets(receiver, found);
+            }
             E::ArrayCreation { elements, .. } => {
                 for element in elements {
                     self.targets(element, found);
@@ -1445,22 +2039,45 @@ impl Walk<'_, '_> {
         }
     }
 
+    /// Whether a call of `method` can be told what it returns: a method of the
+    /// file that nothing overrides.
+    fn returns_task(&self, method: SymbolId) -> bool {
+        let symbol = self.symbols.get(method);
+        !symbol.locations.is_empty()
+            && symbol.as_method().is_some()
+            && !symbol.modifiers.contains(Modifiers::VIRTUAL)
+            && !symbol.modifiers.contains(Modifiers::ABSTRACT)
+            && !symbol.modifiers.contains(Modifiers::OVERRIDE)
+            && symbol.container.is_some_and(|container| {
+                self.symbols.get(container).type_kind() != Some(TypeKind::Interface)
+            })
+    }
+
     /// Everything after `at` in this code runs after what `expression`
     /// waited for.
     fn wait_for(&mut self, expression: &BoundExpression, at: u32) {
+        self.sync_point(at);
         let mut found = Vec::new();
         self.targets(expression, &mut found);
         if !found.is_empty() {
+            let unconditional = self.unconditional();
             self.out.joins.push((
                 found,
                 Join {
                     unit: self.unit,
                     lambda: self.lambda,
                     at,
+                    unconditional,
                     exposed: false,
                 },
             ));
         }
+    }
+
+    /// Something here may hold the code back until another thread is done:
+    /// a loop around it is not a plain fan-out.
+    fn sync_point(&mut self, at: u32) {
+        self.out.sync_points.push((self.unit, self.lambda, at));
     }
 
     fn push_call(&mut self, callee: SymbolId, ctx: Ctx) {
@@ -1608,6 +2225,7 @@ impl Walk<'_, '_> {
             member: self.member.clone(),
             constant: if write { self.constant.clone() } else { None },
             snapshot: !write && self.snapshot,
+            element: write && self.element_write,
         });
     }
 
@@ -1646,15 +2264,13 @@ impl Walk<'_, '_> {
             E::ArrayAccess { array, indices } => {
                 // `arr[i]` with the loop's own index is an element nobody
                 // else's iteration writes.
-                let own = self.parallel_index.is_some_and(|index| {
-                    indices
-                        .iter()
-                        .any(|at| matches!(unconverted(at).kind, E::Local(local) if local == index))
-                });
+                let own = self.own_element(array, indices);
                 if own {
                     self.expression(array);
                 } else {
+                    let saved = std::mem::replace(&mut self.element_write, true);
                     self.write(array);
+                    self.element_write = saved;
                 }
                 for index in indices {
                     self.expression(index);
@@ -1666,7 +2282,9 @@ impl Walk<'_, '_> {
                 ..
             } => {
                 if self.watched(receiver).is_some() {
+                    let saved = std::mem::replace(&mut self.element_write, true);
                     self.write(receiver);
+                    self.element_write = saved;
                 } else {
                     self.expression(receiver);
                 }
@@ -1690,16 +2308,32 @@ impl Walk<'_, '_> {
     /// RLN1003: a local of the method around a `Parallel` body, written in
     /// it with no lock.
     fn local_written(&mut self, local: LocalId, span: TextSpan) {
-        let Some((lambda, site)) = self.parallel else {
-            return;
-        };
         if !self.held.is_empty() {
             return;
         }
         let Some(symbol) = self.body.locals.get(local.0 as usize) else {
             return;
         };
+        // A local function writing a local of the method around: where it is
+        // called from a `Parallel` body, every iteration writes it.
+        if let Some(function) = self.function_span
+            && self.lambda.is_none()
+            && !function.contains_span(symbol.span)
+        {
+            self.out
+                .function_writes
+                .push((self.unit, span, symbol.name.clone(), symbol.span));
+        }
+        let Some((lambda, site)) = self.parallel else {
+            return;
+        };
         if lambda.contains_span(symbol.span) {
+            return;
+        }
+        if self.out.sites[site].group.is_some() {
+            self.out
+                .group_writes
+                .push((span, (self.body_owner, local), symbol.name.clone(), site));
             return;
         }
         self.out
@@ -1773,6 +2407,56 @@ impl Walk<'_, '_> {
         });
     }
 
+    /// The locals a statement assigns, however it does it.
+    fn assigned_in(&self, statement: &BoundStatement) -> HashSet<LocalId> {
+        let mut found = HashSet::new();
+        walk_statement(self.body, statement, &mut |visited| {
+            if let Visited::Expression(expression) = visited {
+                let target = match &expression.kind {
+                    E::Assignment { target, .. }
+                    | E::CompoundAssignment { target, .. }
+                    | E::Increment { target, .. } => Some(target.as_ref()),
+                    E::RefArgument { operand, .. } => Some(operand.as_ref()),
+                    _ => None,
+                };
+                if let Some(target) = target
+                    && let E::Local(local) = unconverted(target).kind
+                {
+                    found.insert(local);
+                }
+            }
+        });
+        found
+    }
+
+    /// The delegates of `Parallel.Invoke`: each runs on a thread of its own,
+    /// at the same time as the others, and the call returns when all are
+    /// done.
+    fn invoke(&mut self, arguments: &[BoundExpression], at: u32) {
+        let mut delegates: Vec<&BoundExpression> = Vec::new();
+        for argument in arguments {
+            match &unconverted(argument).kind {
+                E::ArrayCreation { elements, .. } => delegates.extend(elements),
+                _ => delegates.push(argument),
+            }
+        }
+        let mut group = None;
+        for delegate in delegates {
+            if !matches!(
+                unconverted(delegate).kind,
+                E::Lambda(_) | E::DelegateCreation { .. } | E::MethodGroup { .. }
+            ) {
+                self.expression(delegate);
+                continue;
+            }
+            let site = self.site("Parallel.Invoke", at, false);
+            let group = *group.get_or_insert(site);
+            self.out.sites[site].inline = true;
+            self.out.sites[site].group = Some(group);
+            self.send(delegate, site);
+        }
+    }
+
     /// Code `argument` hands over to run on the thread `site`: a lambda is
     /// walked there, a method is called from there.
     fn send(&mut self, argument: &BoundExpression, site: usize) -> bool {
@@ -1792,17 +2476,28 @@ impl Walk<'_, '_> {
                     self.body_of,
                     std::mem::take(&mut self.after),
                 );
+                let saved_flow = (
+                    self.branch_depth,
+                    self.exited,
+                    std::mem::take(&mut self.loops),
+                    std::mem::take(&mut self.parallel_reassigned),
+                    std::mem::take(&mut self.own_locals),
+                    std::mem::take(&mut self.own_writes),
+                );
+                self.branch_depth = 0;
+                self.exited = false;
                 self.lambda = Some(lambda.span);
                 self.ctx = Ctx::Worker(site);
                 self.body_of = Some(site);
                 self.in_lambda = true;
-                if self.out.sites[site].parallel {
+                if self.out.sites[site].parallel || self.out.sites[site].group.is_some() {
                     self.parallel = Some((lambda.span, site));
                     // The first body with a parameter of a `Parallel.For` is
                     // the one that takes the loop's index.
                     if self.parallel_loop == Some(site) && !lambda.parameters.is_empty() {
                         self.parallel_index = lambda.parameters.first().copied();
                         self.parallel_loop = None;
+                        self.parallel_reassigned = self.assigned_in(&lambda.body);
                     } else {
                         self.parallel_index = None;
                     }
@@ -1818,6 +2513,14 @@ impl Walk<'_, '_> {
                     self.body_of,
                     self.after,
                 ) = saved;
+                (
+                    self.branch_depth,
+                    self.exited,
+                    self.loops,
+                    self.parallel_reassigned,
+                    self.own_locals,
+                    self.own_writes,
+                ) = saved_flow;
                 true
             }
             E::DelegateCreation {
@@ -1940,6 +2643,7 @@ impl Walk<'_, '_> {
                 });
                 if let Some(site) = site {
                     self.out.call_sites.insert(expression.span, site);
+                    self.out.sites[site].looped = self.loops.last().copied();
                 }
                 if let Some(constructor) = constructor {
                     self.push_call(*constructor, self.ctx);
@@ -2003,10 +2707,18 @@ impl Walk<'_, '_> {
                 // most often where it was made; what it switches to with
                 // `ConfigureAwait(false)` stays in it.
                 let saved = (self.ctx, self.in_lambda, self.lambda);
+                let saved_flow = (
+                    self.branch_depth,
+                    self.exited,
+                    std::mem::take(&mut self.loops),
+                );
+                self.branch_depth = 0;
+                self.exited = false;
                 self.in_lambda = true;
                 self.lambda = Some(lambda.span);
                 self.statement(&lambda.body);
                 (self.ctx, self.in_lambda, self.lambda) = saved;
+                (self.branch_depth, self.exited, self.loops) = saved_flow;
             }
             E::Await { operand, .. } => {
                 self.expression(operand);
@@ -2023,12 +2735,14 @@ impl Walk<'_, '_> {
                             self.ctx = Ctx::Main;
                             // Back where the flow began.
                             if let Some(&site) = self.out.flow_sites.get(&self.unit) {
+                                let unconditional = self.unconditional();
                                 self.out.joins.push((
                                     vec![Target::Sites(vec![site])],
                                     Join {
                                         unit: self.unit,
                                         lambda: self.lambda,
                                         at: expression.span.end(),
+                                        unconditional,
                                         exposed: false,
                                     },
                                 ));
@@ -2036,6 +2750,19 @@ impl Walk<'_, '_> {
                         }
                     }
                 }
+            }
+            E::Conditional { .. }
+            | E::ConditionalAccess { .. }
+            | E::Binary {
+                operator:
+                    BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr | BinaryOperator::Coalesce,
+                ..
+            } => {
+                self.branch_depth += 1;
+                for child in expression_children(expression) {
+                    self.expression(child);
+                }
+                self.branch_depth -= 1;
             }
             _ => {
                 for child in expression_children(expression) {
@@ -2125,11 +2852,20 @@ impl Walk<'_, '_> {
             self.out.discarded.insert(unconverted(receiver).span);
         }
         let spawned = spawner(&qualified);
-        let site = spawned.map(|(label, parallel)| {
+        let invoke = matches!(spawned, Some(("Parallel.Invoke", _)));
+        // A scheduler of the program's own may run the tasks one at a time.
+        let scheduled = arguments.iter().any(|argument| {
+            self.type_name(&argument.ty)
+                .is_some_and(|name| name == "System.Threading.Tasks.TaskScheduler")
+        });
+        let site = spawned.filter(|_| !invoke).map(|(label, parallel)| {
             let site = self.site(label, call.span.start(), parallel);
             self.out.call_sites.insert(call.span, site);
             if label == "Parallel.For" {
                 self.parallel_loop = Some(site);
+            }
+            if !parallel && label != "ContinueWith" && !scheduled {
+                self.out.sites[site].looped = self.loops.last().copied();
             }
             site
         });
@@ -2152,6 +2888,7 @@ impl Walk<'_, '_> {
                     Target::Key(key) | Target::Exposed(key) => {
                         continues.extend(self.out.bound.get(&key).into_iter().flatten());
                     }
+                    Target::Returned(_) => {}
                 }
             }
             let chain: Vec<usize> = continues
@@ -2165,10 +2902,20 @@ impl Walk<'_, '_> {
         }
         if !self.own_object(receiver) {
             self.push_call(method, self.ctx);
+            if let Some((lambda, site)) = self.parallel
+                && self.out.sites[site].parallel
+                && self.held.is_empty()
+            {
+                self.out.parallel_calls.push((method, lambda, site));
+            }
             let discarded = self.out.discarded.contains(&call.span);
             if let Some(last) = self.out.calls.last_mut() {
                 last.discarded = discarded;
             }
+        }
+        if invoke {
+            self.invoke(arguments, call.span.start());
+            return;
         }
         // A continuation given the scheduler of the thread that made it runs
         // there, after what it continues.
@@ -2191,6 +2938,16 @@ impl Walk<'_, '_> {
             self.arguments_to(arguments, site);
         }
         self.synchronization(&container, &name, receiver, arguments, call.span);
+        // `tasks.Add(Task.Run(..))`: the collection holds the task, whenever
+        // it holds anything.
+        if name == "Add"
+            && container == "System.Collections.Generic.List"
+            && let Some(key @ Key::Local(..)) = receiver.and_then(|receiver| self.key_of(receiver))
+            && let [argument] = arguments
+            && let Some(&started) = self.out.call_sites.get(&unconverted(argument).span)
+        {
+            self.out.collected.entry(key).or_default().push(started);
+        }
     }
 
     /// What a call to a lock, a gate, a thread or a task does to the order
@@ -2240,7 +2997,7 @@ impl Walk<'_, '_> {
         }
         // Opening a gate: what the thread did before is done for whoever
         // waits on it.
-        if matches!(
+        let opens = matches!(
             name,
             "Set"
                 | "Release"
@@ -2251,8 +3008,9 @@ impl Walk<'_, '_> {
                 | "TrySetException"
                 | "SetCanceled"
                 | "TrySetCanceled"
-        ) && let Some(key) = receiver.and_then(|receiver| self.key_of(receiver))
-        {
+        ) || (name == "Cancel"
+            && container == "System.Threading.CancellationTokenSource");
+        if opens && let Some(key) = receiver.and_then(|receiver| self.key_of(receiver)) {
             self.out.signals.push((key, self.ctx));
         }
         // Waiting for a thread or a gate.
@@ -2267,20 +3025,42 @@ impl Walk<'_, '_> {
                     self.wait_for(argument, span.end());
                 }
             }
-            "Start"
+            "Start" | "RunSynchronously"
                 if container == "System.Threading.Thread"
                     || container == "System.Threading.Tasks.Task" =>
             {
                 // The thread starts where `Start` is called.
-                let Some(key) = receiver.and_then(|receiver| self.key_of(receiver)) else {
+                let Some(receiver) = receiver else {
                     return;
                 };
-                let sites: Vec<usize> = self.out.bound.get(&key).cloned().unwrap_or_default();
+                let mut sites: Vec<usize> = match self.key_of(receiver) {
+                    Some(key) => self.out.bound.get(&key).cloned().unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                if let Some(&site) = self.out.call_sites.get(&unconverted(receiver).span) {
+                    sites.push(site);
+                }
+                // `RunSynchronously()` runs the task before it returns, on
+                // the thread that calls.
+                let inline = name == "RunSynchronously" && arguments.is_empty();
+                // A scheduler of the program's own may run tasks one at a
+                // time.
+                let scheduled = arguments.iter().any(|argument| {
+                    self.type_name(&argument.ty)
+                        .is_some_and(|name| name == "System.Threading.Tasks.TaskScheduler")
+                });
                 for site in sites {
                     let made = &mut self.out.sites[site];
                     if made.unit == self.unit && made.lambda == self.lambda {
                         made.at = span.start();
+                        made.inline |= inline;
                     }
+                    if scheduled {
+                        made.looped = None;
+                    }
+                }
+                if inline {
+                    self.wait_for(receiver, span.end());
                 }
             }
             _ => {}
@@ -2298,14 +3078,16 @@ mod tests {
 namespace System { public delegate void Action(); public delegate void Action<T>(T a); public delegate T Func<T>(); public delegate void AsyncCallback(IAsyncResult r); public interface IAsyncResult { } }
 namespace System.Threading.Tasks {
   public class Task { public static Task Run(System.Action a) => null; public static Task Run(System.Func<Task> a) => null; public static Task<T> Run<T>(System.Func<T> a) => null; public TaskAwaiter GetAwaiter() => default; public ConfiguredTaskAwaitable ConfigureAwait(bool c) => default; public static Task Delay(int ms) => null;
+    public Task() { } public Task(System.Action a) { } public void Start() { } public void RunSynchronously() { } public static Task CompletedTask => null;
     public void Wait() { } public static void WaitAll(params Task[] tasks) { } public static Task WhenAll(params Task[] tasks) => null;
+    public static Task WhenAll(System.Collections.Generic.IEnumerable<Task> tasks) => null; public static Task WhenAny(params Task[] tasks) => null; public static Task WhenAny(System.Collections.Generic.IEnumerable<Task> tasks) => null;
     public Task ContinueWith(System.Action<Task> a) => null; public Task ContinueWith(System.Action<Task> a, TaskScheduler s) => null; }
   public class Task<T> : Task { public T Result => default; }
   public class TaskScheduler { public static TaskScheduler FromCurrentSynchronizationContext() => null; }
   public class TaskCompletionSource<T> { public Task<T> Task => null; public void SetResult(T r) { } }
   public struct TaskAwaiter : System.Runtime.CompilerServices.INotifyCompletion { public bool IsCompleted => true; public void GetResult() { } public void OnCompleted(System.Action a) { } }
   public struct ConfiguredTaskAwaitable { public TaskAwaiter GetAwaiter() => default; }
-  public static class Parallel { public static void For(int from, int to, System.Action<int> body) { } }
+  public static class Parallel { public static void For(int from, int to, System.Action<int> body) { } public static void Invoke(params System.Action[] actions) { } }
 }
 namespace System.Runtime.CompilerServices { public interface INotifyCompletion { void OnCompleted(System.Action a); } public class AsyncTaskMethodBuilder { } }
 namespace System.Threading {
@@ -2315,6 +3097,8 @@ namespace System.Threading {
   public class SemaphoreSlim { public SemaphoreSlim(int n) { } public void Wait() { } public Tasks.Task WaitAsync() => null; public int Release() => 0; }
   public class ManualResetEventSlim { public void Set() { } public void Wait() { } }
   public class WaitHandle { public bool WaitOne() => true; }
+  public struct CancellationToken { public WaitHandle WaitHandle => null; }
+  public class CancellationTokenSource { public CancellationToken Token => default; public void Cancel() { } }
   public class Mutex : WaitHandle { public void ReleaseMutex() { } }
   public static class Monitor { public static void Enter(object o) { } public static void Exit(object o) { } }
   public class ReaderWriterLockSlim { public void EnterReadLock() { } public void ExitReadLock() { } public void EnterWriteLock() { } public void ExitWriteLock() { } }
@@ -2322,7 +3106,7 @@ namespace System.Threading {
   public static class Interlocked { public static int Increment(ref int v) => v; }
   public static class ThreadPool { public static bool QueueUserWorkItem(System.Action<object> a) => true; }
 }
-namespace System.Collections.Generic { public class List<T> { public void Add(T item) { } public int Count => 0; } public class Dictionary<K, V> { public V this[K key] { get => default; set { } } } }
+namespace System.Collections.Generic { public interface IEnumerable<T> { } public class List<T> : IEnumerable<T> { public void Add(T item) { } public void Clear() { } public T[] ToArray() => null; public int Count => 0; } public class Dictionary<K, V> { public V this[K key] { get => default; set { } } } }
 namespace System.Collections.Concurrent { public class ConcurrentQueue<T> { public void Enqueue(T item) { } } }
 namespace UnityEngine {
   public class Object { }
@@ -3041,6 +3825,236 @@ class Responder {
                 "class B : UnityEngine.MonoBehaviour { async Task Load() { await Task.Delay(1).ConfigureAwait(false); transform.position = 1; } }",
             ],
             "RLN1002",
+        );
+    }
+
+    /// A task a method of the file hands back is done where the caller waits
+    /// for the call.
+    #[test]
+    fn what_a_method_hands_back_is_waited_for_at_the_call() {
+        none_of(
+            &[
+                "class A1 { int x; public Task Start() { return Task.Run(() => { x = 1; }); } public async Task M() { await Start(); x = 2; } }",
+                "class A2 { int x; Task Start() => Task.Run(() => { x = 1; }); public void M() { Start().Wait(); x = 2; } }",
+                "class A3 { int x; Task Start() => Task.Run(() => { x = 1; }); public void M() { var t = Start(); t.Wait(); x = 2; } }",
+                "class A4 { int x; Task Start() { var t = Task.Run(() => { x = 1; }); return t; } public void M() { Start().Wait(); x = 2; } }",
+                "class A5 { int x; Task Start(bool b) { if (b) return Task.Run(() => { x = 1; }); return Task.Run(() => { x = 1; }); } public void M(bool b) { Start(b).Wait(); x = 2; } }",
+                "class A6 { int x; Task Inner() => Task.Run(() => { x = 1; }); Task Outer() => Inner(); public async Task M() { await Outer(); x = 2; } }",
+                "class A7 { int x; async Task Start() { await Task.Run(() => { x = 1; }); } public async Task M() { await Start(); x = 2; } }",
+                "class A8 { int x; async Task Start() { var t = Task.Run(() => { x = 1; }); await t; } public async Task M() { await Start(); x = 2; } }",
+            ],
+            "RLN1001",
+        );
+    }
+
+    /// A call nobody waits for, a call waited for after the access, and a
+    /// task that is not the one every path returns, order nothing.
+    #[test]
+    fn what_a_method_hands_back_is_not_waited_for_unless_it_is_certain() {
+        each_of(
+            &[
+                "class A1 { int x; Task Start() => Task.Run(() => { x = 1; }); public void M() { Start(); x = 2; } }",
+                "class A2 { int x; Task Start() => Task.Run(() => { x = 1; }); public void M() { var t = Start(); x = 2; t.Wait(); } }",
+                "class A3 { int x; Task Start() { var t = Task.Run(() => { x = 1; }); return Task.CompletedTask; } public void M() { Start().Wait(); x = 2; } }",
+                "class A4 { int x; Task Start(bool b) { var t = Task.Run(() => { x = 1; }); if (b) return t; return Task.CompletedTask; } public void M(bool b) { Start(b).Wait(); x = 2; } }",
+                "class A5 { int x; async Task Start() { var t = Task.Run(() => { x = 1; }); await Task.Delay(1); } public async Task M() { await Start(); x = 2; } }",
+                "class A6 { int x; async Task Start(bool b) { var t = Task.Run(() => { x = 1; }); if (b) await t; } public async Task M() { await Start(true); x = 2; } }",
+                "class A7 { int x; async Task Start(bool b) { var t = Task.Run(() => { x = 1; }); if (b) return; await t; } public async Task M() { await Start(true); x = 2; } }",
+            ],
+            "RLN1001",
+        );
+    }
+
+    /// Tasks put into a collection that is waited for whole are done after
+    /// the wait.
+    #[test]
+    fn tasks_in_a_collection_that_is_waited_for_are_done() {
+        none_of(
+            &[
+                "class F1 { int x; public void M() { var tasks = new List<Task>(); tasks.Add(Task.Run(() => { x = 1; })); Task.WaitAll(tasks.ToArray()); x = 2; } }",
+                "class F2 { int x; public async Task M() { var tasks = new List<Task>(); tasks.Add(Task.Run(() => { x = 1; })); await Task.WhenAll(tasks); x = 2; } }",
+                "class F3 { int x; public async Task M() { var tasks = new List<Task>(); for (int i = 0; i < 3; i++) tasks.Add(Task.Run(() => { lock (this) { x++; } })); await Task.WhenAll(tasks); x = 2; } }",
+                "class F4 { int x; public async Task M() { Task[] ts = { Task.Run(() => { x = 1; }) }; await Task.WhenAll(ts); x = 2; } }",
+                "class F5 { int x; public async Task M() { var tasks = new List<Task> { Task.Run(() => { x = 1; }) }; await Task.WhenAll(tasks); x = 2; } }",
+                "class F6 { int x; public void M() { var arr = new Task[] { Task.Run(() => { x = 1; }) }; Task.WaitAll(arr); x = 2; } }",
+                "class F7 { int x; public async Task M() { var tasks = new List<Task>(); tasks.Add(Task.Run(() => { x = 1; })); var all = Task.WhenAll(tasks); await all; x = 2; } }",
+            ],
+            "RLN1001",
+        );
+    }
+
+    /// A task that may not be in the collection, one taken out, one added
+    /// after the wait, or a wait that does not wait for all, orders nothing.
+    #[test]
+    fn tasks_that_may_not_be_in_the_collection_that_is_waited_for_still_race() {
+        each_of(
+            &[
+                "class G1 { int x; public async Task M() { var tasks = new List<Task>(); tasks.Add(Task.Run(() => { x = 1; })); x = 2; await Task.WhenAll(tasks); } }",
+                "class G2 { int x; public async Task M() { var tasks = new List<Task>(); tasks.Add(Task.Run(() => { x = 1; })); await Task.WhenAll(tasks); tasks.Add(Task.Run(() => { x = 4; })); x = 2; } }",
+                "class G3 { int x; public async Task M() { var tasks = new List<Task>(); var t = Task.Run(() => { x = 1; }); if (x > 5) tasks.Add(t); await Task.WhenAll(tasks); x = 2; } }",
+                "class G4 { int x; public async Task M() { var tasks = new List<Task>(); tasks.Add(Task.Run(() => { x = 1; })); tasks.Clear(); await Task.WhenAll(tasks); x = 2; } }",
+                "class G5 { int x; public async Task M() { var tasks = new List<Task>(); tasks.Add(Task.Run(() => { x = 1; })); Keep(tasks); await Task.WhenAll(tasks); x = 2; } void Keep(List<Task> l) { l.Clear(); } }",
+                "class G6 { int x; public void M() { var arr = new Task[] { Task.Run(() => { x = 1; }) }; arr[0] = Task.CompletedTask; Task.WaitAll(arr); x = 2; } }",
+                "class G7 { int x; public async Task M() { var tasks = new List<Task>(); tasks.Add(Task.Run(() => { x = 1; })); await Task.WhenAny(tasks); x = 2; } }",
+            ],
+            "RLN1001",
+        );
+    }
+
+    /// Tasks started in a loop run at the same time as each other, unless
+    /// something in the loop holds the next one back.
+    #[test]
+    fn tasks_started_in_a_loop_write_at_the_same_time() {
+        each_of(
+            &[
+                "class L1 { int x; public void M() { for (int k = 0; k < 3; k++) Task.Run(() => { x++; }); } }",
+                "class L2 { int x; public void M() { var ts = new Task[3]; for (int k = 0; k < 3; k++) ts[k] = Task.Run(() => { x++; }); Task.WaitAll(ts); } }",
+                "class L3 { List<int> l = new List<int>(); public void M() { foreach (var k in new[] { 1, 2 }) { Task.Run(() => { l.Add(k); }); } } }",
+            ],
+            "RLN1001",
+        );
+        none_of(
+            &[
+                "class N1 { int x; public void M() { for (int k = 0; k < 3; k++) Task.Run(() => { x++; }).Wait(); } }",
+                "class N2 { int x; public async Task M() { for (int k = 0; k < 3; k++) await Task.Run(() => { x++; }); } }",
+                "class N3 { int x; object o = new object(); public void M() { for (int k = 0; k < 3; k++) Task.Run(() => { lock (o) { x++; } }); } }",
+                "class N4 { int x; SemaphoreSlim s = new SemaphoreSlim(1); public async Task M() { for (int k = 0; k < 3; k++) { await s.WaitAsync(); Task.Run(() => { x++; s.Release(); }); } } }",
+                "class N5 { int[] r = new int[5]; public void M() { for (int k = 0; k < 5; k++) { int j = k; Task.Run(() => { r[j] = 1; }); } } }",
+                "class N6 { int x; public void M() { for (int k = 0; k < 3; k++) Task.Run(() => { x = 1; }); } }",
+                "class N7 { int x; public void M() { var t = Task.CompletedTask; for (int k = 0; k < 3; k++) t = t.ContinueWith(_ => { x++; }); } }",
+                "class N8 { int x; public void M() { Task.Run(() => { x++; }); } }",
+                "class N9 { int n; public void Run() { n++; } } class N10 { public void M(List<N9> ws) { foreach (var w in ws) Task.Run(() => w.Run()); } }",
+                "class N11 { int n; void Work() { n++; } public void M() { for (int k = 0; k < 3; k++) Task.Run(() => Work()); } }",
+            ],
+            "RLN1001",
+        );
+    }
+
+    /// The delegates of one `Parallel.Invoke` run at the same time, and the
+    /// call returns when all are done.
+    #[test]
+    fn the_delegates_of_parallel_invoke_write_at_the_same_time() {
+        each_of(
+            &[
+                "class P1 { int x; public void M() { Parallel.Invoke(() => { x = 1; }, () => { x = 2; }); } }",
+                "class P2 { int x; int y; public void M() { Parallel.Invoke(() => { x = 1; }, () => { y = x; }); } }",
+            ],
+            "RLN1001",
+        );
+        each_of(
+            &[
+                "class P3 { public int M() { int c = 0; Parallel.Invoke(() => { c = 1; }, () => { c = 2; }); return c; } }",
+            ],
+            "RLN1003",
+        );
+        none_of(
+            &[
+                "class N1 { int x; public void M() { Parallel.Invoke(() => { x = 1; }); } }",
+                "class N2 { int x; int y; public void M() { Parallel.Invoke(() => { x = 1; }, () => { y = 2; }); x = 3; } }",
+                "class N3 { int x; object o = new object(); public void M() { Parallel.Invoke(() => { lock (o) { x = 1; } }, () => { lock (o) { x = 2; } }); } }",
+                "class N4 { int x; public void M() { Parallel.Invoke(() => { x = 1; }, () => { }); x = 2; } }",
+            ],
+            "RLN1001",
+        );
+        none_of(
+            &[
+                "class N5 { public int M() { int c = 0; int d = 0; Parallel.Invoke(() => { c = 1; }, () => { d = 2; }); return c + d; } }",
+                "class N6 { public int M() { int c = 0; Parallel.Invoke(() => { c = 1; }); return c; } }",
+            ],
+            "RLN1003",
+        );
+    }
+
+    /// A local function that writes a local of the method around, called from
+    /// a `Parallel` body, is written by every iteration.
+    #[test]
+    fn a_local_function_a_parallel_body_calls_writes_for_every_iteration() {
+        each_of(
+            &[
+                "class P1 { public int M() { int c = 0; void Inc() { c++; } Parallel.For(0, 9, i => { Inc(); }); return c; } }",
+            ],
+            "RLN1003",
+        );
+        none_of(
+            &[
+                "class N1 { public int M() { int c = 0; object o = new object(); void Inc() { c++; } Parallel.For(0, 9, i => { lock (o) { Inc(); } }); return c; } }",
+                "class N2 { public int M() { int c = 0; void Inc() { c++; } Inc(); return c; } }",
+                "class N3 { public int M() { void Own() { int d = 0; d++; } Parallel.For(0, 9, i => { Own(); }); return 0; } }",
+            ],
+            "RLN1003",
+        );
+    }
+
+    /// `a[2 * i]` and `int j = i; a[j]` are elements of the iteration's own;
+    /// two writes that can reach the same element are not.
+    #[test]
+    fn an_index_made_of_the_loops_index_is_an_element_of_its_own() {
+        none_of(
+            &[
+                "class C { int[] a = new int[10]; public void Run() { Parallel.For(0, 4, i => { a[2 * i] = i; a[2 * i + 1] = i; }); } }",
+                "class D { int[] a = new int[10]; public void Run() { Parallel.For(0, 4, i => { int j = i; a[j] = i; }); } }",
+                "class E { int[] a = new int[10]; public void Run() { Parallel.For(0, 4, i => { int j = i + 1; a[j] = i; }); } }",
+            ],
+            "RLN1001",
+        );
+        each_of(
+            &[
+                "class C { int[] a = new int[10]; public void Run() { Parallel.For(0, 4, i => { a[i] = i; a[i + 1] = i; }); } }",
+                "class D { int[] a = new int[10]; public void Run() { Parallel.For(0, 4, i => { a[i / 2] = i; }); } }",
+                "class E { int[] a = new int[10]; public void Run() { Parallel.For(0, 4, i => { int j = i; j++; a[j % 2] = i; }); } }",
+                "class F { int[] a = new int[10]; public void Run() { Parallel.For(0, 4, i => { a[2 * i] = i; a[2 * i + 2] = i; }); } }",
+            ],
+            "RLN1001",
+        );
+    }
+
+    /// `RunSynchronously()` runs the task before it returns.
+    #[test]
+    fn a_task_run_synchronously_is_done_when_the_call_returns() {
+        none_of(
+            &[
+                "class S1 { int x; public void M() { var t = new Task(() => { x = 1; }); t.RunSynchronously(); x = 2; } }",
+                "class S2 { int x; public void M() { new Task(() => { x = 1; }).RunSynchronously(); x = 2; } }",
+                "class S3 { int x; public void M() { var t = new Task(() => { x = 1; }); x = 2; t.RunSynchronously(); } }",
+            ],
+            "RLN1001",
+        );
+        each_of(
+            &[
+                "class T1 { int x; public void M() { var t = new Task(() => { x = 1; }); t.Start(); x = 2; } }",
+                "class T2 { int x; public void M() { var t = new Task(() => { x = 1; }); t.RunSynchronously(); Task.Run(() => { x = 3; }); x = 2; } }",
+            ],
+            "RLN1001",
+        );
+        // It runs on the thread that calls: Unity's main thread, here.
+        none_of(
+            &[
+                "class U : UnityEngine.MonoBehaviour { void Start() { new Task(() => { transform.position = 1; }).RunSynchronously(); } }",
+            ],
+            "RLN1002",
+        );
+        each_of(
+            &[
+                "class V : UnityEngine.MonoBehaviour { void Start() { new Task(() => { transform.position = 1; }).Start(); } }",
+            ],
+            "RLN1002",
+        );
+    }
+
+    /// Cancelling the source opens the wait handle of its token.
+    #[test]
+    fn cancelling_the_source_opens_the_wait_handle_of_its_token() {
+        none_of(
+            &[
+                "class S1 { int x; CancellationTokenSource c = new CancellationTokenSource(); public void M() { Task.Run(() => { x = 1; c.Cancel(); }); c.Token.WaitHandle.WaitOne(); x = 2; } }",
+            ],
+            "RLN1001",
+        );
+        each_of(
+            &[
+                "class S2 { int x; CancellationTokenSource c = new CancellationTokenSource(); public void M() { Task.Run(() => { x = 1; }); c.Token.WaitHandle.WaitOne(); x = 2; } }",
+            ],
+            "RLN1001",
         );
     }
 }
