@@ -765,7 +765,8 @@ impl<'a> Declarer<'a> {
                 | SyntaxKind::StructDeclaration
                 | SyntaxKind::InterfaceDeclaration
                 | SyntaxKind::RecordDeclaration
-                | SyntaxKind::RecordStructDeclaration => {
+                | SyntaxKind::RecordStructDeclaration
+                | SyntaxKind::UnionDeclaration => {
                     self.declare_type(&child, container);
                 }
                 SyntaxKind::EnumDeclaration => self.declare_enum(&child, container),
@@ -824,6 +825,7 @@ impl<'a> Declarer<'a> {
             SyntaxKind::StructDeclaration => TypeKind::Struct,
             SyntaxKind::InterfaceDeclaration => TypeKind::Interface,
             SyntaxKind::RecordStructDeclaration => TypeKind::RecordStruct,
+            SyntaxKind::UnionDeclaration => TypeKind::Struct,
             _ => TypeKind::Record,
         };
         let Some(name_token) = name_token(node) else {
@@ -854,8 +856,19 @@ impl<'a> Declarer<'a> {
         }
         self.declare_type_parameters(node, id);
         self.record_base_types(node, id);
-        self.declare_primary_constructor(node, id);
+        // The list of a union names its case types: no constructor of the
+        // union takes them all.
+        if node.kind() == SyntaxKind::UnionDeclaration {
+            if let Detail::NamedType(detail) = &mut self.symbols.get_mut(id).detail {
+                detail.union_declaration = true;
+            }
+        } else {
+            self.declare_primary_constructor(node, id);
+        }
         self.declare_members(node, id);
+        if node.kind() == SyntaxKind::UnionDeclaration {
+            self.declare_union_members(node, id);
+        }
         if matches!(type_kind, TypeKind::Record | TypeKind::RecordStruct)
             && (self
                 .pending_records
@@ -873,6 +886,62 @@ impl<'a> Declarer<'a> {
         self.pending_captures.push((self.tree, node.clone(), id));
         self.pending_constructors
             .push((self.tree, node.clone(), id, type_kind));
+    }
+
+    /// The members the language gives a union (C# 15): `object? Value { get; }`
+    /// and, for each case type, a public constructor taking it that stores it
+    /// in `Value`. The constructors come out in the order of the list.
+    fn declare_union_members(&mut self, node: &SyntaxNode, owner: SymbolId) {
+        let location = self.location(node);
+        let property = self.symbols.add(
+            SymbolKind::Property,
+            "Value",
+            Some(owner),
+            Detail::Property(Property {
+                synthesized: Some(SynthesizedType::Special(SpecialType::Object)),
+                has_get: true,
+                ..Property::default()
+            }),
+        );
+        let symbol = self.symbols.get_mut(property);
+        symbol.accessibility = Accessibility::Public;
+        symbol.locations.push(location);
+        let Some(list) = node.child_of_kind(SyntaxKind::ParameterList) else {
+            return;
+        };
+        for case in list.children() {
+            if case.kind() != SyntaxKind::Parameter {
+                continue;
+            }
+            let Some(ty) = case.children().find(|child| child.kind().is_type_node()) else {
+                continue;
+            };
+            let constructor = self.symbols.add(
+                SymbolKind::Method,
+                ".ctor",
+                Some(owner),
+                Detail::Method(Method {
+                    method_kind: MethodKind::Constructor,
+                    ..Method::default()
+                }),
+            );
+            let case_location = self.location(&ty);
+            let symbol = self.symbols.get_mut(constructor);
+            symbol.accessibility = Accessibility::Public;
+            symbol.locations.push(case_location);
+            let parameter = self.symbols.add(
+                SymbolKind::Parameter,
+                "value",
+                Some(constructor),
+                Detail::Parameter(Parameter {
+                    ty: Some(self.type_ref(&ty)),
+                    ..Parameter::default()
+                }),
+            );
+            if let Detail::Method(detail) = &mut self.symbols.get_mut(constructor).detail {
+                detail.parameters = vec![parameter];
+            }
+        }
     }
 
     /// The members the language gives a record.

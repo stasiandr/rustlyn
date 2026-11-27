@@ -1122,6 +1122,7 @@ fn unreferenced_labels(declaration: &SyntaxNode) -> Vec<TextSpan> {
             | SyntaxKind::InterfaceDeclaration
             | SyntaxKind::RecordDeclaration
             | SyntaxKind::RecordStructDeclaration
+            | SyntaxKind::UnionDeclaration
             | SyntaxKind::EnumDeclaration
             | SyntaxKind::NamespaceDeclaration
             | SyntaxKind::FileScopedNamespaceDeclaration

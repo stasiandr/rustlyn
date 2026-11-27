@@ -424,6 +424,7 @@ impl<'a> Binder<'a> {
                 | SyntaxKind::InterfaceDeclaration
                 | SyntaxKind::RecordDeclaration
                 | SyntaxKind::RecordStructDeclaration
+                | SyntaxKind::UnionDeclaration
                 | SyntaxKind::EnumDeclaration
                 | SyntaxKind::DelegateDeclaration
                 | SyntaxKind::MethodDeclaration
@@ -498,6 +499,7 @@ impl<'a> Binder<'a> {
                 | SyntaxKind::InterfaceDeclaration
                 | SyntaxKind::RecordDeclaration
                 | SyntaxKind::RecordStructDeclaration
+                | SyntaxKind::UnionDeclaration
                 | SyntaxKind::EnumDeclaration
                 | SyntaxKind::DelegateDeclaration => scopes.push(Scope {
                     ty: symbol,
@@ -1599,6 +1601,23 @@ impl<'a> Binder<'a> {
             let interface = Type::Named {
                 symbol: equatable,
                 type_arguments: vec![self.self_type(ty)],
+            };
+            if !resolved.contains(&interface) {
+                resolved.push(interface);
+            }
+        }
+
+        // A union declaration implements `IUnion`, whose `Value` its own is.
+        if symbol
+            .as_named_type()
+            .is_some_and(|detail| detail.union_declaration)
+            && let Some(interface) = self
+                .compilation
+                .type_by_metadata_name("System.Runtime.CompilerServices.IUnion")
+        {
+            let interface = Type::Named {
+                symbol: interface,
+                type_arguments: Vec::new(),
             };
             if !resolved.contains(&interface) {
                 resolved.push(interface);

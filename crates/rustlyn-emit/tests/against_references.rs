@@ -24797,3 +24797,75 @@ System.Int32 64 True
 ",
     );
 }
+
+#[test]
+fn a_union_declaration_converts_from_its_case_types_and_is_matched_by_what_it_holds() {
+    // `union Pet(Cat, Dog);` is a struct with a `Value` and a constructor for each case type, which
+    // an implicit union conversion calls; patterns look through the union to what it holds, asking
+    // `TryGetValue` and `HasValue` where the type has them, and `{ Value: ... }` on a union written
+    // out is the same question.
+    check(
+        "union_declaration_conversion_and_matching",
+        r#"using System;
+namespace System.Runtime.CompilerServices {
+  public class UnionAttribute : Attribute {}
+  public interface IUnion { object? Value { get; } }
+}
+public class Cat { public string Name = "tom"; }
+public class Dog { }
+public union Pet(Cat, Dog);
+public union Num(int, string?) { public override string ToString() => "Num:" + Value; }
+public union Wrap<T>(T, bool);
+[System.Runtime.CompilerServices.Union]
+struct Counted {
+  public Counted(int x) { _value = x; }
+  public Counted(string x) { _value = x; }
+  private readonly object _value;
+  public object Value { get { Console.Write("[Value]"); return _value; } }
+  public bool HasValue { get { Console.Write("[HasValue]"); return _value != null; } }
+  public bool TryGetValue(out int x) { Console.Write("[TryGetValue(int)]"); if (_value is int i) { x = i; return true; } x = 0; return false; }
+}
+class Program {
+  static string Describe(Pet p) => p switch { Cat { Name: "tom" } => "tom cat", Cat => "cat", Dog => "dog" };
+  static string Kind(Num n) => n switch { int i and > 10 => "big " + i, int => "int", null => "none", string s => "text " + s };
+  static void Main() {
+    Pet p = new Cat();
+    Console.WriteLine(Describe(p));
+    Console.WriteLine(Describe(new Dog()));
+    Console.WriteLine(Describe(new Pet(new Cat { Name = "x" })));
+    Num a = 5, b = 50, c = "hi", d = default;
+    Console.WriteLine(Kind(a) + "," + Kind(b) + "," + Kind(c) + "," + Kind(d));
+    Console.WriteLine(a);
+    Console.WriteLine(((System.Runtime.CompilerServices.IUnion)b).Value);
+    Wrap<long> w = 3L;
+    Console.WriteLine(w is long l ? l : -1);
+    Console.WriteLine(((object)w) is Wrap<long> { Value: long } && w is not null);
+    Console.WriteLine(((object)d) is Num { Value: null });
+    Console.WriteLine(Pet.Equals(p, p));
+    Counted k = new Counted(7);
+    Console.WriteLine(k is 7);
+    Console.WriteLine(k is (int and > 3) and not 5);
+    Console.WriteLine(new Counted("s") is null);
+    Console.WriteLine(((object)new Counted("s")) is Counted { Value: string });
+    Console.WriteLine(typeof(Pet).GetInterfaces().Length);
+  }
+}
+"#,
+        "tom cat
+dog
+cat
+int,big 50,text hi,none
+Num:5
+50
+3
+True
+True
+True
+[TryGetValue(int)]True
+[TryGetValue(int)]True
+[HasValue]False
+[Value]True
+1
+",
+    );
+}

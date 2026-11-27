@@ -128,6 +128,15 @@ impl BodyEmitter<'_, '_> {
     ) -> Result<(), EmitError> {
         self.emit_parameter_captures(plan)?;
         let symbols = self.emitter.compilation.symbols();
+        // A union's constructor keeps its case in `Value`, boxed where the
+        // case is a value.
+        if symbols
+            .get(plan.symbol)
+            .as_named_type()
+            .is_some_and(|detail| detail.union_declaration)
+        {
+            return self.emit_union_constructor(plan, constructor);
+        }
         // An anonymous type's constructor fills every property it has.
         let anonymous = symbols
             .get(plan.symbol)
@@ -169,6 +178,30 @@ impl BodyEmitter<'_, '_> {
             Some((base, arguments)) => self.emit_constructor_call(plan, Some(base), &arguments)?,
             None => self.emit_implicit_base_constructor(plan)?,
         }
+        Ok(())
+    }
+
+    /// `Value = value;` for a union's constructor.
+    fn emit_union_constructor(
+        &mut self,
+        plan: &TypePlan,
+        constructor: SymbolId,
+    ) -> Result<(), EmitError> {
+        let symbols = self.emitter.compilation.symbols();
+        let parameter = symbols
+            .get(constructor)
+            .as_method()
+            .and_then(|detail| detail.parameters.first().copied())
+            .ok_or_else(|| EmitError::new("a union constructor without its case"))?;
+        let property = self
+            .record_property_named(plan.symbol, "Value")
+            .ok_or_else(|| EmitError::new("a union without a `Value`"))?;
+        let field = self.backing_field(plan, property)?;
+        let ty = self.emitter.type_of(parameter);
+        self.stream.emit(Instruction::LoadArgument(0));
+        self.load_parameter_value(parameter, 0)?;
+        self.box_if_a_value(&ty)?;
+        self.stream.emit(Instruction::StoreField(field));
         Ok(())
     }
 

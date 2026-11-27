@@ -263,6 +263,12 @@ pub struct NamedType {
     /// generic in each property's type, with a constructor taking them in
     /// order.
     pub anonymous: bool,
+    /// `union Pet(Cat, Dog);` (C# 15): a struct whose `Value` and constructors
+    /// the language declares from the types in the list.
+    pub union_declaration: bool,
+    /// `[Union]` on a type read from metadata: a source type says so in its
+    /// own declaration.
+    pub union_attribute: bool,
     /// `[InterpolatedStringHandler]` (C# 10): an interpolated string converts
     /// to the type by making one and appending its pieces to it, rather
     /// than by being a string first.

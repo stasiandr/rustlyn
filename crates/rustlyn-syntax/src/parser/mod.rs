@@ -50,6 +50,9 @@ pub fn parse_with(source: SourceText, options: &ParseOptions) -> SyntaxTree {
     let lexed = tokenize_with(&source, options);
     let definitions = lexed.definitions;
     let mut parser = Parser::new(source.clone(), lexed.tokens, lexed.diagnostics);
+    parser.unions = options
+        .language_version
+        .at_least(crate::LanguageVersion::CSharp15);
     // The trivia and tokens one file shares, the next file on this thread
     // can share too: `;` and a newline are the same everywhere.
     if let Some(cache) = GREEN.with(|green| green.borrow_mut().take()) {
@@ -166,6 +169,8 @@ pub(crate) struct Parser {
     /// Whether the parameter list being parsed is an extension block's,
     /// where `extension(C)` names a type and not an untyped parameter.
     pub(crate) extension_receiver: bool,
+    /// Whether `union Name` declares a union type: C# 15 and later.
+    pub(crate) unions: bool,
     /// Whether the `?` at a token starts a conditional, for each `?` asked
     /// about, with what else decides it: whether a query encloses it and how
     /// tightly the pattern around it binds. Asking reads the whole branch
@@ -235,6 +240,7 @@ impl Parser {
             query_depth: 0,
             pattern_precedence: Precedence::Conditional,
             extension_receiver: false,
+            unions: false,
             conditionals: HashMap::new(),
             type_arguments: HashMap::new(),
             closing_parens: None,

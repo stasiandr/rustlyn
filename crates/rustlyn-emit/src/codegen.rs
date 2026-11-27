@@ -2550,7 +2550,7 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
     /// A plain branch may not cross out of a `try`; `leave` is the instruction
     /// that may, and it empties the evaluation stack on the way.
     /// Boxes what is on the stack where it is not already a reference.
-    fn box_if_a_value(&mut self, ty: &Type) -> Result<(), EmitError> {
+    pub(crate) fn box_if_a_value(&mut self, ty: &Type) -> Result<(), EmitError> {
         let symbols = self.emitter.compilation.symbols();
         // A type parameter is boxed whatever it turns out to be: the
         // verifier has no `isinst` or `brtrue` on a `T`, and the box is
@@ -6660,8 +6660,19 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         } else {
             None
         };
+        // A provider's `Create` called on a union (C# 15) is the same call
+        // made on a type that is not a parameter: `constrained. Union` and
+        // then the interface's member.
+        let constrained_type = if constrained_static.is_none() && receiver.is_some_and(is_type_name)
+        {
+            receiver.and_then(|value| self.static_virtual_on(method, &value.ty))
+        } else {
+            None
+        };
         let through = receiver.map(|value| &value.ty).or(standing_in.as_ref());
-        let token = if let Some((_, construction)) = &constrained_static {
+        let token = if let Some((_, construction)) = &constrained_type {
+            self.constraint_member(method, construction)?
+        } else if let Some((_, construction)) = &constrained_static {
             self.constraint_member(method, construction)?
         } else if display_receiver.is_some() {
             match self.display_function_token(method) {
@@ -6673,6 +6684,10 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
         };
         if let Some((parameter, _)) = &constrained_static {
             let constraint = self.emitter.type_token(&Type::TypeParameter(*parameter))?;
+            self.stream.emit(Instruction::Constrained(constraint));
+        }
+        if let Some((ty, _)) = &constrained_type {
+            let constraint = self.emitter.type_token(ty)?;
             self.stream.emit(Instruction::Constrained(constraint));
         }
         // A generic method is called through the instantiation the binder
@@ -11895,6 +11910,42 @@ impl<'a, 'b> BodyEmitter<'a, 'b> {
                 for base in self.emitter.binder.base_types_of(declared) {
                     pending.push(base.substitute(&substitution));
                 }
+            }
+        }
+        None
+    }
+
+    /// The type a static abstract or virtual interface member is called on
+    /// and the construction of the interface it belongs to, where the type
+    /// is a concrete one that implements the interface.
+    fn static_virtual_on(&self, method: SymbolId, ty: &Type) -> Option<(Type, Type)> {
+        let symbols = self.emitter.compilation.symbols();
+        let symbol = symbols.get(method);
+        let container = symbol.container?;
+        if !symbol.modifiers.contains(Modifiers::STATIC)
+            || symbols.get(container).type_kind() != Some(TypeKind::Interface)
+            || !(symbol.modifiers.contains(Modifiers::ABSTRACT)
+                || symbol.modifiers.contains(Modifiers::VIRTUAL))
+            || matches!(ty, Type::TypeParameter(_))
+            || ty.symbol() == Some(container)
+        {
+            return None;
+        }
+        let mut pending: Vec<Type> = vec![ty.clone()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            if current.symbol() == Some(container) {
+                return Some((ty.clone(), current));
+            }
+            let Some(declared) = current.symbol() else {
+                continue;
+            };
+            let substitution = self.emitter.binder.type_substitution(&current);
+            for base in self.emitter.binder.base_types_of(declared) {
+                pending.push(base.substitute(&substitution));
             }
         }
         None

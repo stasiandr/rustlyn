@@ -38,7 +38,7 @@ use crate::trees::Trees;
 use crate::types::{TupleElement, Type};
 
 /// Changes whenever the layout below does.
-const FORMAT: u32 = 24;
+const FORMAT: u32 = 26;
 const MAGIC: &[u8; 8] = b"RLNCOMP\0";
 
 impl Compilation {
@@ -312,6 +312,8 @@ fn write_symbol(out: &mut Writer, symbol: &Symbol) {
             out.bool(detail.ref_like);
             out.option_id(detail.primary_constructor);
             out.bool(detail.anonymous);
+            out.bool(detail.union_declaration);
+            out.bool(detail.union_attribute);
             out.bool(detail.interpolated_string_handler);
         }
         Detail::Method(detail) => {
@@ -436,6 +438,8 @@ fn read_symbol(input: &mut Reader<'_>) -> Option<Symbol> {
             ref_like: input.bool()?,
             primary_constructor: input.option_id()?,
             anonymous: input.bool()?,
+            union_declaration: input.bool()?,
+            union_attribute: input.bool()?,
             interpolated_string_handler: input.bool()?,
         }),
         2 => Detail::Method(Method {

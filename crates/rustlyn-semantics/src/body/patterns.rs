@@ -17,6 +17,15 @@ use crate::symbol::{Modifiers, SymbolId, SymbolKind, TypeKind};
 use crate::types::Type;
 use crate::unions::UnionMembers;
 
+/// What a property pattern's entry turned out to read.
+enum ChainEntry {
+    /// A member of the type, and the pattern its value is matched against.
+    Member(SymbolId, BoundPattern),
+    /// A pattern on the matched value itself: what `Value: P` on a union
+    /// asks of what the union holds.
+    OnSelf(BoundPattern),
+}
+
 impl BodyBinder<'_> {
     /// Binds a pattern against the type of the value it will be matched with.
     ///
@@ -74,13 +83,22 @@ impl BodyBinder<'_> {
         }
     }
 
+    /// What a union offers to patterns, where it is one they can look into:
+    /// one with no `Value` is an error where it is declared, and a pattern
+    /// against it is as against any type.
+    fn matchable_union(&self, union: &Type) -> Option<UnionMembers> {
+        self.binder
+            .union_members(union)
+            .filter(|members| members.value.is_some())
+    }
+
     pub(super) fn bind_pattern(&mut self, node: &SyntaxNode, input: &Type) -> BoundPattern {
         // A union — or a `U?` of one — is matched by what it holds (C# 15).
         let (union, nullable) = match self.binder.nullable_underlying(input) {
             Some(inner) => (inner, true),
             None => (input.clone(), false),
         };
-        if let Some(members) = self.binder.union_members(&union) {
+        if let Some(members) = self.matchable_union(&union) {
             return self.bind_union_pattern(node, input, &union, nullable, &members);
         }
         self.bind_pattern_plain(node, input)
@@ -125,11 +143,8 @@ impl BodyBinder<'_> {
                 and_chain(node, &mut chain);
                 self.bind_and_chain(&chain, input, span)
             }
-            SyntaxKind::ConstantPattern
-                if node
-                    .children()
-                    .next()
-                    .is_some_and(|value| value.kind() == SyntaxKind::NullLiteralExpression) =>
+            SyntaxKind::ConstantPattern | SyntaxKind::TypePattern
+                if self.is_null_constant(node) =>
             {
                 self.union_null_pattern(span, union, nullable, members)
                     .unwrap_or_else(|| self.bind_pattern_plain(node, input))
@@ -137,6 +152,28 @@ impl BodyBinder<'_> {
             _ if self.unwraps(node) => self.union_contents(node, union, nullable, members),
             _ => self.bind_pattern_plain(node, input),
         }
+    }
+
+    /// Whether a constant pattern is `null` or a constant that is: `const S1
+    /// none = null;`.
+    fn is_null_constant(&mut self, node: &SyntaxNode) -> bool {
+        // A bare name is a type pattern to the parser, and a constant where
+        // it names none.
+        let Some(value) = node.children().find(|child| {
+            child.kind().is_expression()
+                || (node.kind() == SyntaxKind::TypePattern
+                    && child.kind().is_type_node()
+                    && !self.names_a_type(child))
+        }) else {
+            return false;
+        };
+        if value.kind() == SyntaxKind::NullLiteralExpression {
+            return true;
+        }
+        let floor = self.body.diagnostics.len();
+        let bound = self.bind_expression(&value);
+        self.body.diagnostics.truncate(floor);
+        matches!(self.binder.folded(&bound), Some(ConstantValue::Null))
     }
 
     /// `a and b and c`, each part matched against what the ones before it
@@ -159,7 +196,7 @@ impl BodyBinder<'_> {
             Some(inner) => (inner, true),
             None => (input.clone(), false),
         };
-        if let Some(members) = self.binder.union_members(&union) {
+        if let Some(members) = self.matchable_union(&union) {
             if self.unwraps(first) {
                 let tested = self.tested_type(first);
                 return self.union_wrap(tested, &union, nullable, &members, span, |this, ty| {
@@ -188,10 +225,10 @@ impl BodyBinder<'_> {
             Some(inner) => (inner, true),
             None => (input.clone(), false),
         };
-        let Some(members) = self.binder.union_members(&union) else {
+        let Some(members) = self.matchable_union(&union) else {
             return Err(Box::new(value));
         };
-        if matches!(value.constant(), Some(ConstantValue::Null)) {
+        if matches!(self.binder.folded(&value), Some(ConstantValue::Null)) {
             return self
                 .union_null_pattern(span, &union, nullable, &members)
                 .ok_or_else(|| Box::new(value));
@@ -287,7 +324,7 @@ impl BodyBinder<'_> {
             Some(inner) => (inner, true),
             None => (input.clone(), false),
         };
-        let members = self.binder.union_members(&union)?;
+        let members = self.matchable_union(&union)?;
         Some(self.union_wrap(
             Some(target.clone()),
             &union,
@@ -316,6 +353,9 @@ impl BodyBinder<'_> {
             let rank = |target: &Type| -> Option<u8> {
                 if *target == tested {
                     Some(0)
+                } else if self.binder.nullable_underlying(target).as_ref() == Some(&tested) {
+                    // `int` into `int?` keeps the value as it is.
+                    Some(1)
                 } else if !self.binder.converts_implicitly(&tested, target)
                     || !target.is_reference_type(symbols)
                 {
@@ -924,7 +964,7 @@ impl BodyBinder<'_> {
         matched: &Type,
         inner: &SyntaxNode,
         part: &SyntaxNode,
-    ) -> Option<(SymbolId, BoundPattern)> {
+    ) -> Option<ChainEntry> {
         // `{ S1.Value: 1 }` on an `S1?` reads `S1`'s `Value`, as `{ S1: {
         // Value: 1 } }` does: a property pattern on a `T?` is one on its `T`,
         // not on the `Nullable<T>` with a `Value` of its own.
@@ -972,26 +1012,51 @@ impl BodyBinder<'_> {
         if let Some(span) = spans.get(spans.len().saturating_sub(names.len())) {
             self.body.symbols.insert(*span, member);
         }
+        // `{ Value: P }` on a union is `P` matched against what the union
+        // holds, however it is read: `Value: string` asks `TryGetValue`
+        // where there is one, and `Value: null` asks `HasValue` (C# 15).
+        if names.len() == 1
+            && let Some(members) = self.matchable_union(&matched)
+            && members.value == Some(member)
+        {
+            let pattern = self.bind_union_pattern(inner, &matched, &matched, false, &members);
+            return Some(ChainEntry::OnSelf(pattern));
+        }
         let member_type = self.member_type(member, &matched);
         let pattern = match names.len() {
             1 => self.bind_pattern(inner, &member_type),
             _ => {
                 let rest = self.bind_property_chain(&names[1..], &member_type, inner, part);
-                BoundPattern::new(
+                // A `T?` is tested for a value and read as its `T`, as
+                // `{ S1: { Value: 1 } }` would be.
+                let held = self.binder.nullable_underlying(&member_type);
+                let mut properties = Vec::new();
+                let mut on_self = None;
+                match rest {
+                    Some(ChainEntry::Member(member, pattern)) => properties.push((member, pattern)),
+                    Some(ChainEntry::OnSelf(pattern)) => on_self = Some(pattern),
+                    None => {}
+                }
+                let reached = BoundPattern::new(
                     BoundPatternKind::Recursive(Box::new(BoundRecursivePattern {
-                        // A `T?` is tested for a value and read as its `T`,
-                        // as `{ S1: { Value: 1 } }` would be.
-                        ty: self.binder.nullable_underlying(&member_type),
-                        properties: rest.into_iter().collect(),
+                        ty: held.or_else(|| on_self.is_some().then(|| member_type.clone())),
+                        properties,
                         deconstruct: None,
                         positional: Vec::new(),
                         local: None,
                     })),
                     part.span(),
-                )
+                );
+                match on_self {
+                    Some(pattern) => BoundPattern::new(
+                        BoundPatternKind::And(Box::new(reached), Box::new(pattern)),
+                        part.span(),
+                    ),
+                    None => reached,
+                }
             }
         };
-        Some((member, pattern))
+        Some(ChainEntry::Member(member, pattern))
     }
 
     /// `Shape { Width: > 2 }` and `p is (1, var b)`.
@@ -1030,6 +1095,8 @@ impl BodyBinder<'_> {
         let matched = ty.clone().unwrap_or_else(|| input.clone());
 
         let mut properties = Vec::new();
+        // What a union is matched for beyond its members: `{ Value: P }`.
+        let mut on_self: Vec<BoundPattern> = Vec::new();
         if let Some(clause) = node.child_of_kind(SyntaxKind::PropertyPatternClause) {
             for part in clause.children() {
                 let names = property_pattern_names(&part);
@@ -1040,8 +1107,10 @@ impl BodyBinder<'_> {
                 if names.is_empty() {
                     continue;
                 }
-                if let Some(entry) = self.bind_property_chain(&names, &matched, &inner, &part) {
-                    properties.push(entry);
+                match self.bind_property_chain(&names, &matched, &inner, &part) {
+                    Some(ChainEntry::Member(member, pattern)) => properties.push((member, pattern)),
+                    Some(ChainEntry::OnSelf(pattern)) => on_self.push(pattern),
+                    None => {}
                 }
             }
         }
@@ -1104,7 +1173,7 @@ impl BodyBinder<'_> {
         }
 
         let local = self.declare_designation(node, &matched);
-        BoundPattern::new(
+        let recursive = BoundPattern::new(
             BoundPatternKind::Recursive(Box::new(BoundRecursivePattern {
                 ty,
                 properties,
@@ -1113,7 +1182,13 @@ impl BodyBinder<'_> {
                 local,
             })),
             span,
-        )
+        );
+        on_self.into_iter().fold(recursive, |whole, pattern| {
+            BoundPattern::new(
+                BoundPatternKind::And(Box::new(whole), Box::new(pattern)),
+                span,
+            )
+        })
     }
 
     /// `System.Runtime.CompilerServices.ITuple`, where a positional pattern on
@@ -1762,10 +1837,19 @@ fn and_chain(node: &SyntaxNode, into: &mut Vec<SyntaxNode>) {
         .filter(|child| child.kind().is_pattern_node())
         .collect();
     for part in parts {
-        if part.kind() == SyntaxKind::AndPattern {
-            and_chain(&part, into);
-        } else {
-            into.push(part);
+        // `(a and b) and c` is `a and b and c`: what narrows the value
+        // narrows it for what follows, whichever way the parentheses go.
+        let grouped = match part.kind() {
+            SyntaxKind::AndPattern => Some(part.clone()),
+            SyntaxKind::ParenthesizedPattern => part
+                .children()
+                .find(|child| child.kind().is_pattern_node())
+                .filter(|inner| inner.kind() == SyntaxKind::AndPattern),
+            _ => None,
+        };
+        match grouped {
+            Some(inner) => and_chain(&inner, into),
+            None => into.push(part),
         }
     }
 }

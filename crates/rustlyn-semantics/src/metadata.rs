@@ -856,6 +856,12 @@ impl<'a> Loader<'a> {
                     row,
                     "System.Runtime.CompilerServices.InterpolatedStringHandlerAttribute",
                 ),
+                union_attribute: self.has_attribute(
+                    index,
+                    table::TYPE_DEF,
+                    row,
+                    "System.Runtime.CompilerServices.UnionAttribute",
+                ),
                 ..NamedType::default()
             }),
         );

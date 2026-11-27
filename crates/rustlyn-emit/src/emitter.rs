@@ -2870,7 +2870,53 @@ impl Emitter<'_> {
                 "System.Runtime.CompilerServices.RequiredMemberAttribute",
             );
         }
+        // A union declaration says so with `[Union]`, which is how a
+        // consumer of the assembly finds it a union.
+        if self
+            .compilation
+            .symbols()
+            .get(ty)
+            .as_named_type()
+            .is_some_and(|detail| detail.union_declaration)
+        {
+            self.mark_union(parent);
+        }
         self.write_custom_attributes(parent, ty, AttributeTarget::Type)
+    }
+
+    /// `[Union]` on a union declaration, where the compilation has the
+    /// attribute to write.
+    fn mark_union(&mut self, parent: u32) {
+        let symbols = self.compilation.symbols();
+        let Some(attribute) = self
+            .compilation
+            .type_by_metadata_name("System.Runtime.CompilerServices.UnionAttribute")
+        else {
+            return;
+        };
+        let constructor = symbols
+            .lookup(attribute, ".ctor")
+            .iter()
+            .copied()
+            .find(|ctor| {
+                symbols
+                    .get(*ctor)
+                    .as_method()
+                    .is_some_and(|detail| detail.parameters.is_empty())
+            });
+        let Some(token) = constructor.and_then(|ctor| self.attribute_constructor(ctor)) else {
+            return;
+        };
+        let tag = if token.0 >> 24 == u32::from(table::METHOD_DEF) {
+            2
+        } else {
+            3
+        };
+        self.metadata.add_custom_attribute(
+            parent,
+            ((token.0 & 0x00FF_FFFF) << 3) | tag,
+            &[0x01, 0x00, 0x00, 0x00],
+        );
     }
 
     /// `[CompilerGenerated]` on a type the language made: a closure's
@@ -3078,7 +3124,15 @@ impl Emitter<'_> {
                     | MethodSource::EventAccessor { .. }
                     | MethodSource::RecordMember(_)
                     | MethodSource::RecordBaseEquals
-            );
+            )
+            // A union's constructors are written by the language too.
+            || (matches!(method.source, MethodSource::RecordConstructor(_))
+                && self
+                    .compilation
+                    .symbols()
+                    .get(ty)
+                    .as_named_type()
+                    .is_some_and(|detail| detail.union_declaration));
         if made {
             self.mark_with(
                 parent,
@@ -8229,7 +8283,7 @@ impl Emitter<'_> {
             ) || symbols
                 .get(container)
                 .as_named_type()
-                .is_some_and(|detail| detail.anonymous)
+                .is_some_and(|detail| detail.anonymous || detail.union_declaration)
         }) && self
             .compilation
             .declaration_node(constructor)

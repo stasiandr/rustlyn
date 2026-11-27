@@ -893,7 +893,13 @@ impl BodyBinder<'_> {
                 }
             } else {
                 BoundExpressionKind::Call {
-                    receiver: None,
+                    // A provider's `Create` is reached through the union
+                    // that implements it.
+                    receiver: Some(Box::new(BoundExpression::new(
+                        BoundExpressionKind::TypeExpression(union.symbol()?),
+                        union.clone(),
+                        span,
+                    ))),
                     method,
                     type_arguments: Vec::new(),
                     arguments,

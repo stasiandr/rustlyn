@@ -248,6 +248,7 @@ define_kinds! {
         FileKeyword = "file",
         AllowsKeyword = "allows",
         ExtensionKeyword = "extension",
+        UnionKeyword = "union",
         VarKeyword = "var",
         UnderscoreToken = "_",
     }
@@ -536,6 +537,7 @@ define_kinds! {
         DelegateDeclaration,
         RecordDeclaration,
         RecordStructDeclaration,
+        UnionDeclaration,
         EnumMemberDeclaration,
         FieldDeclaration,
         EventFieldDeclaration,

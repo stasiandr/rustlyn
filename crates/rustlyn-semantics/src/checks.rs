@@ -446,6 +446,7 @@ impl Checker<'_> {
                     | SyntaxKind::InterfaceDeclaration
                     | SyntaxKind::RecordDeclaration
                     | SyntaxKind::RecordStructDeclaration
+                    | SyntaxKind::UnionDeclaration
                     | SyntaxKind::EnumDeclaration
                     | SyntaxKind::DelegateDeclaration
                     | SyntaxKind::MethodDeclaration
@@ -2135,7 +2136,8 @@ fn attribute_locations(declaration: &SyntaxNode) -> Option<Vec<&'static str>> {
         | SyntaxKind::StructDeclaration
         | SyntaxKind::InterfaceDeclaration
         | SyntaxKind::RecordDeclaration
-        | SyntaxKind::RecordStructDeclaration => {
+        | SyntaxKind::RecordStructDeclaration
+        | SyntaxKind::UnionDeclaration => {
             // A primary constructor is a method the type's attributes may
             // be aimed at.
             if has_parameters() {
@@ -2448,7 +2450,9 @@ fn modifier_rule(declaration: &SyntaxNode) -> Option<ModifierRule> {
     let in_extension = container_kind == SyntaxKind::ExtensionBlockDeclaration;
     let in_struct = matches!(
         container_kind,
-        SyntaxKind::StructDeclaration | SyntaxKind::RecordStructDeclaration
+        SyntaxKind::StructDeclaration
+            | SyntaxKind::RecordStructDeclaration
+            | SyntaxKind::UnionDeclaration
     );
     let in_type = in_extension
         || matches!(
@@ -2458,6 +2462,7 @@ fn modifier_rule(declaration: &SyntaxNode) -> Option<ModifierRule> {
                 | SyntaxKind::InterfaceDeclaration
                 | SyntaxKind::RecordDeclaration
                 | SyntaxKind::RecordStructDeclaration
+                | SyntaxKind::UnionDeclaration
         );
     let explicit = declaration
         .children()
@@ -2592,6 +2597,7 @@ fn modifier_rule(declaration: &SyntaxNode) -> Option<ModifierRule> {
                     | SyntaxKind::InterfaceDeclaration
                     | SyntaxKind::RecordDeclaration
                     | SyntaxKind::RecordStructDeclaration
+                    | SyntaxKind::UnionDeclaration
                     | SyntaxKind::ExtensionBlockDeclaration
             ) {
                 return None;
@@ -2605,7 +2611,9 @@ fn modifier_rule(declaration: &SyntaxNode) -> Option<ModifierRule> {
             }
             if matches!(
                 owner,
-                SyntaxKind::StructDeclaration | SyntaxKind::RecordStructDeclaration
+                SyntaxKind::StructDeclaration
+                    | SyntaxKind::RecordStructDeclaration
+                    | SyntaxKind::UnionDeclaration
             ) {
                 allowed |= READONLY;
             }
@@ -2639,6 +2647,7 @@ fn modifier_rule(declaration: &SyntaxNode) -> Option<ModifierRule> {
         | SyntaxKind::InterfaceDeclaration
         | SyntaxKind::RecordDeclaration
         | SyntaxKind::RecordStructDeclaration
+        | SyntaxKind::UnionDeclaration
         | SyntaxKind::EnumDeclaration
         | SyntaxKind::DelegateDeclaration => {
             if in_extension {
@@ -2674,7 +2683,9 @@ fn modifier_rule(declaration: &SyntaxNode) -> Option<ModifierRule> {
                     }
                 }
                 SyntaxKind::StructDeclaration => PARTIAL | READONLY | UNSAFE | REF,
-                SyntaxKind::RecordStructDeclaration => PARTIAL | READONLY | UNSAFE,
+                SyntaxKind::RecordStructDeclaration | SyntaxKind::UnionDeclaration => {
+                    PARTIAL | READONLY | UNSAFE
+                }
                 SyntaxKind::InterfaceDeclaration => PARTIAL | UNSAFE,
                 SyntaxKind::DelegateDeclaration => UNSAFE,
                 _ => 0,
@@ -2691,6 +2702,7 @@ fn modifier_rule(declaration: &SyntaxNode) -> Option<ModifierRule> {
             | SyntaxKind::InterfaceDeclaration
             | SyntaxKind::RecordDeclaration
             | SyntaxKind::RecordStructDeclaration
+            | SyntaxKind::UnionDeclaration
             | SyntaxKind::EnumDeclaration
             | SyntaxKind::DelegateDeclaration
     );

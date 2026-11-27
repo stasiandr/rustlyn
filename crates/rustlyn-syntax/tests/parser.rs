@@ -5,7 +5,9 @@
 //! a compact s-expression of node kinds, because a full dump would bury the
 //! point of each test.
 
-use rustlyn_syntax::{SyntaxKind, SyntaxNode, SyntaxTree, parse};
+use rustlyn_syntax::{
+    LanguageVersion, ParseOptions, SyntaxKind, SyntaxNode, SyntaxTree, parse, parse_with,
+};
 use rustlyn_text::SourceText;
 
 fn tree_of(text: &str) -> SyntaxTree {
@@ -732,6 +734,55 @@ fn records_and_namespaces() {
         "(NamespaceDeclaration IdentifierName (RecordDeclaration (ParameterList \
          (Parameter PredefinedType) (Parameter PredefinedType)) (BaseList \
          (PrimaryConstructorBaseType IdentifierName (ArgumentList (Argument IdentifierName))))))"
+    );
+}
+
+#[test]
+fn a_union_declaration_lists_its_case_types() {
+    let tree = tree_of(
+        "public readonly union Pet<T>(Cat, T?, int[]) : IPet where T : class { void M() { } }",
+    );
+    assert!(!tree.has_errors(), "{:?}", tree.diagnostics());
+    let union = tree
+        .root()
+        .child_of_kind(SyntaxKind::UnionDeclaration)
+        .expect("a union declaration");
+    assert_eq!(
+        shape_of(&union),
+        "(UnionDeclaration (TypeParameterList TypeParameter) (ParameterList (Parameter \
+         IdentifierName) (Parameter (NullableType IdentifierName)) (Parameter (ArrayType \
+         PredefinedType (ArrayRankSpecifier OmittedArraySizeExpression)))) (BaseList \
+         (SimpleBaseType IdentifierName)) (TypeParameterConstraintClause ClassConstraint) \
+         (MethodDeclaration PredefinedType ParameterList Block))"
+    );
+    let bodiless = tree_of("union Pet(Cat, Dog);");
+    assert!(!bodiless.has_errors(), "{:?}", bodiless.diagnostics());
+    assert_eq!(
+        shape_of(&bodiless.root()),
+        "(CompilationUnit (UnionDeclaration (ParameterList (Parameter IdentifierName) \
+         (Parameter IdentifierName))))"
+    );
+}
+
+#[test]
+fn union_is_a_name_where_it_declares_nothing() {
+    // Before C# 15 the word is an ordinary name, and so it is after it
+    // wherever no name follows.
+    let earlier = ParseOptions::default().with_language_version(LanguageVersion::CSharp14);
+    let tree = parse_with(SourceText::new("Test.cs", "class C { union U; }"), &earlier);
+    assert!(!tree.has_errors(), "{:?}", tree.diagnostics());
+    assert!(
+        tree.root()
+            .descendants()
+            .all(|node| node.kind() != SyntaxKind::UnionDeclaration)
+    );
+    let source = "class union { int union = 1; void union(int union) { union++; union.M(); } }";
+    let tree = tree_of(source);
+    assert!(!tree.has_errors(), "{:?}", tree.diagnostics());
+    assert!(
+        tree.root()
+            .descendants()
+            .all(|node| node.kind() != SyntaxKind::UnionDeclaration)
     );
 }
 

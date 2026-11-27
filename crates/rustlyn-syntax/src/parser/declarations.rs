@@ -201,6 +201,7 @@ impl Parser {
                             | SyntaxKind::ClassKeyword
                             | SyntaxKind::StructKeyword
                     ))
+                || p.at_union_declaration()
                 || (p.at(SyntaxKind::IdentifierToken)
                     && p.contextual_kind() == SyntaxKind::ExtensionKeyword
                     && matches!(
@@ -338,6 +339,9 @@ impl Parser {
                     ) =>
             {
                 self.parse_record_declaration(attributes, modifiers)
+            }
+            SyntaxKind::IdentifierToken if self.at_union_declaration() => {
+                self.parse_union_declaration(attributes, modifiers)
             }
             SyntaxKind::IdentifierToken
                 if self.nth_kind(1) == SyntaxKind::OpenParenToken
@@ -506,6 +510,63 @@ impl Parser {
         }
         self.parse_type_body(&mut children);
         node(kind, children)
+    }
+
+    /// Whether `union Name` starts here: a union declaration (C# 15). Before
+    /// C# 15 `union` is an ordinary name, as it is wherever no name follows
+    /// it.
+    fn at_union_declaration(&self) -> bool {
+        self.unions
+            && self.at(SyntaxKind::IdentifierToken)
+            && self.contextual_kind() == SyntaxKind::UnionKeyword
+            && self.nth_kind(1) == SyntaxKind::IdentifierToken
+    }
+
+    /// `union Pet(Cat, Dog);`: a struct that holds one value of the types in
+    /// its list, with what a body adds. The list names types and nothing
+    /// else, so each entry is a parameter with no name.
+    fn parse_union_declaration(
+        &mut self,
+        attributes: Vec<GreenElement>,
+        modifiers: Vec<GreenElement>,
+    ) -> GreenElement {
+        let mut children = attributes;
+        children.extend(modifiers);
+        children.push(self.eat_token_as(SyntaxKind::UnionKeyword));
+        children.push(self.expect_identifier());
+        if self.at(SyntaxKind::LessThanToken) {
+            children.push(self.parse_type_parameter_list());
+        }
+        if self.at(SyntaxKind::OpenParenToken) {
+            children.push(self.parse_union_case_list());
+        }
+        if self.at(SyntaxKind::ColonToken) {
+            children.push(self.parse_base_list());
+        }
+        while self.at_contextual(SyntaxKind::WhereKeyword) {
+            children.push(self.parse_type_parameter_constraint_clause());
+        }
+        self.parse_type_body(&mut children);
+        node(SyntaxKind::UnionDeclaration, children)
+    }
+
+    /// The `(Cat, Dog)` of a union declaration.
+    fn parse_union_case_list(&mut self) -> GreenElement {
+        let mut children = vec![self.expect(SyntaxKind::OpenParenToken)];
+        while !self.at(SyntaxKind::CloseParenToken) && !self.at_end() {
+            let mut parameter = self.parse_attribute_lists();
+            parameter.push(self.parse_type());
+            if self.at(SyntaxKind::IdentifierToken) {
+                parameter.push(self.eat_token());
+            }
+            children.push(node(SyntaxKind::Parameter, parameter));
+            match self.eat_if(SyntaxKind::CommaToken) {
+                Some(comma) => children.push(comma),
+                None => break,
+            }
+        }
+        children.push(self.expect(SyntaxKind::CloseParenToken));
+        node(SyntaxKind::ParameterList, children)
     }
 
     fn parse_extension_block(

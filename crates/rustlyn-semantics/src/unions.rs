@@ -60,6 +60,13 @@ impl Binder<'_> {
         ) {
             return false;
         }
+        if symbols
+            .get(*symbol)
+            .as_named_type()
+            .is_some_and(|detail| detail.union_attribute)
+        {
+            return true;
+        }
         self.compilation()
             .declaration_nodes(*symbol)
             .iter()
@@ -71,18 +78,65 @@ impl Binder<'_> {
                     .find_node(*span)
             })
             .any(|node| {
-                node.children()
-                    .filter(|child| child.kind() == rustlyn_syntax::SyntaxKind::AttributeList)
-                    .flat_map(|list| list.children().collect::<Vec<_>>())
-                    .filter(|attribute| attribute.kind() == rustlyn_syntax::SyntaxKind::Attribute)
-                    .any(|attribute| {
-                        attribute.children().next().is_some_and(|name| {
-                            let name = name.text();
-                            let name = name.trim().rsplit('.').next().unwrap_or_default();
-                            name == "Union" || name == "UnionAttribute"
+                node.kind() == rustlyn_syntax::SyntaxKind::UnionDeclaration
+                    || node
+                        .children()
+                        .filter(|child| child.kind() == rustlyn_syntax::SyntaxKind::AttributeList)
+                        .flat_map(|list| list.children().collect::<Vec<_>>())
+                        .filter(|attribute| {
+                            attribute.kind() == rustlyn_syntax::SyntaxKind::Attribute
                         })
-                    })
+                        .any(|attribute| {
+                            attribute.children().next().is_some_and(|name| {
+                                let name = name.text();
+                                let name = name.trim().rsplit('.').next().unwrap_or_default();
+                                name == "Union" || name == "UnionAttribute"
+                            })
+                        })
             })
+    }
+
+    /// The interfaces a type lists and those they list, depth first in the
+    /// order written (Roslyn's `GetInterfacesToEmit`).
+    fn interfaces_to_emit(&self, ty: &Type) -> Vec<Type> {
+        fn visit(binder: &Binder<'_>, ty: &Type, seen: &mut Vec<Type>, found: &mut Vec<Type>) {
+            let Some(symbol) = ty.symbol() else {
+                return;
+            };
+            let substitution = binder.type_substitution(ty);
+            for base in binder.base_types_of(symbol) {
+                let base = base.substitute(&substitution);
+                if base.symbol().is_some() && !seen.contains(&base) {
+                    seen.push(base.clone());
+                    found.push(base.clone());
+                    visit(binder, &base, seen, found);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        visit(self, ty, &mut Vec::new(), &mut found);
+        found
+    }
+
+    /// Lists an interface after the ones it extends, the last written first,
+    /// as Roslyn's `MakeAllInterfaces` does before it reverses the result.
+    fn list_interface(
+        &self,
+        interface: Type,
+        visited: &mut Vec<Type>,
+        listed: &mut Vec<(SymbolId, HashMap<SymbolId, Type>)>,
+    ) {
+        let Some(symbol) = interface.symbol() else {
+            return;
+        };
+        if visited.contains(&interface) {
+            return;
+        }
+        visited.push(interface.clone());
+        for inherited in self.interfaces_to_emit(&interface).into_iter().rev() {
+            self.list_interface(inherited, visited, listed);
+        }
+        listed.push((symbol, self.type_substitution(&interface)));
     }
 
     /// The members that make a union type one, where the type is a union.
@@ -95,7 +149,20 @@ impl Binder<'_> {
         let symbols = self.compilation().symbols();
         let mut sink = Diagnostics::new();
         let declared = |member: SymbolId, sink: &mut Diagnostics| self.type_of(member, sink);
-        let public = |member: SymbolId| symbols.get(member).accessibility == Accessibility::Public;
+        // A property read from metadata has none of its own: its getter is
+        // what can be reached.
+        let public = |member: SymbolId| {
+            let found = symbols.get(member);
+            match found.accessibility {
+                Accessibility::NotApplicable => found
+                    .as_property()
+                    .and_then(|detail| detail.getter)
+                    .is_some_and(|getter| {
+                        symbols.get(getter).accessibility == Accessibility::Public
+                    }),
+                declared => declared == Accessibility::Public,
+            }
+        };
         let special = |ty: &Type, wanted: SpecialType| self.special_of(ty) == Some(wanted);
 
         // Where members are looked for, each with the substitution that puts
@@ -135,35 +202,50 @@ impl Binder<'_> {
             symbol,
             type_arguments: own,
         };
+        // The union has to list its own provider, with its own type
+        // parameters as the arguments: `S1<T> : S1<long>.IUnionMembers`
+        // lists another construction, and so none.
         let provider = provider.filter(|provider| {
             public(*provider) && {
+                let arguments = if symbols
+                    .get(*provider)
+                    .as_named_type()
+                    .is_some_and(|detail| detail.type_parameters.is_empty())
+                {
+                    Vec::new()
+                } else {
+                    match &definition {
+                        Type::Named { type_arguments, .. } => type_arguments.clone(),
+                        _ => Vec::new(),
+                    }
+                };
                 let interface = Type::Named {
                     symbol: *provider,
-                    type_arguments: Vec::new(),
+                    type_arguments: arguments,
                 };
-                self.implements(symbol, &interface)
+                self.lists_exactly(symbol, &interface)
             }
         });
         let mut places: Vec<(SymbolId, HashMap<SymbolId, Type>)> = Vec::new();
         match provider {
             Some(provider) => {
                 places.push((provider, HashMap::new()));
-                let mut pending: Vec<Type> = self.base_types_of(provider);
-                while let Some(base) = pending.pop() {
-                    let Some(base_symbol) = base.symbol() else {
-                        continue;
-                    };
-                    if places.iter().any(|(seen, _)| *seen == base_symbol) {
-                        continue;
-                    }
-                    let substitution = self.type_substitution(&base);
-                    pending.extend(
-                        self.base_types_of(base_symbol)
-                            .into_iter()
-                            .map(|inherited| inherited.substitute(&substitution)),
-                    );
-                    places.push((base_symbol, substitution));
+                // The provider's interfaces in the order Roslyn lists them,
+                // which decides the `TryGetValue` that wins among equals.
+                let mut visited: Vec<Type> = Vec::new();
+                let mut listed: Vec<(SymbolId, HashMap<SymbolId, Type>)> = Vec::new();
+                for base in self
+                    .interfaces_to_emit(&Type::Named {
+                        symbol: provider,
+                        type_arguments: Vec::new(),
+                    })
+                    .into_iter()
+                    .rev()
+                {
+                    self.list_interface(base, &mut visited, &mut listed);
                 }
+                listed.reverse();
+                places.extend(listed);
             }
             None => {
                 let mut current = Some(definition.clone());
@@ -210,6 +292,9 @@ impl Binder<'_> {
                         detail.parameters.is_empty()
                             && detail.has_get
                             && detail.getter.is_none_or(&public)
+                            && detail
+                                .get_accessibility
+                                .is_none_or(|narrowed| narrowed == Accessibility::Public)
                     })
                     && special(&declared(*member, sink).substitute(substitution), wanted)
             };
@@ -362,6 +447,32 @@ impl Binder<'_> {
         members.creations.iter().any(|(_, case)| {
             case == from || (!self.is_union_type(case) && self.converts_implicitly(from, case))
         })
+    }
+
+    /// Whether a type lists a construction of an interface among what it
+    /// implements, directly or through what it inherits.
+    fn lists_exactly(&self, ty: SymbolId, wanted: &Type) -> bool {
+        let mut pending = self.base_types_of(ty);
+        let mut seen: Vec<Type> = Vec::new();
+        while let Some(base) = pending.pop() {
+            if base == *wanted {
+                return true;
+            }
+            let Some(symbol) = base.symbol() else {
+                continue;
+            };
+            if seen.contains(&base) {
+                continue;
+            }
+            let substitution = self.type_substitution(&base);
+            pending.extend(
+                self.base_types_of(symbol)
+                    .into_iter()
+                    .map(|inherited| inherited.substitute(&substitution)),
+            );
+            seen.push(base);
+        }
+        false
     }
 
     /// Whether a type lists an interface among what it implements,
