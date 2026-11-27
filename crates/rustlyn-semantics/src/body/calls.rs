@@ -457,16 +457,56 @@ impl BodyBinder<'_> {
         // gave `C`, where `C` has none of that name itself.
         // A name that is both a value and a type (`Color.M()`) reaches them
         // too.
+        // Extensions are looked for place by place, and the nearer place
+        // with one that applies decides which the name is: the value, where
+        // a method there takes it, or the type, where a block there gave
+        // the type a static method.
         let through_type = names_a_type == Some(true)
             || (names_a_type.is_none()
                 && callee.kind() == SyntaxKind::SimpleMemberAccessExpression
-                && !self.extensions_here(&name).iter().any(|method| {
-                    symbols
-                        .get(*method)
-                        .as_method()
-                        .is_some_and(|detail| detail.type_parameters.is_empty())
-                        && self.extension_takes(*method, &receiver_type)
-                }));
+                && {
+                    let through_value = self
+                        .extensions_here(&name)
+                        .into_iter()
+                        .filter(|method| {
+                            symbols
+                                .get(*method)
+                                .as_method()
+                                .is_some_and(|detail| detail.type_parameters.is_empty())
+                                && self.extension_takes(*method, &receiver_type)
+                        })
+                        .filter_map(|method| self.binder.extension_level(&self.context, method))
+                        .min();
+                    match through_value {
+                        None => true,
+                        Some(value_level) => {
+                            let written = if receiver_type.symbol() == Some(container) {
+                                receiver_type.clone()
+                            } else {
+                                self.binder.self_type(container)
+                            };
+                            self.binder
+                                .extension_members_in_scope(&self.context, &name)
+                                .into_iter()
+                                .filter(|candidate| {
+                                    symbols.get(*candidate).as_method().is_some_and(|detail| {
+                                        detail.extended.is_some_and(|extended| {
+                                            let generics =
+                                                self.block_generics(&detail.type_parameters);
+                                            self.static_extension_fits_with(
+                                                extended, &written, &generics,
+                                            )
+                                        })
+                                    })
+                                })
+                                .filter_map(|candidate| {
+                                    self.binder.extension_level(&self.context, candidate)
+                                })
+                                .min()
+                                .is_some_and(|type_level| type_level < value_level)
+                        }
+                    }
+                });
         if candidates.is_empty() && through_type {
             for candidate in self.binder.extension_members_in_scope(&self.context, &name) {
                 let Some(detail) = symbols.get(candidate).as_method() else {
