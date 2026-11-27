@@ -666,6 +666,10 @@ pub(crate) struct Emitter<'a> {
     /// complete: the interface it names may be planned after the type that
     /// implements it, so the token it needs does not exist yet.
     explicit_impls: Vec<ExplicitImpl>,
+    /// The bodies that override with a narrower return type (C# 9), which
+    /// carry `[PreserveBaseOverrides]`: an override of one of them further
+    /// down then answers the base's slot too.
+    covariant_bodies: std::collections::HashSet<Token>,
     /// Whether a type the plan cannot make is skipped rather than fatal.
     ///
     /// An assembly with a hole in it is not an assembly, so `emit` stops.
@@ -1271,6 +1275,7 @@ impl<'a> Emitter<'a> {
             async_pending: Vec::new(),
             async_bodies: HashMap::new(),
             explicit_impls: Vec::new(),
+            covariant_bodies: std::collections::HashSet::new(),
             display_pending: Vec::new(),
             closure_hosts: HashMap::new(),
             nested_displays: HashMap::new(),
@@ -3021,6 +3026,12 @@ impl Emitter<'_> {
                 | MethodSource::AsyncIteratorDispose(_)
         ) {
             self.mark_with(parent, "System.Diagnostics.DebuggerHiddenAttribute");
+        }
+        if self.covariant_bodies.contains(&token) {
+            self.mark_with(
+                parent,
+                "System.Runtime.CompilerServices.PreserveBaseOverridesAttribute",
+            );
         }
         let written = method.source.written_member();
         if let Some(symbol) = written
@@ -7794,6 +7805,15 @@ impl Emitter<'_> {
                 false,
                 &format!("{accessor_prefix}get_{accessor_base}"),
             );
+            let get_flags = if instance
+                && !interface
+                && explicit.is_none()
+                && self.note_covariant_override(property, token, true)
+            {
+                get_flags | method_attributes::NEW_SLOT
+            } else {
+                get_flags
+            };
             if !instance && !interface && explicit.is_none() {
                 self.note_static_property_implementations(property, token, false);
             }
@@ -8051,9 +8071,21 @@ impl Emitter<'_> {
         if synthesized && symbol.name == "<Clone>$" {
             self.note_clone_override(method, token);
         }
+        // An override that returns a narrower type is another method to the
+        // runtime, which matches by signature: it takes a slot of its own
+        // and names the one it overrides.
+        let covariant = !interface
+            && instance
+            && !has_explicit
+            && !synthesized
+            && self.note_covariant_override(method, token, false);
+        if covariant {
+            flags |= method_attributes::NEW_SLOT;
+        }
         // An override the runtime would put into another method's slot takes
         // a slot of its own and names the one it overrides.
-        if !interface
+        if !covariant
+            && !interface
             && instance
             && !has_explicit
             && !synthesized
@@ -9867,6 +9899,57 @@ impl Emitter<'_> {
                 through,
             },
         });
+    }
+
+    /// Remembers that a method, or a property's getter, overrides one whose
+    /// return type is wider than its own (C# 9), and says whether it does.
+    ///
+    /// `override string M()` over `object M()` is no override to the runtime,
+    /// which matches by name and signature: the `MethodImpl` row is what
+    /// puts the body in the base's slot, and `[PreserveBaseOverrides]` what
+    /// keeps a further override in it.
+    fn note_covariant_override(&mut self, member: SymbolId, body: Token, getter: bool) -> bool {
+        let Some(overridden) = self.overridden_member(member) else {
+            return false;
+        };
+        let symbols = self.compilation.symbols();
+        if symbols.get(overridden).kind != symbols.get(member).kind
+            || same_return(&self.type_of(member), &self.type_of(overridden))
+        {
+            return false;
+        }
+        let (Some(container), Some(owner)) = (
+            symbols.get(member).container,
+            symbols.get(overridden).container,
+        ) else {
+            return false;
+        };
+        let Some(class) = self.types.get(&container).copied() else {
+            return false;
+        };
+        let through = self
+            .binder
+            .constructed_from(&self.binder.self_type(container), owner)
+            .unwrap_or_else(|| Type::named(owner));
+        let declaration = if getter {
+            Declaration::Accessor {
+                property: overridden,
+                interface: through,
+                setter: false,
+            }
+        } else {
+            Declaration::Override {
+                member: overridden,
+                through,
+            }
+        };
+        self.explicit_impls.push(ExplicitImpl {
+            class,
+            body,
+            declaration,
+        });
+        self.covariant_bodies.insert(body);
+        true
     }
 
     /// Remembers that a record's `<Clone>$` overrides its base record's.
@@ -13298,6 +13381,56 @@ fn unify(pattern: &Type, actual: &Type, out: &mut HashMap<SymbolId, Type>) {
         | (Type::Pointer(left), Type::Pointer(right)) => unify(left, right, out),
         (_, Type::ByRef(right)) => unify(pattern, right, out),
         _ => {}
+    }
+}
+
+/// Whether an override returns what the method it overrides does, as far as
+/// the runtime can tell: a type parameter stands for whatever a construction
+/// put there and matches anything, `dynamic` is `object`, and a tuple is its
+/// elements whatever they are called.
+fn same_return(left: &Type, right: &Type) -> bool {
+    match (left, right) {
+        (Type::TypeParameter(_), _) | (_, Type::TypeParameter(_)) => true,
+        (Type::Dynamic, Type::Named { type_arguments, .. })
+        | (Type::Named { type_arguments, .. }, Type::Dynamic) => type_arguments.is_empty(),
+        (
+            Type::Named {
+                symbol: left,
+                type_arguments: left_arguments,
+            },
+            Type::Named {
+                symbol: right,
+                type_arguments: right_arguments,
+            },
+        ) => {
+            left == right
+                && left_arguments.len() == right_arguments.len()
+                && left_arguments
+                    .iter()
+                    .zip(right_arguments)
+                    .all(|(left, right)| same_return(left, right))
+        }
+        (Type::Tuple(left), Type::Tuple(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| same_return(&left.ty, &right.ty))
+        }
+        (
+            Type::Array {
+                element: left,
+                rank: left_rank,
+            },
+            Type::Array {
+                element: right,
+                rank: right_rank,
+            },
+        ) => left_rank == right_rank && same_return(left, right),
+        (Type::ByRef(left), Type::ByRef(right)) | (Type::Pointer(left), Type::Pointer(right)) => {
+            same_return(left, right)
+        }
+        (left, right) => left == right,
     }
 }
 

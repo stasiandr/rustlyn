@@ -97,7 +97,7 @@ impl<'a> BodyBinder<'a> {
         body_binder.body
     }
 
-    fn bind_attribute_node(&mut self, attribute: &SyntaxNode) -> Option<BoundAttribute> {
+    pub(super) fn bind_attribute_node(&mut self, attribute: &SyntaxNode) -> Option<BoundAttribute> {
         let span = attribute.span();
         let name = attribute
             .children()
@@ -201,9 +201,19 @@ impl<'a> BodyBinder<'a> {
     fn attribute_type(&mut self, name: &SyntaxNode) -> Type {
         let symbols = self.binder.compilation().symbols();
         let is_type = |candidate: SymbolId| symbols.get(candidate).kind == SymbolKind::NamedType;
-        let (container, last) = match name.kind() {
-            SyntaxKind::IdentifierName => match identifier_text(name) {
-                Some(text) => (None, text),
+        // `[Embedded<int>]` is the `EmbeddedAttribute<T>` made with `int`.
+        let arguments_of = |node: &SyntaxNode| -> Vec<SyntaxNode> {
+            node.child_of_kind(SyntaxKind::TypeArgumentList)
+                .map(|list| {
+                    list.children()
+                        .filter(|child| child.kind().is_type_node())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let (container, last, arguments) = match name.kind() {
+            SyntaxKind::IdentifierName | SyntaxKind::GenericName => match identifier_text(name) {
+                Some(text) => (None, text, arguments_of(name)),
                 None => return Type::Error,
             },
             SyntaxKind::QualifiedName => {
@@ -213,27 +223,39 @@ impl<'a> BodyBinder<'a> {
                 };
                 let container = self.binder.resolve_namespace_or_type(&left, &self.context);
                 match (container, identifier_text(&right)) {
-                    (Some(container), Some(text)) => (Some(container), text),
+                    (Some(container), Some(text)) => (Some(container), text, arguments_of(&right)),
                     _ => return self.resolve(name),
                 }
             }
             _ => return self.resolve(name),
         };
+        let arity = arguments.len();
         for candidate in [format!("{last}Attribute"), last] {
             let found = match container {
-                Some(container) => symbols
+                Some(container) if arity == 0 => symbols
                     .lookup(container, &candidate)
                     .iter()
                     .copied()
                     .find(|found| is_type(*found)),
+                Some(_) => None,
                 None => self
                     .binder
-                    .lookup(&candidate, 0, &self.context)
+                    .lookup(&candidate, arity, &self.context)
                     .filter(|found| is_type(*found)),
             };
             if let Some(found) = found {
-                return Type::named(found);
+                let type_arguments = arguments
+                    .iter()
+                    .map(|argument| self.resolve(argument))
+                    .collect();
+                return Type::Named {
+                    symbol: found,
+                    type_arguments,
+                };
             }
+        }
+        if arity > 0 {
+            return self.resolve(name);
         }
         Type::Error
     }

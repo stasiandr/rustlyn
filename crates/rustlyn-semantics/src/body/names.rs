@@ -543,6 +543,43 @@ impl BodyBinder<'_> {
         None
     }
 
+    /// [`Self::declaring_enclosing`] for the name of a call: a member that
+    /// cannot be called — a constant, a nested type, a field that holds no
+    /// delegate — does not hide the method of that name in a type further
+    /// out (§12.8.10.2). Where no type has anything callable, it is the
+    /// one that has anything.
+    pub(super) fn declaring_enclosing_callable(&self, name: &str) -> Option<SymbolId> {
+        let callable = |id: SymbolId| {
+            let kind = self.kind_of(id);
+            match kind {
+                SymbolKind::NamedType => false,
+                SymbolKind::Field | SymbolKind::Property | SymbolKind::Event => {
+                    let ty = self.binder.type_of(id, &mut Diagnostics::new());
+                    let ty = ty.value();
+                    ty.is_error()
+                        || matches!(ty, Type::Dynamic | Type::TypeParameter(_))
+                        || self.is_invocable(ty)
+                }
+                _ => true,
+            }
+        };
+        for (depth, ty) in self.context.enclosing_types().into_iter().enumerate() {
+            let found = self.binder.lookup_member(ty, name);
+            if !found.iter().any(|id| callable(*id)) {
+                continue;
+            }
+            if depth == 0
+                || self.in_nameof
+                || found
+                    .iter()
+                    .any(|id| callable(*id) && self.reachable_from_nested(*id))
+            {
+                return Some(ty);
+            }
+        }
+        self.declaring_enclosing(name)
+    }
+
     /// Whether a member of a type around this one can be named from inside it.
     ///
     /// The instance ones cannot: a nested type holds no reference to an
@@ -897,7 +934,11 @@ impl BodyBinder<'_> {
         // parameter, whatever the method holding it declared under that name.
         // A `const` local is its value wherever it is named: nothing is read,
         // so nothing is captured.
-        if let Some((_, local)) = self.lookup_local_at(&name)
+        // A name with type arguments is no variable: `var<int>.field` is a
+        // type, whatever local is called `var`.
+        let generic = node.kind() == SyntaxKind::GenericName;
+        if !generic
+            && let Some((_, local)) = self.lookup_local_at(&name)
             && let Some(constant) = self.constant_locals.get(&local).cloned()
         {
             self.refer_to_local(span, local);
@@ -907,7 +948,8 @@ impl BodyBinder<'_> {
                 span,
             );
         }
-        if !self.hidden_by_own_parameter(&name)
+        if !generic
+            && !self.hidden_by_own_parameter(&name)
             && let Some(local) = self.resolve_local(&name)
         {
             self.refer_to_local(span, local);
@@ -935,6 +977,7 @@ impl BodyBinder<'_> {
         }
 
         if let Some(member) = self.member
+            && !generic
             && !self.in_attribute
             && let Some(parameter) = self.lookup_parameter(member, &name)
         {

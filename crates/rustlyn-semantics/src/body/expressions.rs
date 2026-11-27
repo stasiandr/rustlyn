@@ -742,6 +742,22 @@ impl BodyBinder<'_> {
             // `[a, b]` has no type until something says what collection it
             // is, exactly as a lambda has none until a delegate does.
             SyntaxKind::CollectionExpression => {
+                // An `out var x` of its `with(...)` is in scope in the
+                // elements, which are read before any collection is made:
+                // `[with(out var x), x]`.
+                for declaration in node
+                    .children()
+                    .filter(|child| child.kind() == SyntaxKind::WithElement)
+                    .flat_map(|element| element.descendants().collect::<Vec<_>>())
+                    .filter(|inner| {
+                        inner.kind() == SyntaxKind::DeclarationExpression
+                            && inner
+                                .parent()
+                                .is_some_and(|argument| argument.kind() == SyntaxKind::Argument)
+                    })
+                {
+                    self.bind_out_declaration(&declaration);
+                }
                 self.note_collection_elements(node);
                 at(BoundExpressionKind::UnboundCollection(span), Type::Error)
             }
@@ -862,6 +878,27 @@ impl BodyBinder<'_> {
                             .is_some_and(|argument| argument.kind() == SyntaxKind::Argument)
                 }) {
                     self.bind_out_declaration(&declaration);
+                }
+                // So is a pattern variable: `M(new(a is var x), x)`. Its
+                // value does not depend on what the creation is given to, so
+                // it is bound here and again then, to the same local.
+                for pattern in node.descendants().filter(|inner| {
+                    inner.kind() == SyntaxKind::IsPatternExpression
+                        && !inner
+                            .ancestors()
+                            .take_while(|outer| outer.span() != node.span())
+                            .any(|outer| {
+                                matches!(
+                                    outer.kind(),
+                                    SyntaxKind::ParenthesizedLambdaExpression
+                                        | SyntaxKind::SimpleLambdaExpression
+                                        | SyntaxKind::AnonymousMethodExpression
+                                )
+                            })
+                }) {
+                    let floor = self.body.diagnostics.len();
+                    self.bind_expression(&pattern);
+                    self.body.diagnostics.truncate(floor);
                 }
                 at(BoundExpressionKind::UnboundCreation(span), Type::Error)
             }

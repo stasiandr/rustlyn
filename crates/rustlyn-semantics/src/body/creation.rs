@@ -24,8 +24,9 @@ impl BodyBinder<'_> {
     /// nested collection, a conditional — leaves nothing noted, and the
     /// expression is a candidate for any collection.
     pub(super) fn note_collection_elements(&mut self, node: &SyntaxNode) {
-        if let Some((types, hints)) = self.collection_evidence(node) {
+        if let Some((types, hints, constants)) = self.collection_evidence(node) {
             self.collection_types.insert(node.span(), types);
+            self.collection_constants.insert(node.span(), constants);
             self.collection_hints.insert(node.span(), hints);
         }
     }
@@ -38,12 +39,12 @@ impl BodyBinder<'_> {
     /// The second list is what inference reads, which is more: a nested
     /// collection is inferred from element by element in turn, though it
     /// has no type to check applicability with.
-    fn collection_evidence(
-        &mut self,
-        node: &SyntaxNode,
-    ) -> Option<(Vec<Type>, Vec<InferenceArgument>)> {
+    fn collection_evidence(&mut self, node: &SyntaxNode) -> Option<CollectionEvidence> {
         let mut types = Vec::new();
         let mut hints = Vec::new();
+        // What each element folds to, for the ones that are constants: `[0,
+        // 1]` reaches a `byte[]` though an `int` does not.
+        let mut constants = Vec::new();
         for element in node.children().filter(|child| {
             matches!(
                 child.kind(),
@@ -56,12 +57,13 @@ impl BodyBinder<'_> {
             let evidence = self.element_evidence(&expression)?;
             // A spread gives what walking it gives (§12.8.24).
             if element.kind() == SyntaxKind::SpreadElement {
-                let Evidenced::Typed(spread) = evidence else {
+                let Evidenced::Typed(spread, _) = evidence else {
                     return None;
                 };
                 match self.collection_element(&spread) {
                     Some(element) if !element.is_error() => {
                         types.push(element.clone());
+                        constants.push(None);
                         hints.push(InferenceArgument::Typed(element));
                     }
                     _ => return None,
@@ -69,8 +71,9 @@ impl BodyBinder<'_> {
                 continue;
             }
             match evidence {
-                Evidenced::Typed(ty) => {
+                Evidenced::Typed(ty, constant) => {
                     types.push(ty.clone());
+                    constants.push(constant);
                     hints.push(if matches!(ty, Type::Null) {
                         InferenceArgument::Untyped
                     } else {
@@ -81,7 +84,7 @@ impl BodyBinder<'_> {
                 Evidenced::Nothing => {}
             }
         }
-        Some((types, hints))
+        Some((types, hints, constants))
     }
 
     /// What one element says about the element type, if it can be asked
@@ -90,7 +93,7 @@ impl BodyBinder<'_> {
         match expression.kind() {
             SyntaxKind::DefaultLiteralExpression => return Some(Evidenced::Nothing),
             SyntaxKind::CollectionExpression => {
-                let (_, inner) = self.collection_evidence(expression)?;
+                let (_, inner, _) = self.collection_evidence(expression)?;
                 return Some(Evidenced::Nested(inner));
             }
             SyntaxKind::TupleExpression => {
@@ -117,7 +120,8 @@ impl BodyBinder<'_> {
         if bound.ty.is_error() {
             return None;
         }
-        Some(Evidenced::Typed(bound.ty))
+        let constant = self.binder.folded(&bound);
+        Some(Evidenced::Typed(bound.ty, constant))
     }
 
     /// What `{ X = 1, Y = 2 }` or `{ 1, 2 }` does to the object just made.
@@ -388,7 +392,8 @@ impl BodyBinder<'_> {
                             matches!(
                                 self.kind_of(*candidate),
                                 SymbolKind::Field | SymbolKind::Property
-                            )
+                            ) || (self.kind_of(*candidate) == SymbolKind::Event
+                                && self.event_is_a_field_here(*candidate))
                         })
                 }) else {
                     let container = holder.display(self.binder.compilation().symbols());
@@ -2021,12 +2026,20 @@ fn params_array_element(
     }
 }
 
+/// The types a collection expression's elements give, what inference reads of
+/// them, and what each folds to.
+type CollectionEvidence = (
+    Vec<Type>,
+    Vec<InferenceArgument>,
+    Vec<Option<ConstantValue>>,
+);
+
 /// What an element of a collection expression says about the element type.
 enum Evidenced {
     /// Nothing: `null`, `default`, `[]`.
     Nothing,
-    /// Its own type.
-    Typed(Type),
+    /// Its own type, and what it folds to where it is a constant.
+    Typed(Type, Option<ConstantValue>),
     /// A nested collection, which inference reads element by element and
     /// which has no type of its own.
     Nested(Vec<InferenceArgument>),

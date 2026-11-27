@@ -555,6 +555,11 @@ impl Parser {
         if self.at(SyntaxKind::ColonToken) {
             children.push(self.parse_base_list());
         }
+        // `enum Figure;` has no body, as `record R;` has none.
+        if let Some(semicolon) = self.eat_if(SyntaxKind::SemicolonToken) {
+            children.push(semicolon);
+            return node(SyntaxKind::EnumDeclaration, children);
+        }
         children.push(self.expect(SyntaxKind::OpenBraceToken));
 
         while !self.at(SyntaxKind::CloseBraceToken) && !self.at_end() {
@@ -1074,6 +1079,17 @@ impl Parser {
     /// `async` before a type is a modifier; `async` before `=` is a variable.
     fn contextual_modifier_applies(&self) -> bool {
         let next = self.nth_kind(1);
+        // `partial M;` declares a field `M` of a type called `partial`:
+        // a member that is partial has more to it than a name.
+        if self.contextual_kind() == SyntaxKind::PartialKeyword
+            && next == SyntaxKind::IdentifierToken
+            && matches!(
+                self.nth_kind(2),
+                SyntaxKind::SemicolonToken | SyntaxKind::EqualsToken | SyntaxKind::CommaToken
+            )
+        {
+            return false;
+        }
         is_reserved_modifier(next)
             || is_predefined_type(next)
             || is_contextual_modifier(self.nth_contextual_kind(1))

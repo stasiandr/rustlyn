@@ -603,6 +603,7 @@ impl BodyBinder<'_> {
     /// for the duration; its locals and its owner's live in one list, which
     /// is what lets a name written inside it find a variable written outside.
     pub(super) fn bind_local_function(&mut self, node: &SyntaxNode) {
+        self.bind_attribute_names(node);
         let symbol = self.binder.declared_symbol_at(self.tree, node);
         let outer_member = self.member;
         let outer_context =
@@ -693,6 +694,46 @@ impl BodyBinder<'_> {
                 calls: frame.calls,
             });
         }
+    }
+
+    /// The names in the attributes of a local function or a lambda, and of
+    /// its parameters: `[A(N)]` reads the constant `N` of the method
+    /// around it, which no binder that sees the declaration alone can
+    /// find. Only the names are looked up here; what the attribute makes of
+    /// them is judged with every other attribute.
+    pub(super) fn bind_attribute_names(&mut self, node: &SyntaxNode) {
+        let mut lists: Vec<SyntaxNode> = node
+            .children()
+            .filter(|child| child.kind() == SyntaxKind::AttributeList)
+            .collect();
+        for parameters in node
+            .children()
+            .filter(|child| child.kind() == SyntaxKind::ParameterList)
+        {
+            for parameter in parameters.children() {
+                lists.extend(
+                    parameter
+                        .children()
+                        .filter(|child| child.kind() == SyntaxKind::AttributeList),
+                );
+            }
+        }
+        if lists.is_empty() {
+            return;
+        }
+        let floor = self.body.diagnostics.len();
+        let outer = std::mem::replace(&mut self.in_attribute, true);
+        for attribute in lists.iter().flat_map(|list| list.children()) {
+            if attribute.kind() == SyntaxKind::Attribute {
+                self.bind_attribute_node(&attribute);
+            }
+        }
+        self.in_attribute = outer;
+        let mut found = self.body.diagnostics.split_off(floor);
+        found.retain(|(_, diagnostic)| {
+            diagnostic.code() == rustlyn_diagnostics::ErrorCode::ErrNameNotInContext
+        });
+        self.body.diagnostics.extend(found);
     }
 
     /// The local function of this name in scope, if there is one.
@@ -2337,6 +2378,7 @@ impl BodyBinder<'_> {
     /// mean binding it twice and answering differently each time. So the
     /// syntax is recorded and the conversion does the work.
     pub(super) fn bind_lambda(&mut self, node: &SyntaxNode) -> BoundExpression {
+        self.bind_attribute_names(node);
         BoundExpression::new(
             BoundExpressionKind::UnboundLambda(node.span()),
             Type::Error,

@@ -1067,6 +1067,11 @@ impl BodyBinder<'_> {
         let mut parameters = Vec::new();
         for (index, parameter) in detail.parameters.iter().enumerate().skip(skip) {
             let info = symbols.get(*parameter).as_parameter()?;
+            // The default value of one of these parameters is what asks for
+            // this signature: there is none to give.
+            if self.binder.parameter_default_in_progress(*parameter) {
+                return None;
+            }
             let ty = self
                 .member_type(*parameter, &through)
                 .substitute(&substitution);

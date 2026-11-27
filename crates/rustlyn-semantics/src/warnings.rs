@@ -230,10 +230,10 @@ fn annotation_outside_context(
     let ty = binder.resolve_type(&element, &context, &mut sink);
     let symbols = binder.compilation().symbols();
     let reference = match &ty {
-        crate::types::Type::TypeParameter(parameter) => symbols
-            .get(*parameter)
-            .as_type_parameter()
-            .is_some_and(|detail| !detail.value_type),
+        crate::types::Type::TypeParameter(parameter) => {
+            symbols.get(*parameter).as_type_parameter().is_some()
+                && !binder.is_struct_constrained(*parameter)
+        }
         crate::types::Type::Error => false,
         other => binder.held_by_reference(other) || other.is_reference_type(symbols),
     };

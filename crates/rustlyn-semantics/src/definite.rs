@@ -326,17 +326,42 @@ fn trackable(binder: &Binder<'_>, ty: &Type) -> bool {
                 Some(kind) if kind.is_reference_type() => true,
                 Some(TypeKind::Struct) if !compilation.is_from_metadata(symbol) => {
                     // A struct with no fields is assigned by being declared.
-                    declared.members.iter().any(|member| {
-                        let member = symbols.get(*member);
-                        member.kind == SymbolKind::Field
-                            && !member.modifiers.contains(Modifiers::STATIC)
-                            && !member.modifiers.contains(Modifiers::CONST)
-                    })
+                    !deeply_empty(binder, symbol, 0)
                 }
                 _ => false,
             }
         }
     }
+}
+
+/// Whether a struct written in source has no instance field that holds
+/// anything: none, or only fields of structs that are as empty. Such a
+/// local is assigned by being declared.
+fn deeply_empty(binder: &Binder<'_>, symbol: SymbolId, depth: usize) -> bool {
+    let compilation = binder.compilation();
+    let symbols = compilation.symbols();
+    if depth > 8 {
+        return false;
+    }
+    symbols.get(symbol).members.iter().all(|id| {
+        let member = symbols.get(*id);
+        if member.kind != SymbolKind::Field
+            || member.modifiers.contains(Modifiers::STATIC)
+            || member.modifiers.contains(Modifiers::CONST)
+        {
+            return true;
+        }
+        match binder.type_of(*id, &mut Diagnostics::new()) {
+            Type::Named { symbol, .. } => {
+                symbols.get(symbol).type_kind() == Some(TypeKind::Struct)
+                    && !compilation.is_from_metadata(symbol)
+                    && binder.special_of(&Type::named(symbol)).is_none()
+                    && !compilation.declaration_nodes(symbol).is_empty()
+                    && deeply_empty(binder, symbol, depth + 1)
+            }
+            _ => false,
+        }
+    })
 }
 
 /// The types from the core library whose locals are watched: the language's
@@ -1614,6 +1639,16 @@ impl Walk<'_, '_> {
                 true_false.join(&false_false);
                 (true_true, true_false)
             }
+            // `c?.M(out x) is T` is true only where there was a `c`, and so
+            // where the call ran.
+            BoundExpressionKind::TypeTest { operand, .. } if is_conditional_access(operand) => {
+                let (when_true, when_false, when_null) = self.lifted_condition(operand);
+                let mut value = when_true;
+                value.join(&when_false);
+                let mut everything = value.clone();
+                everything.join(&when_null);
+                (value, everything)
+            }
             BoundExpressionKind::IsPattern { operand, pattern } => {
                 // `(b && M(out x)) is not true` is `!(b && M(out x))`: a
                 // pattern of constants on a `bool` picks out which of its
@@ -1636,7 +1671,7 @@ impl Walk<'_, '_> {
                     mismatched.join(&pick(!on_false, &when_false));
                     return (matched, mismatched);
                 }
-                if !matches!(operand.kind, BoundExpressionKind::ConditionalAccess { .. }) {
+                if !is_conditional_access(operand) {
                     self.expression(operand);
                     // `s is string { Length: int j }` on a constant `s` that
                     // is no null cannot fail.
@@ -1653,7 +1688,28 @@ impl Walk<'_, '_> {
                 value.join(&when_false);
                 let mut everything = value.clone();
                 everything.join(&when_null);
+                let values = self.bool_values(pattern);
                 let (on_match, on_mismatch) = match &pattern.kind {
+                    // `c?.M() is true or false`: which of true, false and
+                    // null the pattern takes says which states it keeps.
+                    _ if values.is_some() => {
+                        let [yes, no, nothing] = values.unwrap_or_default();
+                        let unreachable = State::unreachable(self.count());
+                        let (mut matched, mut mismatched) =
+                            (unreachable.clone(), unreachable.clone());
+                        for (taken, state) in [
+                            (yes, when_true.clone()),
+                            (no, when_false.clone()),
+                            (nothing, when_null.clone()),
+                        ] {
+                            if taken {
+                                matched.join(&state);
+                            } else {
+                                mismatched.join(&state);
+                            }
+                        }
+                        (matched, mismatched)
+                    }
                     BoundPatternKind::Constant(constant) => match self.binder.folded(constant) {
                         Some(ConstantValue::Boolean(true)) => (when_true, everything),
                         Some(ConstantValue::Boolean(false)) => (when_false, everything),
@@ -1698,6 +1754,41 @@ impl Walk<'_, '_> {
         }
     }
 
+    /// Which of `true`, `false` and `null` a pattern takes of a `bool?`, where
+    /// it is made of those and of `bool` itself.
+    fn bool_values(&self, pattern: &BoundPattern) -> Option<[bool; 3]> {
+        match &pattern.kind {
+            BoundPatternKind::Constant(constant) => match self.binder.folded(constant)? {
+                ConstantValue::Boolean(true) => Some([true, false, false]),
+                ConstantValue::Boolean(false) => Some([false, true, false]),
+                ConstantValue::Null => Some([false, false, true]),
+                _ => None,
+            },
+            BoundPatternKind::Type(ty) if self.is_bool(ty) => Some([true, true, false]),
+            BoundPatternKind::Not(inner) => {
+                let [yes, no, nothing] = self.bool_values(inner)?;
+                Some([!yes, !no, !nothing])
+            }
+            BoundPatternKind::Or(left, right) => {
+                let (left, right) = (self.bool_values(left)?, self.bool_values(right)?);
+                Some([
+                    left[0] || right[0],
+                    left[1] || right[1],
+                    left[2] || right[2],
+                ])
+            }
+            BoundPatternKind::And(left, right) => {
+                let (left, right) = (self.bool_values(left)?, self.bool_values(right)?);
+                Some([
+                    left[0] && right[0],
+                    left[1] && right[1],
+                    left[2] && right[2],
+                ])
+            }
+            _ => None,
+        }
+    }
+
     /// The states where a `bool?` is true, false and null (C# 10's
     /// improved definite assignment): in `c?.TryGet(out x) == true` the call
     /// ran wherever the value is true, and `x` is assigned there.
@@ -1708,7 +1799,15 @@ impl Walk<'_, '_> {
                 self.expression(receiver);
                 let skipped = self.state.clone();
                 let (when_true, when_false, mut when_null) = self.lifted_condition(access);
-                when_null.join(&skipped);
+                // A receiver that is a constant, and no null, is never
+                // skipped: `"a"?.M(x = 0)` always runs the call.
+                if !self
+                    .binder
+                    .folded(receiver)
+                    .is_some_and(|value| value != ConstantValue::Null)
+                {
+                    when_null.join(&skipped);
+                }
                 (when_true, when_false, when_null)
             }
             BoundExpressionKind::Binary {
@@ -1728,9 +1827,17 @@ impl Walk<'_, '_> {
                 left,
                 right,
             } => {
+                // `null` where a `T?` is wanted is bound as that type's
+                // `default`, which is no less a null.
+                let null_default = |side: &BoundExpression| match &unwrapped(side).kind {
+                    BoundExpressionKind::Default(ty) => {
+                        self.binder.nullable_underlying(ty).is_some()
+                    }
+                    _ => false,
+                };
                 let constant = |side: &BoundExpression| match self.binder.folded(unwrapped(side)) {
                     Some(value @ (ConstantValue::Boolean(_) | ConstantValue::Null)) => Some(value),
-                    _ if is_null_literal(side) => Some(ConstantValue::Null),
+                    _ if is_null_literal(side) || null_default(side) => Some(ConstantValue::Null),
                     _ => None,
                 };
                 let (other, constant) = match (constant(left), constant(right)) {
@@ -1761,7 +1868,12 @@ impl Walk<'_, '_> {
             }
             BoundExpressionKind::Conversion {
                 operand,
-                conversion: ConversionKind::NullableWrap | ConversionKind::Identity,
+                conversion:
+                    ConversionKind::NullableWrap
+                    | ConversionKind::Identity
+                    | ConversionKind::Boxing
+                    | ConversionKind::ImplicitReference
+                    | ConversionKind::ExplicitReference,
                 ..
             } => self.lifted_condition(operand),
             // `(t = c?.M(x = 0)) != null`, which is how a `??` whose left is
@@ -2186,6 +2298,25 @@ fn unwrapped(expression: &BoundExpression) -> &BoundExpression {
             ..
         } => unwrapped(operand),
         _ => expression,
+    }
+}
+
+/// Whether an expression is a conditional access, perhaps converted to a
+/// type that keeps its null a null (`(object)c?.M()`).
+fn is_conditional_access(expression: &BoundExpression) -> bool {
+    match &expression.kind {
+        BoundExpressionKind::ConditionalAccess { .. } => true,
+        BoundExpressionKind::Conversion {
+            operand,
+            conversion:
+                ConversionKind::NullableWrap
+                | ConversionKind::Identity
+                | ConversionKind::Boxing
+                | ConversionKind::ImplicitReference
+                | ConversionKind::ExplicitReference,
+            ..
+        } => is_conditional_access(operand),
+        _ => false,
     }
 }
 

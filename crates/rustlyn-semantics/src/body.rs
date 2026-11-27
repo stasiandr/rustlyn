@@ -100,6 +100,8 @@ pub struct BodyBinder<'a> {
     /// the expression's span, for overload resolution to ask whether a
     /// candidate's element type is one they reach.
     collection_types: HashMap<TextSpan, Vec<Type>>,
+    /// What the elements noted in `collection_types` fold to.
+    collection_constants: HashMap<TextSpan, Vec<Option<ConstantValue>>>,
     /// The same with what nested collections suggest, which only inference
     /// reads.
     collection_hints: HashMap<TextSpan, Vec<inference::InferenceArgument>>,
@@ -259,6 +261,10 @@ struct Shape {
     from_function: bool,
 }
 
+/// An element of a collection expression as overload resolution sees it: its
+/// type, and what it folds to where it is a constant.
+type NotedElement = (Type, Option<ConstantValue>);
+
 /// What a call says about its arguments beyond their types.
 ///
 /// A constant may reach a parameter its type does not, a lambda has only an
@@ -296,7 +302,7 @@ struct Evidence {
     collections: Vec<bool>,
     /// The natural types of each collection expression's elements, where
     /// they were plain enough to have any.
-    elements: Vec<Option<Vec<Type>>>,
+    elements: Vec<Option<Vec<NotedElement>>>,
     /// The branch types of an argument that is a conditional or a `switch`
     /// whose branches could not agree on a type: it reaches a parameter
     /// every branch reaches, and no other (§12.18).
@@ -498,6 +504,7 @@ impl<'a> BodyBinder<'a> {
             capture_floor: 0,
             branch_types: HashMap::new(),
             collection_types: HashMap::new(),
+            collection_constants: HashMap::new(),
             collection_hints: HashMap::new(),
             in_finally_memo: HashMap::new(),
             typeless_memo: RefCell::new(HashMap::new()),

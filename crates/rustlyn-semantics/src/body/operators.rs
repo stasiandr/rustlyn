@@ -1732,6 +1732,19 @@ impl BodyBinder<'_> {
             return through;
         }
 
+        // `p - null`: the `null` is a pointer of the other's type, and the
+        // difference of two pointers is a `long`.
+        let (left, right) = match (operator, &left.ty, &right.ty) {
+            (BinaryOperator::Subtract, Type::Pointer(_), Type::Null) => {
+                let pointer = left.ty.clone();
+                (left, self.convert(right, &pointer))
+            }
+            (BinaryOperator::Subtract, Type::Null, Type::Pointer(_)) => {
+                let pointer = right.ty.clone();
+                (self.convert(left, &pointer), right)
+            }
+            _ => (left, right),
+        };
         match self.binder.binary_result(operator, &left.ty, &right.ty) {
             Some(ty) => {
                 let ty = widened.take().unwrap_or(ty);

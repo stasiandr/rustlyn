@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use rustlyn_text::TextSpan;
 
 use super::{BodyBinder, Fit};
-use crate::symbol::{SymbolId, TypeKind, Variance};
+use crate::symbol::{RefKind, SymbolId, TypeKind, Variance};
 use crate::types::{TupleElement, Type};
 
 /// An argument, as much of it as inference reads.
@@ -241,10 +241,10 @@ impl Inferrer<'_, '_> {
 
     /// Adds a bound; one that is the same type but for its tuple element
     /// names merges with it, keeping only the names both agree on.
-    fn add(bounds: &mut Bounds, ty: &Type, function: bool) {
+    fn add(bounds: &mut Bounds, ty: &Type, function: bool, object: Option<&Type>) {
         match bounds
             .iter_mut()
-            .find(|(known, f)| known == ty && *f == function)
+            .find(|(known, f)| same_type(known, ty, object) && *f == function)
         {
             Some(known) => known.0 = merge_names(&known.0, ty),
             None => bounds.push((ty.clone(), function)),
@@ -642,7 +642,8 @@ impl Inferrer<'_, '_> {
             return;
         }
         if let Some(index) = self.ordinal(target) {
-            Self::add(&mut self.exact[index], source, function);
+            let object = self.binder.binder.object_type();
+            Self::add(&mut self.exact[index], source, function, object.as_ref());
             return;
         }
         if self.span_inference(source, target, function, true) {
@@ -657,6 +658,9 @@ impl Inferrer<'_, '_> {
                 },
             ) if rank == wanted_rank => self.exact(element, wanted, function),
             (Type::Pointer(source), Type::Pointer(target)) => self.exact(source, target, function),
+            (Type::FunctionPointer(source), Type::FunctionPointer(target)) => {
+                self.function_pointer_inference(source, target, Kind::Exact, function);
+            }
             _ => {
                 if let Some((source, target)) = self.tuple_pair(source, target) {
                     for (source, target) in source.iter().zip(&target) {
@@ -683,6 +687,58 @@ impl Inferrer<'_, '_> {
         }
     }
 
+    /// Inference between two function pointer types. A reference type a
+    /// pointer returns varies with it (covariance) and one it takes against
+    /// it (contravariance), as for delegates, and so does a function pointer
+    /// of one; everything else, and every `ref` of either, has to be the same
+    /// type.
+    fn function_pointer_inference(
+        &mut self,
+        source: &crate::types::FunctionPointer,
+        target: &crate::types::FunctionPointer,
+        kind: Kind,
+        function: bool,
+    ) {
+        if source.parameters.len() != target.parameters.len()
+            || source.convention != target.convention
+            || source.modifiers != target.modifiers
+            || source.returns_ref != target.returns_ref
+            || source
+                .parameters
+                .iter()
+                .zip(&target.parameters)
+                .any(|((source, _), (target, _))| source != target)
+        {
+            return;
+        }
+        let returned = if kind == Kind::Exact
+            || source.returns_ref != RefKind::None
+            || !(self.is_reference(&source.returns)
+                || matches!(source.returns, Type::FunctionPointer(_)))
+        {
+            Kind::Exact
+        } else {
+            kind
+        };
+        self.bound_inference(returned, &source.returns, &target.returns, function);
+        for ((source_ref, source), (target_ref, target)) in
+            source.parameters.iter().zip(&target.parameters)
+        {
+            let taken = if kind == Kind::Exact
+                || *source_ref != RefKind::None
+                || source_ref != target_ref
+                || !(self.is_reference(source) || matches!(source, Type::FunctionPointer(_)))
+            {
+                Kind::Exact
+            } else if kind == Kind::Lower {
+                Kind::Upper
+            } else {
+                Kind::Lower
+            };
+            self.bound_inference(taken, source, target, function);
+        }
+    }
+
     fn lower_bound(&mut self, source: &Type, target: &Type, function: bool) {
         let (source, target) = (&self.normalized(source), &self.normalized(target));
         if let (Some(source), Some(target)) = (
@@ -693,7 +749,8 @@ impl Inferrer<'_, '_> {
             return;
         }
         if let Some(index) = self.ordinal(target) {
-            Self::add(&mut self.lower[index], source, function);
+            let object = self.binder.binder.object_type();
+            Self::add(&mut self.lower[index], source, function, object.as_ref());
             return;
         }
         if self.span_inference(source, target, function, false) {
@@ -715,6 +772,10 @@ impl Inferrer<'_, '_> {
             for (source, target) in source.iter().zip(&target) {
                 self.lower_bound(source, target, function);
             }
+            return;
+        }
+        if let (Type::FunctionPointer(source), Type::FunctionPointer(target)) = (source, target) {
+            self.function_pointer_inference(source, target, Kind::Lower, function);
             return;
         }
         let Type::Named {
@@ -823,7 +884,7 @@ impl Inferrer<'_, '_> {
             return;
         }
         if let Some(index) = self.ordinal(target) {
-            Self::add(&mut self.upper[index], source, function);
+            Self::add(&mut self.upper[index], source, function, None);
             return;
         }
         if let Type::Array { element, rank } = target {
@@ -840,6 +901,10 @@ impl Inferrer<'_, '_> {
             for (source, target) in source.iter().zip(&target) {
                 self.exact(source, target, function);
             }
+            return;
+        }
+        if let (Type::FunctionPointer(source), Type::FunctionPointer(target)) = (source, target) {
+            self.function_pointer_inference(source, target, Kind::Upper, function);
             return;
         }
         let Type::Named {
@@ -1049,9 +1114,21 @@ impl Inferrer<'_, '_> {
         let keep = |(_, function): &&(Type, bool)| !(has_function && has_other && *function);
         let lower: Vec<&(Type, bool)> = lower.iter().filter(keep).collect();
 
+        // `dynamic` and `object` are one candidate unless an upper bound
+        // takes a side: then they are two, and `Func<object, dynamic>`
+        // against `Func<T, T>` has none.
+        let object = self
+            .binder
+            .binder
+            .object_type()
+            .filter(|_| upper.is_empty());
+        let object = object.as_ref();
         let mut candidates: Vec<(Type, bool)> = Vec::new();
         let merge_in = |candidates: &mut Vec<(Type, bool)>, (ty, function): &(Type, bool)| {
-            if let Some(known) = candidates.iter_mut().find(|(known, _)| known == ty) {
+            if let Some(known) = candidates
+                .iter_mut()
+                .find(|(known, _)| same_type(known, ty, object))
+            {
                 known.0 = merge_names(&known.0, ty);
             } else {
                 candidates.push((ty.clone(), *function));
@@ -1078,30 +1155,29 @@ impl Inferrer<'_, '_> {
         let initial = candidates.clone();
         for (bound, _) in &lower {
             for (candidate, _) in &initial {
-                if bound == candidate {
+                if same_type(bound, candidate, object) {
                     continue;
                 }
                 if !self.converts(bound, candidate) {
-                    candidates.retain(|(known, _)| known != candidate);
+                    candidates.retain(|(known, _)| !same_type(known, candidate, object));
                 }
             }
         }
         for (bound, _) in upper {
             for (candidate, _) in &initial {
-                if bound == candidate {
+                if same_type(bound, candidate, object) {
                     continue;
                 }
                 if !self.converts(candidate, bound) {
-                    candidates.retain(|(known, _)| known != candidate);
+                    candidates.retain(|(known, _)| !same_type(known, candidate, object));
                 }
             }
         }
         let mut best: Option<(Type, bool)> = None;
         for candidate in &candidates {
-            if candidates
-                .iter()
-                .all(|other| other.0 == candidate.0 || self.converts(&other.0, &candidate.0))
-            {
+            if candidates.iter().all(|other| {
+                same_type(&other.0, &candidate.0, object) || self.converts(&other.0, &candidate.0)
+            }) {
                 if best.is_some() {
                     return None;
                 }
@@ -1149,6 +1225,47 @@ pub(super) fn mentions(ty: &Type, parameter: SymbolId) -> bool {
     }
 }
 
+/// Whether two bounds are one type, as far as inference is concerned: the
+/// same but for tuple element names and for `dynamic` standing where
+/// `object` does, which the identity conversion makes no difference of.
+fn same_type(first: &Type, second: &Type, object: Option<&Type>) -> bool {
+    match (first, second) {
+        (Type::Dynamic, other) | (other, Type::Dynamic) => {
+            matches!(other, Type::Dynamic) || object == Some(other)
+        }
+        (Type::Tuple(a), Type::Tuple(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(a, b)| same_type(&a.ty, &b.ty, object))
+        }
+        (
+            Type::Named {
+                symbol: a,
+                type_arguments: x,
+            },
+            Type::Named {
+                symbol: b,
+                type_arguments: y,
+            },
+        ) => a == b && x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same_type(x, y, object)),
+        (
+            Type::Array {
+                element: a,
+                rank: x,
+            },
+            Type::Array {
+                element: b,
+                rank: y,
+            },
+        ) => x == y && same_type(a, b, object),
+        (Type::Pointer(a), Type::Pointer(b)) | (Type::ByRef(a), Type::ByRef(b)) => {
+            same_type(a, b, object)
+        }
+        _ => first == second,
+    }
+}
+
 /// Two candidates that are one type but for their tuple element names, as
 /// one: a name both give stays, a name they disagree on goes.
 fn merge_names(first: &Type, second: &Type) -> Type {
@@ -1182,6 +1299,7 @@ fn merge_names(first: &Type, second: &Type) -> Type {
             element: Box::new(merge_names(a, b)),
             rank: *rank,
         },
+        (Type::Dynamic, _) | (_, Type::Dynamic) => Type::Dynamic,
         _ => first.clone(),
     }
 }

@@ -18736,3 +18736,105 @@ Ext.St
 ",
     );
 }
+
+/// An override that returns a narrower type than what it overrides (C# 9) is
+/// another method to the runtime, which matches by signature: it has a slot
+/// of its own, a `MethodImpl` row that puts it in the base's, and
+/// `[PreserveBaseOverrides]` so that an override further down answers both.
+/// Without them a call through the base ran the base's body.
+#[test]
+fn an_override_with_a_narrower_return_type_answers_the_base_slot() {
+    check(
+        "CovariantReturns",
+        r#"
+using System;
+using System.Collections.Generic;
+class B
+{
+    public virtual object M() => "b";
+    public virtual B Self() => this;
+    public virtual T G<T>(T t) => t;
+    public virtual object P => "bp";
+    public virtual IEnumerable<object> Seq() => new object[] { "bs" };
+    public virtual object this[int i] => "bi" + i;
+    public virtual object Kept() => "bk";
+}
+class D : B
+{
+    public override string M() => "d";
+    public override D Self() => this;
+    public override string P => "dp";
+    public override IEnumerable<string> Seq() => new[] { "ds" };
+    public override string this[int i] => "di" + i;
+    public override object Kept() => "dk";
+    public int Extra => 5;
+}
+class E : D
+{
+    public override string M() => "e";
+    public override string P => "ep";
+    public override E Self() => this;
+    public override string this[int i] => "ei" + i;
+}
+abstract class Shape { public abstract Shape Clone(); public abstract object Tag { get; } }
+sealed class Circle : Shape { public override Circle Clone() => new Circle(); public override string Tag => "circle"; }
+class GB<T> { public virtual object Make(T t) => "gb" + t; public virtual T Same(T t) => t; }
+class GD : GB<int> { public override string Make(int t) => "gd" + t; public override int Same(int t) => t + 1; }
+class GD2<U> : GB<U> { public override string Make(U t) => "gd2" + t; }
+class Ex : Exception { public override string Message => "exm"; public override string ToString() => "exs"; }
+class Program
+{
+    static void Main()
+    {
+        D d = new E();
+        string s = d.M();
+        Console.WriteLine(s.Length + s);
+        Console.WriteLine(d.Self().Extra);
+        Console.WriteLine(new E().Self().M().ToUpper());
+        B b = d;
+        object o = b.M();
+        Console.WriteLine(o);
+        var e = new E();
+        Func<string> f = e.M;
+        Console.WriteLine(f());
+        Func<object> fo = b.M;
+        Console.WriteLine(fo());
+        Console.WriteLine(e.G(3));
+        Console.WriteLine(b.P + " " + d.P + " " + d.P.Length + " " + e.P);
+        Console.WriteLine(b[1] + " " + d[2] + " " + d[2].Length);
+        foreach (var x in b.Seq()) Console.WriteLine(x);
+        foreach (string x in d.Seq()) Console.WriteLine(x.Length);
+        Console.WriteLine(b.Kept() + " " + b.Self().GetType().Name + " " + new D().Self().GetType().Name);
+        B plain = new D();
+        Console.WriteLine(plain.M() + " " + plain.P + " " + plain[3]);
+        Shape sh = new Circle();
+        Console.WriteLine(sh.Clone().GetType().Name + " " + sh.Tag + " " + new Circle().Clone().Tag.Length);
+        GB<int> g = new GD();
+        Console.WriteLine(g.Make(1) + " " + g.Same(1) + " " + new GD().Make(2).Length);
+        GB<string> g2 = new GD2<string>();
+        Console.WriteLine(g2.Make("x") + " " + new GD2<int>().Make(4).Length);
+        Exception ex = new Ex();
+        Console.WriteLine(ex.Message + " " + ex);
+    }
+}
+"#,
+        "1e
+5
+E
+e
+e
+e
+3
+ep ep 2 ep
+ei1 ei2 3
+ds
+2
+dk E D
+d dp di3
+Circle circle 6
+gd1 2 3
+gd2x 4
+exm exs
+",
+    );
+}

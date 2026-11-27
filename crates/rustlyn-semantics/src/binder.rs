@@ -1609,6 +1609,30 @@ impl<'a> Binder<'a> {
         resolved
     }
 
+    /// Whether a type parameter is held to a value type: by its own `where T
+    /// : struct`, or, for an override that may not restate constraints, by
+    /// that of the method it overrides.
+    #[must_use]
+    pub fn is_struct_constrained(&self, ty: SymbolId) -> bool {
+        let mut current = ty;
+        for _ in 0..32 {
+            if self
+                .compilation
+                .symbols()
+                .get(current)
+                .as_type_parameter()
+                .is_some_and(|detail| detail.value_type)
+            {
+                return true;
+            }
+            match self.overridden_type_parameter(current) {
+                Some(next) => current = next,
+                None => return false,
+            }
+        }
+        false
+    }
+
     /// The type parameter an override's type parameter stands in for.
     ///
     /// `public override SyntaxList<TNode> VisitList<TNode>(SyntaxList<TNode>
@@ -2173,12 +2197,7 @@ impl<'a> Binder<'a> {
                 // `T?` is `Nullable<T>` only under `where T : struct`;
                 // otherwise it is the annotation, which this does not track.
                 let annotation = match &underlying {
-                    Type::TypeParameter(symbol) => !self
-                        .compilation
-                        .symbols()
-                        .get(*symbol)
-                        .as_type_parameter()
-                        .is_some_and(|detail| detail.value_type),
+                    Type::TypeParameter(symbol) => !self.is_struct_constrained(*symbol),
                     other => other.is_reference_type(self.compilation.symbols()),
                 };
                 if annotation {

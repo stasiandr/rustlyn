@@ -113,7 +113,22 @@ impl BodyBinder<'_> {
                 .iter()
                 .map(|argument| match argument.kind {
                     BoundExpressionKind::UnboundCollection(at) => {
-                        self.collection_types.get(&at).cloned()
+                        self.collection_types.get(&at).map(|types| {
+                            let constants = self.collection_constants.get(&at);
+                            types
+                                .iter()
+                                .enumerate()
+                                .map(|(index, ty)| {
+                                    (
+                                        ty.clone(),
+                                        constants
+                                            .and_then(|constants| constants.get(index))
+                                            .cloned()
+                                            .flatten(),
+                                    )
+                                })
+                                .collect()
+                        })
                     }
                     _ => None,
                 })
@@ -442,7 +457,7 @@ impl BodyBinder<'_> {
     /// the `params string[]` form, whatever else it might be.
     fn elements_reach(
         &self,
-        elements: &[Option<Vec<Type>>],
+        elements: &[Option<Vec<super::NotedElement>>],
         index: usize,
         parameter: &Type,
     ) -> bool {
@@ -453,12 +468,15 @@ impl BodyBinder<'_> {
             return true;
         };
         let symbols = self.binder.compilation().symbols();
-        types.iter().all(|ty| {
+        types.iter().all(|(ty, constant)| {
             ty.is_error()
                 || (matches!(ty, Type::Null)
                     && (element.is_reference_type(symbols)
                         || self.binder.nullable_underlying(&element).is_some()))
                 || self.binder.converts_implicitly(ty, &element)
+                || constant
+                    .as_ref()
+                    .is_some_and(|constant| self.constant_reaches(constant, ty, &element))
         })
     }
 

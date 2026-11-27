@@ -642,15 +642,35 @@ impl Checker<'_> {
             let Some(declaration) = attribute.parent().and_then(|list| list.parent()) else {
                 continue;
             };
-            let (bound, found) = crate::body::BodyBinder::bind_attribute_diagnosed(
+            let (bound, mut found) = crate::body::BodyBinder::bind_attribute_diagnosed(
                 &self.binder,
                 tree,
                 declaration,
                 &attribute,
             );
+            // On a local function or a lambda, an attribute may name the
+            // constants of the method around it, which are not in sight
+            // from here: the body that holds it says which names are wrong.
+            let local = attribute.ancestors().any(|ancestor| {
+                matches!(
+                    ancestor.kind(),
+                    SyntaxKind::Block
+                        | SyntaxKind::LocalFunctionStatement
+                        | SyntaxKind::ParenthesizedLambdaExpression
+                        | SyntaxKind::SimpleLambdaExpression
+                        | SyntaxKind::AnonymousMethodExpression
+                )
+            });
+            let unresolved = local
+                && found
+                    .iter()
+                    .any(|(_, diagnostic)| diagnostic.code() == ErrorCode::ErrNameNotInContext);
+            if local {
+                found.retain(|(_, diagnostic)| diagnostic.code() != ErrorCode::ErrNameNotInContext);
+            }
             // An argument of an attribute that did not bind is not judged:
             // Roslyn says what is wrong with the attribute, and stops.
-            let clean = !found.iter().any(|(_, diagnostic)| diagnostic.is_error());
+            let clean = !unresolved && !found.iter().any(|(_, diagnostic)| diagnostic.is_error());
             self.found.extend(found);
             if let Some(bound) = bound
                 .as_ref()
@@ -1962,6 +1982,18 @@ fn same_type(symbols: &crate::symbol::Symbols, first: &Type, second: &Type) -> b
         ) => first_rank == second_rank && same_type(symbols, first, second),
         (Type::Pointer(first), Type::Pointer(second))
         | (Type::ByRef(first), Type::ByRef(second)) => same_type(symbols, first, second),
+        (Type::FunctionPointer(first), Type::FunctionPointer(second)) => {
+            first.convention == second.convention
+                && first.modifiers == second.modifiers
+                && first.returns_ref == second.returns_ref
+                && first.parameters.len() == second.parameters.len()
+                && same_type(symbols, &first.returns, &second.returns)
+                && first.parameters.iter().zip(&second.parameters).all(
+                    |((first_kind, first), (second_kind, second))| {
+                        first_kind == second_kind && same_type(symbols, first, second)
+                    },
+                )
+        }
         _ => first == second,
     }
 }

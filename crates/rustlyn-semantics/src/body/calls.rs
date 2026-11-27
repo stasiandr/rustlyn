@@ -35,10 +35,37 @@ impl BodyBinder<'_> {
             return name;
         }
         let argument_list = children.find(|child| child.kind() == SyntaxKind::ArgumentList);
-        let arguments = argument_list
+        let floor = self.body.diagnostics.len();
+        let mut arguments = argument_list
             .as_ref()
             .map(|list| self.bind_argument_list(list))
             .unwrap_or_default();
+        // `Id(M(out var x)).N(x)`: what the receiver declares is in scope in
+        // the arguments. Names the arguments could not find are the sign of
+        // it, and then the receiver is bound first and they are bound again.
+        let mut bound_receiver: Option<(TextSpan, BoundExpression)> = None;
+        if matches!(
+            callee.kind(),
+            SyntaxKind::SimpleMemberAccessExpression | SyntaxKind::PointerMemberAccessExpression
+        ) && self.body.diagnostics[floor..]
+            .iter()
+            .any(|(_, diagnostic)| diagnostic.code() == ErrorCode::ErrNameNotInContext)
+            && let Some(left) = callee.children().next()
+            && left.descendants().any(|inner| {
+                matches!(
+                    inner.kind(),
+                    SyntaxKind::DeclarationExpression | SyntaxKind::SingleVariableDesignation
+                )
+            })
+            && self.namespace_of(&left).is_none()
+        {
+            self.body.diagnostics.truncate(floor);
+            bound_receiver = Some((left.span(), self.bind_expression(&left)));
+            arguments = argument_list
+                .as_ref()
+                .map(|list| self.bind_argument_list(list))
+                .unwrap_or_default();
+        }
         let argument_names = argument_list
             .as_ref()
             .map(Self::argument_names)
@@ -131,7 +158,7 @@ impl BodyBinder<'_> {
                 // own `Lerp` and not `Mathf.Lerp`, however well both take it.
                 // A field is not called, so `Empty()` beside a field `Empty`
                 // is still `Expression.Empty()`.
-                let declared = self.declaring_enclosing(&name).is_some_and(|ty| {
+                let declared = self.declaring_enclosing_callable(&name).is_some_and(|ty| {
                     let symbols = self.binder.compilation().symbols();
                     self.binder
                         .lookup_member(ty, &name)
@@ -156,7 +183,7 @@ impl BodyBinder<'_> {
                     }
                 }
                 let Some(enclosing) = self
-                    .declaring_enclosing(&name)
+                    .declaring_enclosing_callable(&name)
                     .or_else(|| self.context.enclosing_type())
                 else {
                     return BoundExpression::error(span);
@@ -277,7 +304,10 @@ impl BodyBinder<'_> {
                 if self.namespace_of(&left).is_some() {
                     return BoundExpression::error(span);
                 }
-                let mut receiver = self.bind_expression(&left);
+                let mut receiver = match bound_receiver.take() {
+                    Some((at, bound)) if at == left.span() => bound,
+                    _ => self.bind_expression(&left),
+                };
                 if callee.kind() == SyntaxKind::PointerMemberAccessExpression {
                     receiver = self.pointed_at(receiver);
                 }
@@ -833,9 +863,49 @@ impl BodyBinder<'_> {
                 {
                     self.report_object_required(method, name_node.span());
                 }
-                let ty = self
+                let mut ty = self
                     .member_type(method, &receiver_type)
                     .substitute(&substitution);
+                // A covariant return (C# 9): `d.M()` on a `Derived` whose
+                // `M` overrides `object M()` with `string M()` is a `string`,
+                // and the override is the method called.
+                let mut method = method;
+                if !matches!(
+                    receiver.as_deref().map(|base| &base.kind),
+                    Some(BoundExpressionKind::Base)
+                ) && receiver_type.symbol().is_some()
+                    && self.is_virtual_call(method, None)
+                {
+                    let nearest = self.base_override(method, &receiver_type);
+                    if nearest != method {
+                        let mut nearest_substitution = substitution.clone();
+                        let symbols = self.binder.compilation().symbols();
+                        if let (Some(theirs), Some(ours)) = (
+                            symbols.get(method).as_method(),
+                            symbols.get(nearest).as_method(),
+                        ) {
+                            for (their, our) in
+                                theirs.type_parameters.iter().zip(&ours.type_parameters)
+                            {
+                                if let Some(argument) = substitution.get(their).cloned() {
+                                    nearest_substitution.insert(*our, argument);
+                                }
+                            }
+                        }
+                        let narrower = self
+                            .member_type(nearest, &receiver_type)
+                            .substitute(&nearest_substitution);
+                        if narrower != ty
+                            && !narrower.is_error()
+                            && !ty.is_error()
+                            && self.binder.converts_implicitly(&narrower, &ty)
+                        {
+                            ty = narrower;
+                            method = nearest;
+                            substitution = nearest_substitution;
+                        }
+                    }
+                }
                 // An instance call written without a receiver is a call on
                 // `this`, and the backend needs that receiver spelled out.
                 let receiver = receiver.or_else(|| {

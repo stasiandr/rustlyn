@@ -31,6 +31,10 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    static BINDING: std::cell::RefCell<Vec<SymbolId>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl Binder<'_> {
     /// The value of a `const` field or an enum member, if it has one.
     #[must_use]
@@ -464,6 +468,13 @@ impl Binder<'_> {
         ))
     }
 
+    /// Whether a parameter's default value is being bound just now: it names
+    /// the method it belongs to, whose signature needs that very value.
+    #[must_use]
+    pub fn parameter_default_in_progress(&self, parameter: SymbolId) -> bool {
+        BINDING.with_borrow(|parameters| parameters.contains(&parameter))
+    }
+
     /// The `= value` of an optional parameter as a constant of the
     /// parameter's own type, where it folds to one: `long limit = 5` is an
     /// `Int64`, and `double scale = 2` a `Double`. `None` for a default that
@@ -476,7 +487,15 @@ impl Binder<'_> {
             return compilation.anonymous_delegate_default(parameter);
         }
         let (tree, node, expression) = self.parameter_default_syntax(parameter)?;
+        // `void M(object a = new[] { M })`: the default names the method,
+        // whose signature needs the default. The second time round it is no
+        // constant, which is all the signature wants to know.
+        if self.parameter_default_in_progress(parameter) {
+            return None;
+        }
+        BINDING.with_borrow_mut(|parameters| parameters.push(parameter));
         let value = crate::body::BodyBinder::bind_lone_expression(self, tree, &node, &expression);
+        BINDING.with_borrow_mut(|parameters| parameters.pop());
         let folded = self.folded(&value)?;
         let mut sink = crate::Diagnostics::new();
         let ty = self.type_of(parameter, &mut sink);
